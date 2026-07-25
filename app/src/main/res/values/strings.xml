@@ -1,0 +1,34 @@
+<resources>
+    <string name="app_name">WAV Recorder</string>
+    <string name="start_recording">Start Recording</string>
+    <string name="stop_recording">Stop Recording</string>
+    <string name="status_idle">Ready to record</string>
+    <string name="status_recording">Recording…</string>
+    <string name="status_recording_part">Recording… (part %1$d)</string>
+    <string name="status_saved">Saved: %1$s</string>
+    <string name="permission_denied">Microphone permission is required to record audio.</string>
+    <string name="tab_record">Record</string>
+    <string name="tab_library">Library</string>
+    <string name="destination_label">Destination: %1$s</string>
+    <string name="choose_folder">Change</string>
+    <string name="empty_recordings">No recordings yet</string>
+    <string name="playback_failed">Playback failed: %1$s</string>
+    <string name="recording_error">Recording error: %1$s</string>
+    <string name="notification_channel_name">Recording</string>
+    <string name="stop_confirm_title">Stop recording?</string>
+    <string name="stop_confirm_message">This will stop and save the current recording.</string>
+    <string name="stop_confirm_positive">Stop</string>
+    <string name="stop_confirm_cancel">Cancel</string>
+    <string name="stats_button">Stats</string>
+    <string name="stats_computing">Computing stats…</string>
+    <string name="stats_close">Close</string>
+    <string name="stats_read_failed">Could not read this file</string>
+    <string name="delete_button">Delete</string>
+    <string name="delete_confirm_title">Delete recording?</string>
+    <string name="delete_confirm_message">"%1$s" will be permanently deleted. This can\'t be undone.</string>
+    <string name="delete_confirm_positive">Delete</string>
+    <string name="delete_confirm_cancel">Cancel</string>
+    <string name="delete_failed">Could not delete the file</string>
+    <string name="audio_focus_denied">Another app is using audio playback right now</string>
+    <string name="more_options">More options</string>
+</resources>
