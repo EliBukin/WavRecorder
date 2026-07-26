@@ -457,6 +457,149 @@ class WavRecorderTest {
         assertNotNull("session 2's own failure should still be reported normally", session2ErrorReported)
     }
 
+    @Test
+    fun `a stale thread whose blocked read later returns valid data must not touch a newer session`() {
+        // Companion to the test above: there, the stale read is released by returning an error,
+        // which the existing generation check on the *exception* path already suppresses. This
+        // covers the gap where the blocked read instead eventually returns real, positive audio
+        // data -- which recordLoop() would otherwise write, roll over, and finalize with whatever
+        // the shared sampleRate/segmentMaxBytes fields say *now* (session 2's), not what was true
+        // when session 1 started.
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        // Bigger than either session's segmentMaxBytes (44100 or 48000 Hz * 2 bytes * 1s), so if
+        // this stale data were wrongly accepted it would force a rollover no matter which
+        // session's threshold was in effect at the time -- making an extra segment a reliable
+        // signal of the bug rather than a coincidence of timing.
+        val staleChunk = ByteArray(100_000) { 9 }
+
+        var session1ReadCount = 0
+        val session1StopCalled = AtomicBoolean(false)
+        val letSession1Resume = CountDownLatch(1)
+        val session1Source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                session1ReadCount++
+                if (session1ReadCount == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                var released = false
+                while (!released) {
+                    released = try { letSession1Resume.await(5, TimeUnit.SECONDS); true } catch (_: InterruptedException) { false }
+                }
+                // The blocked read finally "succeeds" instead of erroring out -- valid, positive
+                // audio data arriving well after this session was superseded.
+                System.arraycopy(staleChunk, 0, buffer, offset, staleChunk.size)
+                return staleChunk.size
+            }
+            override fun stop() {
+                session1StopCalled.set(true) // deliberately does NOT unblock read()
+            }
+            override fun release() {}
+        }
+
+        var session2ReadCount = 0
+        val session2Blocked = CountDownLatch(1)
+        val session2Source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                session2ReadCount++
+                if (session2ReadCount == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                session2Blocked.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() {}
+            override fun release() {}
+        }
+
+        var startCallCount = 0
+        val recorder = WavRecorder(
+            segmentMaxSeconds = 1,
+            threadJoinTimeoutMs = 50, // fast, deterministic timeout for the test
+            openAudioSource = {
+                startCallCount++
+                if (startCallCount == 1) {
+                    WavRecorder.RecorderConfig(session1Source, sampleRate = 44100, bufferSize = staleChunk.size)
+                } else {
+                    WavRecorder.RecorderConfig(session2Source, sampleRate = 48000, bufferSize = chunk.size)
+                }
+            }
+        )
+
+        val session1Files = mutableListOf<File>()
+        var session1SegmentCreateCount = 0
+        var session1SegmentStartedCount = 0
+        var session1AmplitudeCount = 0
+        var session1ErrorReported: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget {
+                session1SegmentCreateCount++
+                val file = tempFolder.newFile("session1-seg$session1SegmentCreateCount.wav")
+                session1Files += file
+                OutputTarget.FileTarget(file)
+            },
+            onSegmentStarted = { session1SegmentStartedCount++ },
+            onAmplitude = { session1AmplitudeCount++ },
+            onError = { e -> session1ErrorReported = e }
+        )
+        val session1Deadline = System.currentTimeMillis() + 2000
+        while (session1ReadCount < 1 && System.currentTimeMillis() < session1Deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        shadowOf(Looper.getMainLooper()).idle() // deliver the onSegmentStarted/onAmplitude posts from the accepted chunk
+
+        // Snapshot right after the one legitimate chunk was accepted, before the stale resume.
+        val segmentStartedBeforeResume = session1SegmentStartedCount
+        val amplitudeBeforeResume = session1AmplitudeCount
+        assertEquals(1, segmentStartedBeforeResume)
+        assertEquals(1, amplitudeBeforeResume)
+
+        recorder.stop()
+        assertTrue("expected AudioSource#stop() to have been called", session1StopCalled.get())
+        assertFalse(recorder.isActive)
+
+        var session2ErrorReported: Exception? = null
+        var session2SegmentCreateCount = 0
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget {
+                session2SegmentCreateCount++
+                OutputTarget.FileTarget(tempFolder.newFile("session2-seg$session2SegmentCreateCount.wav"))
+            },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> session2ErrorReported = e }
+        )
+        assertTrue("expected a new session to be able to start", recorder.isActive)
+
+        // Now let session 1's long-blocked read() finally return -- with valid, positive data.
+        letSession1Resume.countDown()
+        Thread.sleep(300)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertNull("a stale session must never report an error against a newer session", session1ErrorReported)
+        assertNull("a stale session's discarded data must not surface as a newer session's error",
+            session2ErrorReported)
+        assertTrue("session 2 must still be active; a stale session must not be able to stop it", recorder.isActive)
+
+        assertEquals("the stale read must not roll over into a second segment for session 1",
+            1, session1SegmentCreateCount)
+        assertEquals("no additional onSegmentStarted callback should fire for the stale session",
+            segmentStartedBeforeResume, session1SegmentStartedCount)
+        assertEquals("no additional onAmplitude callback should fire for the stale session",
+            amplitudeBeforeResume, session1AmplitudeCount)
+
+        val session1Format = WavRiffParser.parse(session1Files[0].inputStream())
+        assertNotNull(session1Format)
+        assertEquals("session 1's header must keep its own sample rate, not session 2's",
+            44100, session1Format?.sampleRate)
+        assertEquals("session 1's finalized file must contain only the audio accepted before stop",
+            chunk.size.toLong(), session1Format?.dataSize)
+    }
+
     /** Wraps a real [FileChannel] but only ever lets [maxBytesPerCall] bytes through per write(),
      * forcing callers to loop to fully drain a larger buffer -- exercising WavRecorder's
      * writeFully() without needing an OS-level short write, which real local files essentially

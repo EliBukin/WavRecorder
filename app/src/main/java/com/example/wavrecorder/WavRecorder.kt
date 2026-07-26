@@ -113,18 +113,16 @@ class WavRecorder(
     private var recordingThread: Thread? = null
     private val isRecording = AtomicBoolean(false)
 
-    // Bumped on every start(). recordLoop() captures the value current at its own launch and
-    // checks it before mutating any shared state or firing a callback: if stop() ever has to give
-    // up waiting on a wedged thread (see stop()'s join timeout) and a new session starts, that
-    // stale thread resuming later must not be able to touch the new session's state or report
-    // errors against it. Without this, a since-superseded thread could flip isRecording false,
-    // release the new session's AudioSource, or call the new session's onError out from under it.
+    // Bumped on every start() *and* on every stop(). recordLoop() captures the value current at
+    // its own launch and rechecks it (together with isRecording) before mutating any shared
+    // state or firing a callback: if stop() ever has to give up waiting on a wedged thread (see
+    // stop()'s join timeout) and a new session starts, that stale thread resuming later must not
+    // be able to touch the new session's state or report errors against it. Without this, a
+    // since-superseded thread could flip isRecording false, release the new session's
+    // AudioSource, or call the new session's onError out from under it. Bumping it in stop() too
+    // means even callbacks already queued on the main looper by the just-stopped session (but not
+    // yet delivered) get suppressed when they run, rather than only future ones.
     private val generation = AtomicInteger(0)
-
-    // Actual sample rate in use for the current recording session; only known once AudioRecord
-    // has been successfully opened, since it may fall back from the preferred candidate.
-    private var sampleRate = SAMPLE_RATE_CANDIDATES.first()
-    private var segmentMaxBytes = 0L
 
     val isActive: Boolean get() = isRecording.get()
 
@@ -150,8 +148,8 @@ class WavRecorder(
         }
 
         val source = config.source
-        sampleRate = config.sampleRate
-        segmentMaxBytes = sampleRate.toLong() * CHANNELS * BYTES_PER_SAMPLE * segmentMaxSeconds
+        val sampleRate = config.sampleRate
+        val segmentMaxBytes = sampleRate.toLong() * CHANNELS * BYTES_PER_SAMPLE * segmentMaxSeconds
 
         audioSource = source
         try {
@@ -169,7 +167,10 @@ class WavRecorder(
         val myGeneration = generation.incrementAndGet()
         isRecording.set(true)
         recordingThread = Thread({
-            recordLoop(myGeneration, context, source, nextTarget, config.bufferSize, onSegmentStarted, onAmplitude, onError)
+            recordLoop(
+                myGeneration, context, source, nextTarget, config.bufferSize, sampleRate,
+                segmentMaxBytes, onSegmentStarted, onAmplitude, onError
+            )
         }, "WavRecorderThread").apply { start() }
     }
 
@@ -193,6 +194,13 @@ class WavRecorder(
      */
     fun stop() {
         isRecording.set(false)
+        // Invalidate this session's generation too: a callback the recording thread already
+        // posted to the main looper before observing isRecording=false (e.g. the amplitude
+        // update for the read right before this stop()) would otherwise still be delivered,
+        // updating the UI for a session that's already stopped. This doesn't affect the
+        // recording thread's own finalization of its current segment, which never consults
+        // generation -- only the *dispatch* of callbacks does.
+        generation.incrementAndGet()
         audioSource?.let {
             try { it.stop() } catch (_: Exception) {}
             try { it.release() } catch (_: Exception) {}
@@ -221,6 +229,8 @@ class WavRecorder(
         source: AudioSource,
         nextTarget: NextTarget,
         bufferSize: Int,
+        sampleRate: Int,
+        segmentMaxBytes: Long,
         onSegmentStarted: (OutputTarget) -> Unit,
         onAmplitude: (Float) -> Unit,
         onError: (Exception) -> Unit
@@ -246,6 +256,18 @@ class WavRecorder(
                 // and onError path as every other fatal condition below.
                 try {
                     val read = source.read(buffer, 0, buffer.size)
+
+                    // source.read() can block for an arbitrary time (a hung driver, a
+                    // disconnected mic) and stop() only waits up to threadJoinTimeoutMs for it
+                    // before giving up (see stop()'s doc). If this thread is still stuck in that
+                    // read() when a newer session starts, the read may eventually return *valid*
+                    // data instead of an error -- recheck right away, before this data touches
+                    // any state, and quietly bail if this thread is no longer current. Otherwise
+                    // this would write stale audio into a segment that's already being finalized
+                    // (or gone), roll it over into a segment nothing else knows about, and/or
+                    // finalize using a newer session's sampleRate/segmentMaxBytes.
+                    if (generation.get() != myGeneration || !isRecording.get()) break
+
                     if (read < 0) {
                         // A negative result usually means a real AudioSource failure (another app
                         // seized the mic, a dead object, etc.) -- but stop() intentionally
@@ -264,12 +286,12 @@ class WavRecorder(
 
                     val now = System.currentTimeMillis()
                     if (now - segment.lastHeaderFlush >= HEADER_FLUSH_INTERVAL_MS) {
-                        flushHeader(segment)
+                        flushHeader(segment, sampleRate)
                         segment.lastHeaderFlush = now
                     }
 
                     if (segment.audioLen >= segmentMaxBytes) {
-                        closeSegment(context, segment)
+                        closeSegment(context, segment, sampleRate)
                         segment = openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted)
                     }
                 } catch (e: Exception) {
@@ -278,7 +300,7 @@ class WavRecorder(
                 }
             }
         } finally {
-            closeSegment(context, segment)
+            closeSegment(context, segment, sampleRate)
         }
     }
 
@@ -311,10 +333,10 @@ class WavRecorder(
     }
 
     /** Best-effort: rewrites the header in place without disturbing the write position. */
-    private fun flushHeader(segment: Segment) {
+    private fun flushHeader(segment: Segment, sampleRate: Int) {
         try {
             val writePosition = segment.writer.position()
-            patchWavHeader(segment.writer, segment.audioLen)
+            patchWavHeader(segment.writer, segment.audioLen, sampleRate)
             segment.writer.position(writePosition)
         } catch (_: Exception) {
             // Not fatal: worst case, the next periodic flush (or the final close) catches up.
@@ -359,10 +381,10 @@ class WavRecorder(
      * finalizing it would leave a silent, pointless 0-byte-audio WAV file behind in the user's
      * library. Delete it instead of patching a "valid" empty header onto it.
      */
-    private fun closeSegment(context: Context, segment: Segment) {
+    private fun closeSegment(context: Context, segment: Segment, sampleRate: Int) {
         if (segment.audioLen > 0L) {
             try {
-                patchWavHeader(segment.writer, segment.audioLen)
+                patchWavHeader(segment.writer, segment.audioLen, sampleRate)
             } catch (_: Exception) {
                 // Best-effort: the periodic flushHeader() calls during recording mean the header
                 // is very likely already correct on disk even if this final patch fails.
@@ -410,7 +432,7 @@ class WavRecorder(
         return ((dbfs - floorDb) / -floorDb).coerceIn(0f, 1f)
     }
 
-    private fun patchWavHeader(writer: SegmentWriter, totalAudioLen: Long) {
+    private fun patchWavHeader(writer: SegmentWriter, totalAudioLen: Long, sampleRate: Int) {
         val header = WavHeaderWriter.build(sampleRate, CHANNELS, BITS_PER_SAMPLE, totalAudioLen)
         writer.position(0)
         writeFully(writer, header)
