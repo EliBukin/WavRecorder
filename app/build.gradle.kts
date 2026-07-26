@@ -34,6 +34,13 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -45,4 +52,14 @@ dependencies {
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.fragment:fragment-ktx:1.8.2")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("androidx.test:core:1.6.1")
+    testImplementation("androidx.test.ext:junit:1.2.1")
+    // fragment-testing's EmptyFragmentActivity must be merged into the manifest Robolectric
+    // loads for local (JVM) unit tests, which is the debug app manifest, not a test-only one —
+    // hence debugImplementation rather than testImplementation. This is the setup Google's own
+    // FragmentScenario + Robolectric docs call for.
+    debugImplementation("androidx.fragment:fragment-testing:1.8.2")
 }

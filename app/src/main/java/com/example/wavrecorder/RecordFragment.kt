@@ -84,12 +84,25 @@ class RecordFragment : Fragment() {
 
     private val requestPermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
-            if (results[Manifest.permission.RECORD_AUDIO] == true) {
-                beginRecording()
-            } else {
-                Toast.makeText(requireContext(), R.string.permission_denied, Toast.LENGTH_LONG).show()
-            }
+            handlePermissionResult(results)
         }
+
+    // The results map only contains entries for permissions that were actually requested, so a
+    // permission already granted before the call (e.g. RECORD_AUDIO, when only POST_NOTIFICATIONS
+    // was missing) is absent from it rather than present with value true. Checking the map instead
+    // of the live permission state would misread that absence as a denial. internal for testing.
+    @Suppress("UNUSED_PARAMETER")
+    internal fun handlePermissionResult(results: Map<String, Boolean>) {
+        if (hasMicrophonePermission()) {
+            beginRecording()
+        } else {
+            Toast.makeText(requireContext(), R.string.permission_denied, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun hasMicrophonePermission(): Boolean =
+        ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
 
     private val folderPicker =
         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -165,9 +178,7 @@ class RecordFragment : Fragment() {
 
     private fun requestPermissionAndRecord() {
         val needed = mutableListOf<String>()
-        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!hasMicrophonePermission()) {
             needed += Manifest.permission.RECORD_AUDIO
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
