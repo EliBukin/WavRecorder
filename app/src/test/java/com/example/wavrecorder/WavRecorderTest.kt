@@ -219,6 +219,75 @@ class WavRecorderTest {
         assertEquals(chunk.size.toLong(), firstSegment?.dataSize)
     }
 
+    /** Wraps a real [FileChannel] but fails every [write], standing in for a WAV-header write
+     * that fails partway through segment creation (disk full, a broken destination) without
+     * needing an OS-level failure that's hard to reproduce portably. */
+    private class FailingWriteWrapper(private val channel: FileChannel) : SegmentWriter {
+        override fun write(buffer: ByteBuffer): Int = throw IOException("simulated header write failure")
+        override fun position(): Long = channel.position()
+        override fun position(newPosition: Long) { channel.position(newPosition) }
+        override fun close() = channel.close()
+    }
+
+    /** Fails only the seek-back-to-0 that [WavRecorder] always does immediately before (re)writing
+     * the WAV header -- regular audio writes never reposition -- so this simulates a header patch
+     * failure (periodic or final) without touching normal data writes at all. */
+    private class FailingHeaderPatchWriter(private val channel: FileChannel) : SegmentWriter {
+        override fun write(buffer: ByteBuffer): Int = channel.write(buffer)
+        override fun position(): Long = channel.position()
+        override fun position(newPosition: Long) {
+            if (newPosition == 0L) throw IOException("simulated header patch failure")
+            channel.position(newPosition)
+        }
+        override fun close() = channel.close()
+    }
+
+    /** Simulates a writer/destination that reports a close failure -- e.g. a network-backed SAF
+     * provider failing to flush on close -- while still actually releasing the real channel
+     * underneath so the test itself doesn't leak a file handle. */
+    private class FailingCloseWriter(private val channel: FileChannel) : SegmentWriter {
+        override fun write(buffer: ByteBuffer): Int = channel.write(buffer)
+        override fun position(): Long = channel.position()
+        override fun position(newPosition: Long) { channel.position(newPosition) }
+        override fun close() {
+            channel.close()
+            throw IOException("simulated close failure")
+        }
+    }
+
+    @Test
+    fun `a failure while opening the first segment closes resources and deletes the incomplete file`() {
+        // Regression test for openSegment(): before its resource cleanup was added, a failure
+        // partway through construction (here, the placeholder WAV header write) left the
+        // just-opened RandomAccessFile/FileChannel unclosed and the empty/partial file it had
+        // already created sitting in the user's library. On Windows specifically, a leaked
+        // RandomAccessFile holds an exclusive lock, so segmentFile.delete() below would itself
+        // fail (rather than just leave a stray file behind) if the channel weren't closed first
+        // -- making this assertion a direct check of the resource cleanup, not just the deletion.
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val fake = FakeAudioSource() // recording never gets past opening the first segment
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) },
+            wrapChannel = { channel -> FailingWriteWrapper(channel) }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        awaitTerminatedAndDeliverCallbacks(recorder)
+
+        assertNotNull("expected the header-write failure to be reported", reportedError)
+        assertFalse(recorder.isActive)
+        assertFalse("the incomplete segment file must be deleted, not left behind as a partial WAV",
+            segmentFile.exists())
+    }
+
     @Test
     fun `a failure from AudioSource startRecording is caught, released, and reported`() {
         val failure = IllegalStateException("mic busy")
@@ -647,5 +716,317 @@ class WavRecorderTest {
             assertArrayEquals("audio data must be complete and byte-for-byte correct despite " +
                 "every write() call only draining 5 bytes at a time", chunk, input.readBytes())
         }
+    }
+
+    @Test
+    fun `onMicrophoneInfo reports the AudioSource's verified microphone info immediately`() {
+        // The real device-verification logic lives in the production-only SystemAudioSource
+        // (needs a real AudioRecord/AudioManager), so this covers the contract WavRecorder itself
+        // is responsible for: asking the source what it verified once recording has started, and
+        // handing that straight to the caller -- not assuming AudioSource.MIC/UNPROCESSED implies
+        // any particular physical device.
+        val expectedInfo = MicrophoneInfo(label = "Insta360 Mic Air", isExternal = true, verified = true)
+        val fake = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int = -1
+            override fun stop() {}
+            override fun release() {}
+            override fun describeMicrophone(): MicrophoneInfo = expectedInfo
+        }
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) }
+        )
+
+        var reportedInfo: MicrophoneInfo? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(tempFolder.newFile("segment.wav")) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {},
+            onMicrophoneInfo = { info -> reportedInfo = info }
+        )
+
+        // Delivered synchronously from start() itself (before the recording thread even exists),
+        // not via the generation-guarded handler.post() path the other callbacks use -- so no
+        // idle()/await is needed to observe it.
+        assertEquals(expectedInfo, reportedInfo)
+        recorder.stop()
+    }
+
+    @Test
+    fun `an unverifiable AudioSource reports MicrophoneInfo_UNVERIFIED rather than assuming external`() {
+        // A fake/test source (or a real device that can't determine routing) must never be
+        // reported as a confidently-external mic it can't actually back up.
+        val fake = FakeAudioSource() // no describeMicrophone() override: uses the interface default
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) }
+        )
+
+        var reportedInfo: MicrophoneInfo? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(tempFolder.newFile("segment.wav")) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {},
+            onMicrophoneInfo = { info -> reportedInfo = info }
+        )
+
+        assertEquals(MicrophoneInfo.UNVERIFIED, reportedInfo)
+        assertFalse(reportedInfo?.isExternal ?: true)
+        recorder.stop()
+    }
+
+    @Test
+    fun `a verified external microphone disconnecting mid-recording stops safely, finalizes, and preserves audio`() {
+        // Standing in for SystemAudioSource's real AudioDeviceCallback-backed monitoring: a real
+        // AudioRecord can keep handing back samples for a moment after its device is actually
+        // gone, so isDeviceConnected() flipping false is what recordLoop() must notice and act on,
+        // not read() itself erroring out.
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val connected = AtomicBoolean(true)
+        val fake = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                return chunk.size
+            }
+            override fun stop() {}
+            override fun release() {}
+            override fun describeMicrophone() =
+                MicrophoneInfo(label = "USB Mic", isExternal = true, verified = true)
+            override fun isDeviceConnected(): Boolean = connected.get()
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val recorder = WavRecorder(
+            headerFlushIntervalMs = 10, // fast disconnect-check cadence for the test
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        Thread.sleep(50) // let some real audio actually get captured first
+        connected.set(false) // simulate the external mic being unplugged
+
+        awaitTerminatedAndDeliverCallbacks(recorder)
+
+        assertTrue("expected a MicrophoneDisconnectedException, got $reportedError",
+            reportedError is MicrophoneDisconnectedException)
+        assertFalse("recording must stop, not silently continue on the phone mic", recorder.isActive)
+
+        // The audio already captured before the disconnect must not be lost: the file must still
+        // exist with a valid, non-empty header, not be deleted or left as a 0-byte placeholder.
+        val format = WavRiffParser.parse(segmentFile.inputStream())
+        assertNotNull("expected the segment to still finalize with the audio captured before " +
+            "the disconnect was noticed", format)
+        assertTrue("expected some real audio to have been preserved", (format?.dataSize ?: 0L) > 0L)
+    }
+
+    @Test
+    fun `a silent route change away from the verified external microphone stops safely without any device-removal callback`() {
+        // Standing in for the gap isDeviceConnected() alone can't cover: Android silently
+        // rerouting an active AudioRecord to a different device (typically the built-in mic)
+        // without ever reporting the original device as removed. isDeviceConnected() deliberately
+        // stays at its default (true) throughout this test -- only isRouteUnchanged()'s own direct
+        // re-check flips, proving recordLoop() reacts to that seam on its own, independent of any
+        // removal callback ever firing.
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val routeUnchanged = AtomicBoolean(true)
+        val fake = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                return chunk.size
+            }
+            override fun stop() {}
+            override fun release() {}
+            override fun describeMicrophone() =
+                MicrophoneInfo(label = "USB Mic", isExternal = true, verified = true)
+            override fun isRouteUnchanged(): Boolean = routeUnchanged.get()
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val recorder = WavRecorder(
+            headerFlushIntervalMs = 10, // fast route-check cadence for the test
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        Thread.sleep(50) // let some real audio actually get captured first
+        routeUnchanged.set(false) // simulate a silent OS-level reroute, e.g. to the phone mic
+
+        awaitTerminatedAndDeliverCallbacks(recorder)
+
+        assertTrue("expected a MicrophoneRouteChangedException, got $reportedError",
+            reportedError is MicrophoneRouteChangedException)
+        assertFalse("recording must stop, not silently continue on whatever it got rerouted to",
+            recorder.isActive)
+
+        // The audio already captured before the reroute was noticed must not be lost.
+        val format = WavRiffParser.parse(segmentFile.inputStream())
+        assertNotNull("expected the segment to still finalize with the audio captured before the " +
+            "route change was noticed", format)
+        assertTrue("expected some real audio to have been preserved", (format?.dataSize ?: 0L) > 0L)
+    }
+
+    @Test
+    fun `a failure patching the final WAV header is reported via stop() as Failed, not a silent success`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount <= 2) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+            // position(0) is only ever called to seek back and (re)write the header -- regular
+            // audio writes never reposition -- so failing exactly that call simulates a header
+            // patch failure without disturbing normal data writes at all.
+            wrapChannel = { channel -> FailingHeaderPatchWriter(channel) }
+        )
+
+        var onErrorCalled = false
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { onErrorCalled = true }
+        )
+
+        val deadline = System.currentTimeMillis() + 2000
+        while (readCount < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+
+        val result = recorder.stop()
+
+        assertTrue("expected the header-patch failure to surface as FinalizeResult.Failed",
+            result is WavRecorder.FinalizeResult.Failed)
+        val failed = result as WavRecorder.FinalizeResult.Failed
+        assertTrue(failed.cause is WavFinalizationException)
+        assertEquals(segmentFile.absolutePath, (failed.target as? OutputTarget.FileTarget)?.file?.absolutePath)
+        // Finalization failures are reported through stop()'s return value, not the live-recording
+        // onError callback -- RecordingService is what turns this into "needs recovery" instead
+        // of a plain onError toast or a "Saved" status.
+        assertFalse("a stop()-time finalization failure must not also fire the generic onError " +
+            "callback", onErrorCalled)
+
+        // The audio captured before the failed patch must still be recoverable on disk, even
+        // though the header's declared size is now stale.
+        assertTrue("expected the raw audio bytes to still be on disk despite the header not " +
+            "being patched", segmentFile.length() > WavHeaderWriter.HEADER_SIZE)
+    }
+
+    @Test
+    fun `a failure closing the writer during final close is reported via stop() as Failed`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount <= 2) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+            wrapChannel = { channel -> FailingCloseWriter(channel) }
+        )
+
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {}
+        )
+
+        val deadline = System.currentTimeMillis() + 2000
+        while (readCount < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+
+        val result = recorder.stop()
+
+        assertTrue("expected the writer-close failure to surface as FinalizeResult.Failed",
+            result is WavRecorder.FinalizeResult.Failed)
+        assertTrue((result as WavRecorder.FinalizeResult.Failed).cause is WavFinalizationException)
+        assertTrue("expected the audio bytes already written to still be on disk",
+            segmentFile.length() > WavHeaderWriter.HEADER_SIZE)
+    }
+
+    @Test
+    fun `a finalization failure during rollover stops the recording instead of silently opening another segment`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        var segmentCreateCount = 0
+        // sampleRate=1 + segmentMaxSeconds=1 => segmentMaxBytes=2, so the first 4-byte chunk
+        // immediately triggers a rollover -- straight into the header patch failure below.
+        val fake = FakeAudioSource(scriptedReads = listOf(chunk, chunk, chunk))
+        val recorder = WavRecorder(
+            segmentMaxSeconds = 1,
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 1, bufferSize = chunk.size) },
+            wrapChannel = { channel -> FailingHeaderPatchWriter(channel) }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget {
+                segmentCreateCount++
+                OutputTarget.FileTarget(tempFolder.newFile("segment$segmentCreateCount.wav"))
+            },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        awaitTerminatedAndDeliverCallbacks(recorder)
+
+        assertTrue("expected the rollover's finalization failure to be reported like any other " +
+            "fatal error", reportedError is WavFinalizationException)
+        assertFalse(recorder.isActive)
+        assertEquals("a rollover that fails to finalize must not silently open a second segment " +
+            "and keep going", 1, segmentCreateCount)
+
+        // Confirms the finalization outcome is consistently "failed", not just that an error was
+        // reported once: a caller checking stop()'s result afterward (as RecordingService does)
+        // must also see this recording as needing recovery, never a plain success.
+        val result = recorder.stop()
+        assertTrue(result is WavRecorder.FinalizeResult.Failed)
     }
 }

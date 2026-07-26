@@ -67,7 +67,12 @@ class RecordFragment : Fragment() {
 
         override fun onError(e: Exception) {
             if (_binding != null) {
-                Toast.makeText(requireContext(), getString(R.string.recording_error, e.message), Toast.LENGTH_LONG).show()
+                val message = when (e) {
+                    is MicrophoneDisconnectedException -> getString(R.string.mic_disconnected_error)
+                    is MicrophoneRouteChangedException -> getString(R.string.mic_route_changed_error)
+                    else -> getString(R.string.recording_error, e.message)
+                }
+                Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
                 resetToIdle()
             }
         }
@@ -78,6 +83,35 @@ class RecordFragment : Fragment() {
                 binding.statusText.text = lastTarget?.let {
                     getString(R.string.status_saved, it.displayPath)
                 } ?: getString(R.string.status_idle)
+            }
+        }
+
+        override fun onMicrophoneInfo(info: MicrophoneInfo) {
+            if (_binding != null) updateMicDeviceLabel(info)
+        }
+
+        override fun onFinalizationFailed(target: OutputTarget?, cause: Exception) {
+            if (_binding != null) {
+                resetToIdle()
+                // Deliberately never worded as "saved" -- the header/writer didn't actually close
+                // cleanly, so the file (if any) needs to be treated as possibly needing recovery,
+                // not a normal successful result.
+                binding.statusText.text = target?.let {
+                    getString(R.string.recording_needs_recovery, it.displayPath, cause.message ?: "")
+                } ?: getString(R.string.recording_error, cause.message)
+            }
+        }
+
+        override fun onFinalizationUnknown(target: OutputTarget?) {
+            if (_binding != null) {
+                resetToIdle()
+                // Deliberately distinct from both "Saved" and "needs recovery": whether the last
+                // segment actually finished writing is genuinely unconfirmed (the recording thread
+                // never joined in time), not known to have failed -- wording this as a plain save
+                // would be a false confidence claim the recorder itself can't back up.
+                binding.statusText.text = target?.let {
+                    getString(R.string.recording_needs_verification, it.displayPath)
+                } ?: getString(R.string.recording_needs_verification_unknown_location)
             }
         }
     }
@@ -164,6 +198,7 @@ class RecordFragment : Fragment() {
             currentPartNumber = service.lastPartNumber
             binding.recordButton.text = getString(R.string.stop_recording)
             updateRecordingStatus()
+            service.lastMicrophoneInfo?.let { updateMicDeviceLabel(it) }
         }
     }
 
@@ -217,9 +252,18 @@ class RecordFragment : Fragment() {
         }
     }
 
+    private fun updateMicDeviceLabel(info: MicrophoneInfo) {
+        binding.micDeviceLabel.text = when {
+            !info.verified -> getString(R.string.mic_device_unverified, info.label)
+            info.isExternal -> getString(R.string.mic_device_external_verified, info.label)
+            else -> getString(R.string.mic_device_builtin_verified, info.label)
+        }
+    }
+
     private fun resetToIdle() {
         binding.recordButton.text = getString(R.string.start_recording)
         binding.statusText.text = getString(R.string.status_idle)
+        binding.micDeviceLabel.text = getString(R.string.mic_device_idle)
         binding.waveformView.clear()
     }
 

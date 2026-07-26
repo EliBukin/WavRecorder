@@ -41,6 +41,21 @@ class RecordingService : Service() {
         fun onSegmentStarted(target: OutputTarget, partNumber: Int)
         fun onError(e: Exception)
         fun onStopped(lastTarget: OutputTarget?)
+        /** The input device recording actually started capturing from, known as soon as
+         * [startRecording] returns. Default no-op so existing [Listener] implementations don't
+         * have to handle this if they don't display it. */
+        fun onMicrophoneInfo(info: MicrophoneInfo) {}
+        /** The recording was stopped, but the final segment's WAV header/writer failed to close
+         * cleanly -- [target] (if known) may be truncated or carry a stale header and should be
+         * treated as needing manual recovery, not a normal successful save. Fired *instead of*
+         * [onStopped], never both. */
+        fun onFinalizationFailed(target: OutputTarget?, cause: Exception) {}
+        /** The recording thread didn't finish within [WavRecorder]'s join timeout, so whether the
+         * final segment actually finalized cleanly is genuinely unknown -- it may still be running
+         * on its own in the background. [target] (if known) must be treated as unverified, not a
+         * confirmed save: never report a plain "Saved" here. Fired *instead of* [onStopped],
+         * never both. */
+        fun onFinalizationUnknown(target: OutputTarget?) {}
     }
 
     inner class LocalBinder : Binder() {
@@ -48,19 +63,29 @@ class RecordingService : Service() {
     }
 
     private val binder = LocalBinder()
-    private val recorder = WavRecorder()
-    private lateinit var destinationManager: DestinationManager
+    // Both settable (rather than a plain val) so tests can substitute a WavRecorder wired to a
+    // fake AudioSource instead of the real microphone, and/or a DestinationManager that fails on
+    // command (e.g. simulating a revoked SAF permission) without needing to reproduce that exact
+    // OS-level condition.
+    internal var recorder: WavRecorder = WavRecorder()
+    internal lateinit var destinationManager: DestinationManager
 
     private var sessionTimestamp: String? = null
     private val partCounter = AtomicInteger(0)
     private var currentTarget: OutputTarget? = null
     private var currentPartNumber = 1
+    private var microphoneInfo: MicrophoneInfo? = null
 
     var listener: Listener? = null
 
     val isRecording: Boolean get() = recorder.isActive
     val lastTarget: OutputTarget? get() = currentTarget
     val lastPartNumber: Int get() = currentPartNumber
+    /** The input device the current (or most recently started) session verified itself to be
+     * using; null once a session has been fully reset by a new [startRecording] call. Lets a
+     * fragment that reconnects mid-recording (e.g. after rotation) resync its display without
+     * waiting for a new session to start. */
+    val lastMicrophoneInfo: MicrophoneInfo? get() = microphoneInfo
 
     override fun onCreate() {
         super.onCreate()
@@ -79,6 +104,13 @@ class RecordingService : Service() {
 
     fun startRecording() {
         if (recorder.isActive) return
+        // Reset every piece of session state up front, before recorder.start() below even runs.
+        // Without this, a session that fails or is stopped before its first segment opens (so
+        // onSegmentStarted never fires to overwrite currentTarget) would otherwise leave the
+        // *previous* session's file sitting in currentTarget, and stopRecording() would then
+        // report that old, already-finished file as if it were this session's newly saved result.
+        currentTarget = null
+        microphoneInfo = null
         sessionTimestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         partCounter.set(0)
         currentPartNumber = 1
@@ -107,6 +139,10 @@ class RecordingService : Service() {
                 recorder.stop()
                 listener?.onError(e)
                 finishRecording()
+            },
+            onMicrophoneInfo = { info ->
+                microphoneInfo = info
+                listener?.onMicrophoneInfo(info)
             }
         )
 
@@ -119,8 +155,21 @@ class RecordingService : Service() {
     fun stopRecording() {
         if (!recorder.isActive) return
         val target = currentTarget
-        recorder.stop()
-        listener?.onStopped(target)
+        // Exhaustive over the sealed FinalizeResult (no else branch) so a future case added there
+        // can't silently fall through to onStopped() the way Unknown previously did here -- it had
+        // been lumped into a catch-all `else -> onStopped(target)` alongside Ok, which reported a
+        // plain "Saved" even when the recording thread never actually confirmed finalizing.
+        when (val result = recorder.stop()) {
+            is WavRecorder.FinalizeResult.Failed -> {
+                // Never report a plain "saved" when the header/writer didn't actually finalize
+                // cleanly -- result.target (from the recording thread itself) is preferred over
+                // the locally-tracked currentTarget since it's the one that was actually being
+                // finalized when this failed, but they're normally the same file.
+                listener?.onFinalizationFailed(result.target ?: target, result.cause)
+            }
+            WavRecorder.FinalizeResult.Unknown -> listener?.onFinalizationUnknown(target)
+            WavRecorder.FinalizeResult.Ok -> listener?.onStopped(target)
+        }
         finishRecording()
     }
 

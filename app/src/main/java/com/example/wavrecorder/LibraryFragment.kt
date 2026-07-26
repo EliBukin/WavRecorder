@@ -24,13 +24,16 @@ import com.example.wavrecorder.databinding.DialogStatsBinding
 import com.example.wavrecorder.databinding.FragmentLibraryBinding
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 
 class LibraryFragment : Fragment() {
 
     private var _binding: FragmentLibraryBinding? = null
     private val binding get() = _binding!!
 
-    private lateinit var destinationManager: DestinationManager
+    // internal + var (rather than private/val) so a test can substitute a DestinationManager
+    // subclass that fails on command, e.g. simulating a revoked SAF permission.
+    internal lateinit var destinationManager: DestinationManager
     private lateinit var adapter: RecordingsAdapter
 
     /** The currently loaded MediaPlayer, if any. It stays alive across pause/resume. */
@@ -38,6 +41,17 @@ class LibraryFragment : Fragment() {
     private var activeUri: Uri? = null
     private var activeDurationMs = 0
     private var currentSpeed = 1.0f
+    // True from the moment prepareAsync() is called until onPrepared/onError fires. MediaPlayer
+    // throws IllegalStateException for start()/pause()/seekTo()/playbackParams while still in its
+    // Preparing state, so every control path that isn't the initial playNew() call must check
+    // this and no-op instead of touching the player.
+    private var isPreparingPlayback = false
+
+    // Bumped on every refreshList() call; a scan result only gets applied if it's still the most
+    // recent one requested. Concurrent scans (e.g. onResume() firing again before a slow SAF
+    // listing finishes) can otherwise complete out of order and let a stale result clobber a
+    // newer one.
+    private val refreshRequestId = AtomicInteger(0)
 
     private val progressHandler = Handler(Looper.getMainLooper())
     private val progressTick = object : Runnable {
@@ -129,17 +143,49 @@ class LibraryFragment : Fragment() {
         refreshList()
     }
 
-    private fun refreshList() {
+    // internal for testing: a test swaps in a DestinationManager that throws, then calls this
+    // directly to exercise the failure path without waiting on the fragment's own onResume().
+    internal fun refreshList() {
         // Listing a SAF-picked folder walks DocumentFile, which is one Binder round-trip to the
         // storage provider per file (name, mime type, last-modified are each a separate query) -
         // enough to visibly stutter the tab on a slower provider, so this runs off the main thread.
+        // Captures only the manager reference (not `this`/the fragment/any view) so a slow or
+        // failing scan can't keep the fragment's view tree alive from a background thread.
         val manager = destinationManager
+        val appContext = requireContext().applicationContext
+        val requestId = refreshRequestId.incrementAndGet()
         Thread({
-            val items = manager.listRecordings()
+            // listRecordings() can throw -- a revoked SAF permission (folder deleted, permission
+            // pulled from Settings) surfaces as a SecurityException, and other provider failures
+            // are possible too. Previously nothing caught this, so the scan thread would die
+            // silently: no crash, but also no list update and no indication anything went wrong.
+            val result = try {
+                Result.success(manager.listRecordings())
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
             Handler(Looper.getMainLooper()).post {
                 if (_binding == null) return@post
-                adapter.submitList(items)
-                binding.emptyText.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+                // A newer refreshList() has since been requested; this result is stale (the two
+                // scans raced and this one lost) and must not overwrite the list with newer data
+                // -- true whether this scan succeeded or failed.
+                if (requestId != refreshRequestId.get()) return@post
+                result.fold(
+                    onSuccess = { items ->
+                        adapter.submitList(items)
+                        binding.emptyText.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+                    },
+                    onFailure = { e ->
+                        // Deliberately leaves the previously-shown list (if any) in place rather
+                        // than clearing it to empty -- a transient/permission failure shouldn't
+                        // make existing recordings look like they've vanished.
+                        Toast.makeText(
+                            appContext,
+                            getString(R.string.library_load_failed, e.message ?: e.javaClass.simpleName),
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                )
             }
         }, "LibraryScanThread").start()
     }
@@ -206,16 +252,30 @@ class LibraryFragment : Fragment() {
 
     private fun deleteRecording(item: RecordingItem) {
         if (item.uri == activeUri) releasePlayer()
-        val deleted = destinationManager.deleteRecording(item.uri)
-        if (!deleted) {
-            Toast.makeText(requireContext(), R.string.delete_failed, Toast.LENGTH_SHORT).show()
-        }
-        refreshList()
+        // DocumentFile.delete() on a SAF uri is a content-provider round trip like the listing
+        // above, and File.delete() itself can block on I/O too; either can janks the UI thread if
+        // run synchronously from this button-click handler.
+        val manager = destinationManager
+        val appContext = requireContext().applicationContext
+        Thread({
+            val deleted = manager.deleteRecording(item.uri)
+            Handler(Looper.getMainLooper()).post {
+                if (_binding == null) return@post
+                if (!deleted) {
+                    Toast.makeText(appContext, R.string.delete_failed, Toast.LENGTH_SHORT).show()
+                }
+                refreshList()
+            }
+        }, "DeleteRecordingThread").start()
     }
 
     private fun togglePlayPause(item: RecordingItem) {
         when {
             activeUri != item.uri -> playNew(item)
+            // Still waiting on onPrepared/onError for this same item; MediaPlayer isn't in a
+            // state that accepts start()/pause() yet, so ignore the extra tap rather than let it
+            // throw.
+            isPreparingPlayback -> Unit
             mediaPlayer?.isPlaying == true -> pauseActive()
             else -> resumeActive()
         }
@@ -227,19 +287,42 @@ class LibraryFragment : Fragment() {
             Toast.makeText(requireContext(), R.string.audio_focus_denied, Toast.LENGTH_SHORT).show()
             return
         }
+        // Marked active (and preparing) immediately so the list shows this row as the selected
+        // one right away, even though playback itself only starts once onPrepared fires.
+        activeUri = item.uri
+        currentSpeed = 1.0f
+        isPreparingPlayback = true
         try {
             val player = MediaPlayer().apply {
                 setDataSource(requireContext(), item.uri)
                 setOnCompletionListener { releasePlayer() }
-                prepare()
-                start()
+                setOnPreparedListener { mp ->
+                    isPreparingPlayback = false
+                    activeDurationMs = mp.duration
+                    mp.start()
+                    progressHandler.post(progressTick)
+                    adapter.notifyDataSetChanged()
+                }
+                setOnErrorListener { _, what, extra ->
+                    isPreparingPlayback = false
+                    Toast.makeText(
+                        requireContext(),
+                        getString(R.string.playback_failed, "error $what/$extra"),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    releasePlayer()
+                    true
+                }
+                // prepare() blocks the calling thread until the MediaExtractor/decoder is ready to
+                // go, which can take long enough on a slow SAF provider or large file to visibly
+                // stall the UI thread this is always called from. prepareAsync() hands the same
+                // work to MediaPlayer's own internal thread instead; setOnPreparedListener above
+                // is what actually starts playback once it's done.
+                prepareAsync()
             }
             mediaPlayer = player
-            activeUri = item.uri
-            activeDurationMs = player.duration
-            currentSpeed = 1.0f
-            progressHandler.post(progressTick)
         } catch (e: Exception) {
+            isPreparingPlayback = false
             Toast.makeText(requireContext(), getString(R.string.playback_failed, e.message), Toast.LENGTH_SHORT).show()
             releasePlayer()
             return
@@ -254,6 +337,7 @@ class LibraryFragment : Fragment() {
     }
 
     private fun resumeActive() {
+        if (isPreparingPlayback) return // not yet in a state that accepts start()
         if (!requestAudioFocus()) {
             Toast.makeText(requireContext(), R.string.audio_focus_denied, Toast.LENGTH_SHORT).show()
             return
@@ -264,11 +348,13 @@ class LibraryFragment : Fragment() {
     }
 
     private fun seekActiveTo(ms: Int) {
+        if (isPreparingPlayback) return // seekTo() before onPrepared throws
         mediaPlayer?.seekTo(ms)
         activeUri?.let { adapter.notifyProgressChanged(it) }
     }
 
     private fun cycleSpeed() {
+        if (isPreparingPlayback) return // playbackParams before onPrepared throws
         val player = mediaPlayer ?: return
         val currentIndex = SPEED_STEPS.indexOfFirst { it == currentSpeed }.let { if (it < 0) 0 else it }
         val nextSpeed = SPEED_STEPS[(currentIndex + 1) % SPEED_STEPS.size]
@@ -323,6 +409,8 @@ class LibraryFragment : Fragment() {
         progressHandler.removeCallbacks(progressTick)
         abandonAudioFocus()
         mediaPlayer?.apply {
+            // stop() while still in the Preparing state throws; release() is valid from any
+            // state regardless, so that alone is enough to tear the player down.
             try { stop() } catch (_: Exception) {}
             release()
         }
@@ -330,6 +418,7 @@ class LibraryFragment : Fragment() {
         activeUri = null
         activeDurationMs = 0
         currentSpeed = 1.0f
+        isPreparingPlayback = false
         adapter.notifyDataSetChanged()
     }
 

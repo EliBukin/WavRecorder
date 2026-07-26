@@ -2,7 +2,10 @@ package com.example.wavrecorder
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
@@ -20,6 +23,40 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.log10
 
+/** Describes the input device actually captured from, for display and for deciding whether
+ * disconnect-monitoring is even possible. [verified] is false whenever the real routed device
+ * couldn't be determined (an implementation/OS that doesn't support it, or a test fake) -- callers
+ * must not read [isExternal] as a confident "yes" in that case, only as "unknown". */
+data class MicrophoneInfo(
+    val label: String,
+    val isExternal: Boolean,
+    val verified: Boolean
+) {
+    companion object {
+        val UNVERIFIED = MicrophoneInfo(label = "Unverified input", isExternal = false, verified = false)
+    }
+}
+
+/** Thrown when the input device an already-running recording verified itself to be using
+ * disconnects mid-recording. Deliberately distinct from a generic I/O failure so the UI can show a
+ * message specific to "unplug the mic" rather than a generic recording error. */
+class MicrophoneDisconnectedException(message: String) : IOException(message)
+
+/** Thrown when a periodic re-check finds the actually-routed capture device no longer matches the
+ * one verified at recording start -- e.g. Android silently rerouting an active AudioRecord to the
+ * built-in mic without ever reporting the original device as removed, which is the specific gap
+ * [MicrophoneDisconnectedException] (driven entirely by AudioDeviceCallback.onAudioDevicesRemoved)
+ * cannot catch on its own. Kept as a distinct type so the UI can report accurately: the external
+ * mic may still be physically plugged in, it's just no longer the one actually being recorded. */
+class MicrophoneRouteChangedException(message: String) : IOException(message)
+
+/** Thrown by [WavRecorder.closeSegment] when the final WAV header patch or the writer's close
+ * failed: the audio bytes already written are very likely intact (they were flushed incrementally
+ * during recording; see HEADER_FLUSH_INTERVAL_MS), but the file's header may be stale or the last
+ * few buffers unflushed, so it needs to be treated as "may need recovery", never as a normal save. */
+class WavFinalizationException(val target: OutputTarget, cause: Exception) :
+    IOException("Failed to finalize ${target.displayPath}: ${cause.message}", cause)
+
 /** Thin seam over [AudioRecord] so recording logic (segment rollover, error handling) can be
  * unit tested with a fake instead of a real microphone. */
 interface AudioSource {
@@ -27,9 +64,153 @@ interface AudioSource {
     fun read(buffer: ByteArray, offset: Int, length: Int): Int
     fun stop()
     fun release()
+
+    /** Best-effort description of the device actually routed for capture, established once
+     * [startRecording] has succeeded. Default [MicrophoneInfo.UNVERIFIED]: a fake/test source (or
+     * a real one that can't determine routing) must never claim external-mic confidence it
+     * doesn't have. */
+    fun describeMicrophone(): MicrophoneInfo = MicrophoneInfo.UNVERIFIED
+
+    /** True as long as the input device verified in [describeMicrophone] is still present. A real
+     * implementation flips this to false the moment the OS reports that device removed -- default
+     * true means "no disconnect monitoring available for this source", not "definitely connected". */
+    fun isDeviceConnected(): Boolean = true
+
+    /** True as long as the capture device actually routed right now is still the one verified in
+     * [describeMicrophone]. Unlike [isDeviceConnected] (driven by an explicit OS removal
+     * callback), a real implementation re-checks this directly on the same cadence, catching a
+     * silent reroute (typically to the built-in mic) that never fires a removal callback at all
+     * because, as far as the OS is concerned, nothing was removed. Default true: no route
+     * re-verification available (a fake/test source, or a real one that never verified a route to
+     * begin with). */
+    fun isRouteUnchanged(): Boolean = true
 }
 
-private class SystemAudioSource(private val audioRecord: AudioRecord) : AudioSource {
+/** Types of [AudioDeviceInfo] that represent a physically attached microphone rather than the
+ * phone's own built-in hardware or a virtual/telephony source. Covers how the Insta360 Mic Air and
+ * similar accessories actually enumerate (USB, or a USB/3.5mm adapter reporting as a wired
+ * headset); Bluetooth SCO is included for a paired mic headset. */
+private fun isExternalInputType(type: Int): Boolean = when (type) {
+    AudioDeviceInfo.TYPE_USB_DEVICE,
+    AudioDeviceInfo.TYPE_USB_HEADSET,
+    AudioDeviceInfo.TYPE_USB_ACCESSORY,
+    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+    AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> true
+    else -> false
+}
+
+private fun genericLabelForType(type: Int): String = when (type) {
+    AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone microphone"
+    AudioDeviceInfo.TYPE_USB_DEVICE -> "USB microphone"
+    AudioDeviceInfo.TYPE_USB_HEADSET -> "USB headset microphone"
+    AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB accessory microphone"
+    AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset microphone"
+    AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth microphone"
+    else -> "External microphone"
+}
+
+/** Prefers the device's own reported product name (an Insta360 Mic Air identifies itself this way
+ * over USB) and only falls back to a generic type-based label when the OS doesn't supply one. */
+private fun friendlyDeviceLabel(device: AudioDeviceInfo): String {
+    val product = device.productName?.toString()?.trim().orEmpty()
+    return product.ifEmpty { genericLabelForType(device.type) }
+}
+
+/** An attached input device's reported product name is checked against this to prefer an actual
+ * Insta360 accessory (e.g. "Insta360 Mic Air") over some other external input when both are
+ * attached at once -- this app exists specifically for Insta360 field recording, so when there's
+ * a choice, that's the one that should win. */
+private fun isInsta360Device(device: AudioDeviceInfo): Boolean =
+    device.productName?.toString()?.contains("insta360", ignoreCase = true) == true
+
+/** The best attached input device that looks like a real external microphone rather than the
+ * phone's own hardware: an Insta360 accessory is preferred by product name over any other external
+ * input when several are attached at once, falling back to the first external input found. Only a
+ * preference either way: if it later turns out unusable, [AudioRecord] itself falls back to
+ * default routing, which [SystemAudioSource] then verifies (never assumes) via
+ * [AudioRecord.getRoutedDevice]. */
+private fun pickExternalInputDevice(audioManager: AudioManager): AudioDeviceInfo? {
+    val externalInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        ?.filter { isExternalInputType(it.type) }
+        ?: return null
+    return externalInputs.firstOrNull(::isInsta360Device) ?: externalInputs.firstOrNull()
+}
+
+private class SystemAudioSource(
+    private val audioRecord: AudioRecord,
+    private val audioManager: AudioManager
+) : AudioSource {
+    @Volatile private var micInfo: MicrophoneInfo = MicrophoneInfo.UNVERIFIED
+    @Volatile private var deviceConnected: Boolean = true
+    private var routedDeviceId: Int? = null
+    private var routedDeviceWasExternal: Boolean = false
+    private var deviceCallback: AudioDeviceCallback? = null
+
+    override fun startRecording() {
+        audioRecord.startRecording()
+
+        // Only knowable once recording has actually started -- routing isn't established before
+        // that, so checking any earlier would either return null or a stale/default guess. This
+        // is the "verify, don't assume" step: UNPROCESSED/MIC being the chosen AudioSource type
+        // says nothing about *which physical device* ended up routed.
+        val routed = audioRecord.routedDevice ?: return
+        routedDeviceId = routed.id
+        routedDeviceWasExternal = isExternalInputType(routed.type)
+        micInfo = MicrophoneInfo(
+            label = friendlyDeviceLabel(routed),
+            isExternal = routedDeviceWasExternal,
+            verified = true
+        )
+
+        // Only arms disconnect-watching for a verified *external* device: the built-in mic can't
+        // "disconnect", and without a verified routedDeviceId there's nothing concrete to match a
+        // removal event against.
+        if (isExternalInputType(routed.type)) {
+            val callback = object : AudioDeviceCallback() {
+                override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) {
+                    if (removedDevices.any { it.id == routedDeviceId }) {
+                        deviceConnected = false
+                    }
+                }
+            }
+            deviceCallback = callback
+            // Callbacks land on the caller's own looper (main, here) when handler is null; that's
+            // fine since all this does is flip a volatile flag -- recordLoop() is what actually
+            // acts on it, from the recording thread, at its own pace (see isDeviceConnected()).
+            audioManager.registerAudioDeviceCallback(callback, null)
+        }
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
+        audioRecord.read(buffer, offset, length)
+    override fun stop() = audioRecord.stop()
+    override fun release() {
+        deviceCallback?.let { audioManager.unregisterAudioDeviceCallback(it) }
+        deviceCallback = null
+        audioRecord.release()
+    }
+    override fun describeMicrophone(): MicrophoneInfo = micInfo
+
+    override fun isDeviceConnected(): Boolean = deviceConnected
+
+    // Independent of the AudioDeviceCallback-driven deviceConnected flag above: this re-checks
+    // AudioRecord's own live routing directly, so a reroute the OS never reports as a "removal" at
+    // all (most commonly a silent fallback to the built-in mic while the external device is still
+    // physically attached, e.g. a transient USB glitch) still gets caught, on the same cadence.
+    override fun isRouteUnchanged(): Boolean {
+        val verifiedId = routedDeviceId ?: return true
+        val routed = audioRecord.routedDevice ?: return false
+        if (routed.id != verifiedId) return false
+        if (routedDeviceWasExternal && !isExternalInputType(routed.type)) return false
+        return true
+    }
+}
+
+/** Fallback for the (practically never expected) case where [AudioManager] itself isn't
+ * available: recording still proceeds using default routing, it's just unverifiable, so this
+ * relies entirely on [AudioSource]'s default "unverified"/"always connected" behavior rather than
+ * claiming external-mic confidence -- or disconnect-monitoring -- it has no way to back up. */
+private class UnmonitorableAudioSource(private val audioRecord: AudioRecord) : AudioSource {
     override fun startRecording() = audioRecord.startRecording()
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
         audioRecord.read(buffer, offset, length)
@@ -45,6 +226,11 @@ interface SegmentWriter {
     fun position(): Long
     fun position(newPosition: Long)
     fun close()
+
+    /** Best-effort: push already-written bytes past the OS page cache to physical storage, so
+     * captured audio survives a hard crash/power loss rather than just an app-level one (which the
+     * page cache alone already covers). Default no-op for writers that can't do this (e.g. tests). */
+    fun force() {}
 }
 
 private class FileChannelSegmentWriter(private val channel: FileChannel) : SegmentWriter {
@@ -54,6 +240,7 @@ private class FileChannelSegmentWriter(private val channel: FileChannel) : Segme
         channel.position(newPosition)
     }
     override fun close() = channel.close()
+    override fun force() = channel.force(false) // false: skip syncing metadata/timestamps, just data
 }
 
 /**
@@ -72,7 +259,11 @@ private class FileChannelSegmentWriter(private val channel: FileChannel) : Segme
 class WavRecorder(
     private val segmentMaxSeconds: Long = SEGMENT_MAX_SECONDS,
     private val threadJoinTimeoutMs: Long = THREAD_JOIN_TIMEOUT_MS,
-    private val openAudioSource: () -> RecorderConfig = ::openBestAudioRecord,
+    // Configurable (like the two above) purely so tests can shrink the real-time cost of
+    // exercising the header-flush/disconnect-check cadence instead of waiting out the production
+    // default every time.
+    private val headerFlushIntervalMs: Long = HEADER_FLUSH_INTERVAL_MS,
+    private val openAudioSource: (Context) -> RecorderConfig = ::openBestAudioRecord,
     private val wrapChannel: (FileChannel) -> SegmentWriter = { FileChannelSegmentWriter(it) }
 ) {
 
@@ -93,8 +284,14 @@ class WavRecorder(
 
         // Re-patch the header periodically so a mid-recording process kill (low memory, task
         // kill, crash) still leaves a valid, playable WAV file instead of one whose header
-        // claims zero bytes of audio.
+        // claims zero bytes of audio. Disconnect-monitoring piggybacks on the same cadence (see
+        // recordLoop()) rather than being checked on every single read, for the same reason.
         private const val HEADER_FLUSH_INTERVAL_MS = 3000L
+
+        // Forcing every write to physical storage would be needless I/O/battery cost; this only
+        // needs to bound how much audio a hard crash/power loss (not just an app-level failure,
+        // which the OS page cache already survives) could lose, so a much coarser interval is fine.
+        private const val DATA_FORCE_INTERVAL_MS = 30_000L
 
         // stop() releases the AudioSource before joining so a blocked mic read gets kicked loose
         // first; this timeout is just a backstop against the recording thread being stuck
@@ -109,9 +306,23 @@ class WavRecorder(
 
     class RecorderConfig(val source: AudioSource, val sampleRate: Int, val bufferSize: Int)
 
+    /** Result of the final segment's finalization, known by the time [stop] returns (assuming the
+     * recording thread actually joined within [threadJoinTimeoutMs]). */
+    sealed class FinalizeResult {
+        /** The last segment's header/writer closed cleanly. */
+        object Ok : FinalizeResult()
+        /** The recording thread didn't finish within the join timeout, so whether the last
+         * segment finalized cleanly is unknown -- it may still be running on its own. */
+        object Unknown : FinalizeResult()
+        /** The last segment's header patch or writer close failed; [target] (if known) may be
+         * truncated or carry a stale header and should be treated as needing recovery. */
+        data class Failed(val target: OutputTarget?, val cause: Exception) : FinalizeResult()
+    }
+
     private var audioSource: AudioSource? = null
     private var recordingThread: Thread? = null
     private val isRecording = AtomicBoolean(false)
+    @Volatile private var lastFinalizeResult: FinalizeResult = FinalizeResult.Ok
 
     // Bumped on every start() *and* on every stop(). recordLoop() captures the value current at
     // its own launch and rechecks it (together with isRecording) before mutating any shared
@@ -124,6 +335,13 @@ class WavRecorder(
     // yet delivered) get suppressed when they run, rather than only future ones.
     private val generation = AtomicInteger(0)
 
+    // Bumped only by start() -- never by stop() -- purely so a recording thread's finally block
+    // can tell whether a *newer* session has since begun by the time it actually runs, before
+    // writing lastFinalizeResult. generation can't be reused for this: stop() always bumps it as
+    // part of a session's own normal shutdown, moments before that same session's finally block
+    // even runs, which would make a session unable to ever report its own finalization result.
+    private val sessionCounter = AtomicInteger(0)
+
     val isActive: Boolean get() = isRecording.get()
 
     @SuppressLint("MissingPermission")
@@ -132,7 +350,8 @@ class WavRecorder(
         nextTarget: NextTarget,
         onSegmentStarted: (OutputTarget) -> Unit,
         onAmplitude: (Float) -> Unit,
-        onError: (Exception) -> Unit
+        onError: (Exception) -> Unit,
+        onMicrophoneInfo: (MicrophoneInfo) -> Unit = {}
     ) {
         if (isRecording.get()) return
 
@@ -141,7 +360,7 @@ class WavRecorder(
         // be allowed to propagate as an uncaught exception on the caller's thread.
         val config: RecorderConfig
         try {
-            config = openAudioSource()
+            config = openAudioSource(context)
         } catch (e: Exception) {
             onError(e)
             return
@@ -164,11 +383,18 @@ class WavRecorder(
             return
         }
 
+        // Established synchronously (this runs on the caller's thread, before the recording
+        // thread even exists) so a UI observing this call can show the active input immediately,
+        // not after the first segment/amplitude callback arrives from the background thread.
+        onMicrophoneInfo(source.describeMicrophone())
+
+        lastFinalizeResult = FinalizeResult.Ok
         val myGeneration = generation.incrementAndGet()
+        val mySession = sessionCounter.incrementAndGet()
         isRecording.set(true)
         recordingThread = Thread({
             recordLoop(
-                myGeneration, context, source, nextTarget, config.bufferSize, sampleRate,
+                myGeneration, mySession, context, source, nextTarget, config.bufferSize, sampleRate,
                 segmentMaxBytes, onSegmentStarted, onAmplitude, onError
             )
         }, "WavRecorderThread").apply { start() }
@@ -191,8 +417,14 @@ class WavRecorder(
      * wedged driver, not just a blocked read), this gives up waiting rather than hanging the
      * caller forever. That thread is then on its own: [generation] is what keeps it from
      * corrupting a subsequent session if/when it eventually does resume.
+     *
+     * Returns whether the just-stopped session's final segment actually finalized cleanly.
+     * [recordLoop]'s finally block runs entirely on the recording thread before it terminates, so
+     * by the time [Thread.join] returns having actually joined (not timed out), that result is
+     * already known -- callers use this to decide whether it's safe to report a plain "saved" or
+     * whether the file may need recovery, instead of always assuming success.
      */
-    fun stop() {
+    fun stop(): FinalizeResult {
         isRecording.set(false)
         // Invalidate this session's generation too: a callback the recording thread already
         // posted to the main looper before observing isRecording=false (e.g. the amplitude
@@ -219,12 +451,15 @@ class WavRecorder(
                 // is stuck on will eventually return, at which point it'll find (via
                 // [generation]) that it's no longer the current session and back off quietly.
                 thread.interrupt()
+                return FinalizeResult.Unknown
             }
         }
+        return lastFinalizeResult
     }
 
     private fun recordLoop(
         myGeneration: Int,
+        mySession: Int,
         context: Context,
         source: AudioSource,
         nextTarget: NextTarget,
@@ -285,12 +520,41 @@ class WavRecorder(
                     postIfCurrent(myGeneration, handler) { onAmplitude(amplitude) }
 
                     val now = System.currentTimeMillis()
-                    if (now - segment.lastHeaderFlush >= HEADER_FLUSH_INTERVAL_MS) {
+                    if (now - segment.lastHeaderFlush >= headerFlushIntervalMs) {
+                        // Piggybacks on the header-flush cadence rather than being checked on
+                        // every read: a real AudioRecord can keep handing back samples for a
+                        // short while after its routed device is actually gone (buffered/stale
+                        // data, or silently re-routed to the phone mic), so this doesn't need
+                        // read()-level responsiveness -- it just must not go unnoticed for long.
+                        if (!source.isDeviceConnected()) {
+                            throw MicrophoneDisconnectedException(
+                                "External microphone disconnected during recording"
+                            )
+                        }
+                        // Checked in addition to (not instead of) isDeviceConnected() above: a
+                        // silent reroute away from the verified device may never fire a removal
+                        // callback at all, so relying on that alone would let recording continue
+                        // unnoticed on the phone mic.
+                        if (!source.isRouteUnchanged()) {
+                            throw MicrophoneRouteChangedException(
+                                "Recording input changed unexpectedly; no longer using the " +
+                                    "verified external microphone"
+                            )
+                        }
                         flushHeader(segment, sampleRate)
                         segment.lastHeaderFlush = now
                     }
+                    if (now - segment.lastForce >= DATA_FORCE_INTERVAL_MS) {
+                        forceSegment(segment)
+                        segment.lastForce = now
+                    }
 
                     if (segment.audioLen >= segmentMaxBytes) {
+                        // closeSegment() now throws on a genuine finalization failure (header
+                        // patch or writer close) instead of swallowing it -- letting that
+                        // propagate here means a rollover that fails to finalize is treated as
+                        // fatal via the same catch below, instead of silently opening a new
+                        // segment and continuing as if nothing happened.
                         closeSegment(context, segment, sampleRate)
                         segment = openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted)
                     }
@@ -300,8 +564,28 @@ class WavRecorder(
                 }
             }
         } finally {
-            closeSegment(context, segment, sampleRate)
+            // Deliberately not left to propagate uncaught: this runs in the recording thread's
+            // own finally block with nothing above it on the call stack to catch it, so an
+            // uncaught failure here would silently kill the thread while isRecording stayed true
+            // forever -- the exact silent-hang bug finalization errors must not cause. The result
+            // is instead handed to stop() (see lastFinalizeResult/FinalizeResult) so the caller
+            // can tell a genuine save apart from a segment that needs recovery.
+            try {
+                closeSegment(context, segment, sampleRate)
+                if (sessionCounter.get() == mySession) lastFinalizeResult = FinalizeResult.Ok
+            } catch (e: Exception) {
+                if (sessionCounter.get() == mySession) {
+                    lastFinalizeResult = FinalizeResult.Failed(segment.target, e)
+                }
+            }
         }
+    }
+
+    /** Best-effort: not fatal on its own if it fails, since it's purely a durability nicety (see
+     * DATA_FORCE_INTERVAL_MS) -- the audio isn't lost, it just hasn't been proactively pushed past
+     * the OS page cache yet, and the next periodic force (or the final close) will catch up. */
+    private fun forceSegment(segment: Segment) {
+        try { segment.writer.force() } catch (_: Exception) {}
     }
 
     /**
@@ -330,6 +614,7 @@ class WavRecorder(
     private class Segment(val target: OutputTarget, val writer: SegmentWriter, val pfd: ParcelFileDescriptor?) {
         var audioLen = 0L
         var lastHeaderFlush = System.currentTimeMillis()
+        var lastForce = System.currentTimeMillis()
     }
 
     /** Best-effort: rewrites the header in place without disturbing the write position. */
@@ -351,26 +636,45 @@ class WavRecorder(
         onSegmentStarted: (OutputTarget) -> Unit
     ): Segment {
         val target = nextTarget.create()
+        // Declared outside the try so a failure partway through construction (a bad truncate, a
+        // wrapChannel seam throwing, a disk-full header write) still leaves the catch block a
+        // reference to whatever was actually opened before the failure -- each is assigned
+        // immediately after its constructor/open call succeeds, before the next fallible step.
+        var raf: RandomAccessFile? = null
         var pfd: ParcelFileDescriptor? = null
-        val channel = when (target) {
-            is OutputTarget.FileTarget -> {
-                val raf = RandomAccessFile(target.file, "rw")
-                raf.setLength(0)
-                raf.channel
+        var channel: FileChannel? = null
+        try {
+            when (target) {
+                is OutputTarget.FileTarget -> {
+                    val r = RandomAccessFile(target.file, "rw")
+                    raf = r
+                    channel = r.channel
+                    r.setLength(0)
+                }
+                is OutputTarget.SafTarget -> {
+                    val opened = context.contentResolver.openFileDescriptor(target.uri, "rw")
+                        ?: throw IllegalStateException("Cannot open the selected destination")
+                    pfd = opened
+                    val fc = FileOutputStream(opened.fileDescriptor).channel
+                    channel = fc
+                    fc.truncate(0)
+                }
             }
-            is OutputTarget.SafTarget -> {
-                val opened = context.contentResolver.openFileDescriptor(target.uri, "rw")
-                    ?: throw IllegalStateException("Cannot open the selected destination")
-                pfd = opened
-                val fc = FileOutputStream(opened.fileDescriptor).channel
-                fc.truncate(0)
-                fc
-            }
+            val writer = wrapChannel(channel!!)
+            writeFully(writer, WavHeaderWriter.placeholder())
+            postIfCurrent(myGeneration, handler) { onSegmentStarted(target) }
+            return Segment(target, writer, pfd)
+        } catch (e: Exception) {
+            // Without this, any of the failures above would leak the FileChannel/RandomAccessFile
+            // (or, for SAF, the ParcelFileDescriptor's underlying fd) and leave a partial/empty
+            // file behind that closeSegment() never gets a chance to clean up, since a Segment was
+            // never successfully constructed.
+            try { channel?.close() } catch (_: Exception) {}
+            try { raf?.close() } catch (_: Exception) {}
+            try { pfd?.close() } catch (_: Exception) {}
+            deleteSegmentFile(context, target)
+            throw e
         }
-        val writer = wrapChannel(channel)
-        writeFully(writer, WavHeaderWriter.placeholder())
-        postIfCurrent(myGeneration, handler) { onSegmentStarted(target) }
-        return Segment(target, writer, pfd)
     }
 
     /**
@@ -380,21 +684,46 @@ class WavRecorder(
      * ever written to it — most commonly the still-open segment at the moment recording stops —
      * finalizing it would leave a silent, pointless 0-byte-audio WAV file behind in the user's
      * library. Delete it instead of patching a "valid" empty header onto it.
+     *
+     * A failure patching the final header or closing the writer used to be swallowed here, which
+     * meant a caller could report "Saved" for a file whose header never actually got the right
+     * size written to it (or whose last buffered bytes never made it past the writer). Both are
+     * now collected and thrown as a [WavFinalizationException] instead -- every other cleanup step
+     * (the fd close, deleting an empty segment) still runs first regardless, so this only ever
+     * reports a failure *after* doing everything it can to leave the file in the best state
+     * possible; it never skips cleanup just because it's about to report a problem.
      */
     private fun closeSegment(context: Context, segment: Segment, sampleRate: Int) {
+        var failure: Exception? = null
         if (segment.audioLen > 0L) {
             try {
                 patchWavHeader(segment.writer, segment.audioLen, sampleRate)
-            } catch (_: Exception) {
-                // Best-effort: the periodic flushHeader() calls during recording mean the header
-                // is very likely already correct on disk even if this final patch fails.
+            } catch (e: Exception) {
+                failure = e
             }
         }
-        try { segment.writer.close() } catch (_: Exception) {}
-        try { segment.pfd?.close() } catch (_: Exception) {}
+        try {
+            segment.writer.close()
+        } catch (e: Exception) {
+            // The header patch above is what's least likely to have actually reached disk (it's a
+            // tiny seek-and-rewrite at the very end), so if it already failed, that's the more
+            // informative cause to surface; a close() failure on top is very often a downstream
+            // symptom of the same broken channel/destination, not a separate root cause.
+            if (failure == null) failure = e
+        }
+        try {
+            segment.pfd?.close()
+        } catch (_: Exception) {
+            // Secondary fd release for a SAF destination; the writer/channel close above is what
+            // actually flushes/finalizes the data, so a failure here alone isn't treated as fatal.
+        }
 
         if (segment.audioLen <= 0L) {
             deleteSegmentFile(context, segment.target)
+        }
+
+        if (failure != null) {
+            throw WavFinalizationException(segment.target, failure)
         }
     }
 
@@ -464,10 +793,23 @@ private fun writeFully(writer: SegmentWriter, data: ByteBuffer) {
  * dedicated mic that's pure downside. It's not guaranteed on every device, so this falls
  * back to the general-purpose MIC source if UNPROCESSED fails to initialize, and falls back
  * from 48kHz to 44.1kHz if the higher rate isn't supported.
+ *
+ * Neither AudioSource type says anything about *which physical input device* actually ends up
+ * routed, though: on a phone with an external mic attached, the OS still decides that routing on
+ * its own. [AudioRecord.Builder.setPreferredDevice] is only a request -- it can silently fall
+ * back to the built-in mic if the preferred device becomes unusable between selection and start
+ * -- so [SystemAudioSource] verifies the *actual* routed device once recording begins rather than
+ * trusting this preference; see [SystemAudioSource.startRecording].
  */
-private fun openBestAudioRecord(): WavRecorder.RecorderConfig {
+@SuppressLint("MissingPermission")
+private fun openBestAudioRecord(context: Context): WavRecorder.RecorderConfig {
     val channelConfig = WavRecorder.CHANNEL_CONFIG
     val audioFormat = WavRecorder.AUDIO_FORMAT
+    // A required system service; only nullable in the framework's generic getSystemService(Class)
+    // signature. Without it there's no way to verify or monitor routing at all, so this falls
+    // back to the same "unverified" path a device lacking explicit-routing support would take.
+    val audioManager = context.getSystemService(AudioManager::class.java)
+    val preferredDevice = audioManager?.let(::pickExternalInputDevice)
 
     val sources = buildList {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) add(MediaRecorder.AudioSource.UNPROCESSED)
@@ -482,9 +824,31 @@ private fun openBestAudioRecord(): WavRecorder.RecorderConfig {
                 val minBufferSize = AudioRecord.getMinBufferSize(rate, channelConfig, audioFormat)
                 if (minBufferSize <= 0) continue
                 val bufferSize = minBufferSize * 2
-                candidate = AudioRecord(source, rate, channelConfig, audioFormat, bufferSize)
+                candidate = AudioRecord.Builder()
+                    .setAudioSource(source)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(audioFormat)
+                            .setSampleRate(rate)
+                            .setChannelMask(channelConfig)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufferSize)
+                    .build()
                 if (candidate.state == AudioRecord.STATE_INITIALIZED) {
-                    return WavRecorder.RecorderConfig(SystemAudioSource(candidate), rate, bufferSize)
+                    // setPreferredDevice() is an AudioRouting instance method (API 28+), not a
+                    // Builder step -- and only a *request* either way, which is exactly why
+                    // SystemAudioSource still verifies the device that actually ends up routed
+                    // afterward rather than trusting this was honored.
+                    if (preferredDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        candidate.setPreferredDevice(preferredDevice)
+                    }
+                    val audioSource = if (audioManager != null) {
+                        SystemAudioSource(candidate, audioManager)
+                    } else {
+                        UnmonitorableAudioSource(candidate)
+                    }
+                    return WavRecorder.RecorderConfig(audioSource, rate, bufferSize)
                 }
                 candidate.release()
             } catch (e: Exception) {

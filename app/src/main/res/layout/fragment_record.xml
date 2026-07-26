@@ -30,6 +30,14 @@
 
     </LinearLayout>
 
+    <TextView
+        android:id="@+id/micDeviceLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/mic_device_idle"
+        android:textSize="13sp" />
+
     <com.example.wavrecorder.WaveformView
         android:id="@+id/waveformView"
         android:layout_width="match_parent"
