@@ -90,7 +90,7 @@ interface AudioSource {
  * phone's own built-in hardware or a virtual/telephony source. Covers how the Insta360 Mic Air and
  * similar accessories actually enumerate (USB, or a USB/3.5mm adapter reporting as a wired
  * headset); Bluetooth SCO is included for a paired mic headset. */
-private fun isExternalInputType(type: Int): Boolean = when (type) {
+internal fun isExternalInputType(type: Int): Boolean = when (type) {
     AudioDeviceInfo.TYPE_USB_DEVICE,
     AudioDeviceInfo.TYPE_USB_HEADSET,
     AudioDeviceInfo.TYPE_USB_ACCESSORY,
@@ -111,7 +111,7 @@ private fun genericLabelForType(type: Int): String = when (type) {
 
 /** Prefers the device's own reported product name (an Insta360 Mic Air identifies itself this way
  * over USB) and only falls back to a generic type-based label when the OS doesn't supply one. */
-private fun friendlyDeviceLabel(device: AudioDeviceInfo): String {
+internal fun friendlyDeviceLabel(device: AudioDeviceInfo): String {
     val product = device.productName?.toString()?.trim().orEmpty()
     return product.ifEmpty { genericLabelForType(device.type) }
 }
@@ -120,7 +120,7 @@ private fun friendlyDeviceLabel(device: AudioDeviceInfo): String {
  * Insta360 accessory (e.g. "Insta360 Mic Air") over some other external input when both are
  * attached at once -- this app exists specifically for Insta360 field recording, so when there's
  * a choice, that's the one that should win. */
-private fun isInsta360Device(device: AudioDeviceInfo): Boolean =
+internal fun isInsta360Device(device: AudioDeviceInfo): Boolean =
     device.productName?.toString()?.contains("insta360", ignoreCase = true) == true
 
 /** The best attached input device that looks like a real external microphone rather than the

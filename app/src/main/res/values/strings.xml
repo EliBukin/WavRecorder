@@ -36,6 +36,12 @@
     <string name="mic_device_external_verified">Input: %1$s (external, verified)</string>
     <string name="mic_device_builtin_verified">Input: %1$s</string>
     <string name="mic_device_unverified">Input: %1$s (unverified)</string>
+    <string name="mic_idle_insta360_connected">%1$s connected — preferred input</string>
+    <string name="mic_idle_external_connected">External microphone connected — preferred input</string>
+    <string name="mic_idle_none_detected">No external microphone detected</string>
+    <string name="no_external_mic_confirm_message">No external microphone was detected. Continue using the phone microphone?</string>
+    <string name="no_external_mic_confirm_positive">Continue</string>
+    <string name="no_external_mic_confirm_cancel">Cancel</string>
     <string name="mic_disconnected_error">External microphone disconnected. Recording was stopped and saved up to that point.</string>
     <string name="mic_route_changed_error">Recording input changed unexpectedly (no longer using the external microphone). Recording was stopped and saved up to that point.</string>
     <string name="recording_needs_recovery">Recording stopped, but the file may need recovery: %1$s\n(%2$s)</string>

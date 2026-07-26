@@ -3,6 +3,8 @@ package com.example.wavrecorder
 import android.Manifest
 import android.app.Application
 import android.content.ComponentName
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import androidx.fragment.app.testing.launchFragmentInContainer
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -15,6 +17,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.AudioDeviceInfoBuilder
 import org.robolectric.shadows.ShadowToast
 
 /**
@@ -42,6 +45,15 @@ class RecordFragmentPermissionTest {
         shadowOf(app()).setComponentNameAndServiceForBindService(
             ComponentName(app(), RecordingService::class.java),
             binder
+        )
+
+        // These tests are specifically about the permission flow, not mic detection -- registering
+        // a generic external input device keeps the new no-external-mic confirmation dialog (see
+        // RecordFragmentMicStatusTest) out of their way, so a record-button tap still starts
+        // recording directly once permissions are settled, exactly as before that dialog existed.
+        val audioManager = app().getSystemService(AudioManager::class.java)
+        shadowOf(audioManager).setInputDevices(
+            listOf(AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_USB_DEVICE).build())
         )
     }
 

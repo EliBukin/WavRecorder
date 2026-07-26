@@ -6,6 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -31,6 +34,17 @@ class RecordFragment : Fragment() {
     private var recordingService: RecordingService? = null
     private var isBound = false
     private var pendingStart = false
+
+    private var audioManager: AudioManager? = null
+    // Defaults to "none detected" rather than an optimistic guess: until the first real query
+    // runs (see refreshPreferredMicStatus(), called from onStart()), there's nothing to back up
+    // any stronger claim, and a stale "connected" default could let a Record tap skip the
+    // no-external-mic confirmation it's specifically meant to guard.
+    private var latestPreferredMicStatus: PreferredMicStatus = PreferredMicStatus.NoneDetected
+    private val audioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) = refreshPreferredMicStatus()
+        override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) = refreshPreferredMicStatus()
+    }
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -162,12 +176,24 @@ class RecordFragment : Fragment() {
 
         binding.chooseFolderButton.setOnClickListener { folderPicker.launch(null) }
         binding.recordButton.setOnClickListener {
-            if (recordingService?.isRecording == true) confirmStopRecording() else requestPermissionAndRecord()
+            when {
+                recordingService?.isRecording == true -> confirmStopRecording()
+                latestPreferredMicStatus == PreferredMicStatus.NoneDetected -> confirmRecordWithoutExternalMic()
+                else -> requestPermissionAndRecord()
+            }
         }
     }
 
     override fun onStart() {
         super.onStart()
+        // Registered for exactly as long as this screen is visible, mirroring the service
+        // binding just below -- so the idle status can react immediately to a mic being plugged
+        // in or removed while the user is looking at this screen, without waiting for a
+        // recording to be in progress (that path is covered separately, by SystemAudioSource).
+        audioManager = requireContext().getSystemService(AudioManager::class.java)
+        audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
+        refreshPreferredMicStatus()
+
         // Bind whenever visible so we always have a live channel for waveform/status updates
         // and can resync with a recording that's been running in the background (screen off,
         // another app in front) since we were last here.
@@ -180,6 +206,9 @@ class RecordFragment : Fragment() {
 
     override fun onStop() {
         super.onStop()
+        audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+        audioManager = null
+
         // Only detaches the UI's live connection — the service is independently started via
         // startForegroundService() once recording begins, so it (and the recording) keeps
         // running after this unbind, which is the whole point.
@@ -208,6 +237,18 @@ class RecordFragment : Fragment() {
             .setMessage(R.string.stop_confirm_message)
             .setNegativeButton(R.string.stop_confirm_cancel, null)
             .setPositiveButton(R.string.stop_confirm_positive) { _, _ -> recordingService?.stopRecording() }
+            .show()
+    }
+
+    /** Recording is never blocked on this -- it's purely a heads-up, since the phone's own mic is
+     * a perfectly valid (if non-preferred) input, and the post-start route verification (see
+     * RecordingService.Listener.onMicrophoneInfo/onError) remains the actual source of truth
+     * regardless of what the user chooses here. */
+    private fun confirmRecordWithoutExternalMic() {
+        MaterialAlertDialogBuilder(requireContext())
+            .setMessage(R.string.no_external_mic_confirm_message)
+            .setNegativeButton(R.string.no_external_mic_confirm_cancel, null)
+            .setPositiveButton(R.string.no_external_mic_confirm_positive) { _, _ -> requestPermissionAndRecord() }
             .show()
     }
 
@@ -260,10 +301,34 @@ class RecordFragment : Fragment() {
         }
     }
 
+    /** Re-queries [AudioManager] for the currently preferred input device and, unless a recording
+     * is actually in progress right now, reflects it in the idle status label immediately -- called
+     * from [onStart] and every time [audioDeviceCallback] fires. [latestPreferredMicStatus] itself
+     * is always kept current regardless of recording state, so the moment recording actually does
+     * stop (see [resetToIdle]), the label reflects reality rather than a status computed before
+     * whatever changed (e.g. the mic that had been recording from disconnecting) was noticed. */
+    private fun refreshPreferredMicStatus() {
+        latestPreferredMicStatus = queryPreferredMicStatus(audioManager)
+        if (recordingService?.isRecording != true) updateIdleMicStatusLabel()
+    }
+
+    /** Deliberately worded as "connected"/"detected", never "verified" or "active" -- this is only
+     * ever a claim about AudioManager's attached-device list, not about what an actual AudioRecord
+     * would end up routed to; see [PreferredMicStatus]. */
+    private fun updateIdleMicStatusLabel() {
+        if (_binding == null) return
+        binding.micDeviceLabel.text = when (val status = latestPreferredMicStatus) {
+            is PreferredMicStatus.Insta360Connected ->
+                getString(R.string.mic_idle_insta360_connected, status.label)
+            PreferredMicStatus.ExternalConnected -> getString(R.string.mic_idle_external_connected)
+            PreferredMicStatus.NoneDetected -> getString(R.string.mic_idle_none_detected)
+        }
+    }
+
     private fun resetToIdle() {
         binding.recordButton.text = getString(R.string.start_recording)
         binding.statusText.text = getString(R.string.status_idle)
-        binding.micDeviceLabel.text = getString(R.string.mic_device_idle)
+        updateIdleMicStatusLabel()
         binding.waveformView.clear()
     }
 
