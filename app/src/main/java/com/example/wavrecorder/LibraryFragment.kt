@@ -46,6 +46,11 @@ class LibraryFragment : Fragment() {
     // Preparing state, so every control path that isn't the initial playNew() call must check
     // this and no-op instead of touching the player.
     private var isPreparingPlayback = false
+    // Set when a focus loss (of either kind) arrives while still Preparing: onPrepared checks this
+    // instead of unconditionally auto-starting, so a track that lost focus before it ever finished
+    // preparing doesn't start playing anyway. Cleared by onPrepared itself, or by a focus-gain that
+    // arrives before preparation finishes (see audioFocusListener).
+    private var suppressAutoStartOnPrepared = false
 
     // Bumped on every refreshList() call; a scan result only gets applied if it's still the most
     // recent one requested. Concurrent scans (e.g. onResume() firing again before a slow SAF
@@ -69,21 +74,45 @@ class LibraryFragment : Fragment() {
     private var focusRequest: AudioFocusRequest? = null
     private var resumeOnFocusGain = false
 
+    // Android documents isPlaying()/pause() (and most other MediaPlayer control calls) as
+    // undefined while still in the Preparing state, which prepareAsync() leaves the player in
+    // until onPrepared/onError fires -- a focus-change or ACTION_AUDIO_BECOMING_NOISY broadcast
+    // can land at any moment, including squarely inside that window, so every branch below is
+    // written to never touch isPlaying()/pause() while isPreparingPlayback is still true.
     private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS -> {
                 resumeOnFocusGain = false
-                pauseActive()
+                if (isPreparingPlayback) {
+                    // Permanent loss: cancel the auto-start outright rather than start playback
+                    // into a focus state that's already gone, or leave it to time out on its own.
+                    suppressAutoStartOnPrepared = true
+                } else {
+                    pauseActive()
+                }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                resumeOnFocusGain = mediaPlayer?.isPlaying == true
-                pauseActive()
+                if (isPreparingPlayback) {
+                    // Transient: don't auto-start once ready either, but remember to once focus
+                    // actually comes back (below), the same way an already-playing track would.
+                    suppressAutoStartOnPrepared = true
+                    resumeOnFocusGain = true
+                } else {
+                    resumeOnFocusGain = mediaPlayer?.isPlaying == true
+                    pauseActive()
+                }
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
                 if (resumeOnFocusGain) {
                     resumeOnFocusGain = false
-                    resumeActive()
+                    if (isPreparingPlayback) {
+                        // Still not ready: let onPrepared itself start it once it is, instead of
+                        // touching a player that's still Preparing.
+                        suppressAutoStartOnPrepared = false
+                    } else {
+                        resumeActive()
+                    }
                 }
             }
         }
@@ -92,7 +121,7 @@ class LibraryFragment : Fragment() {
     /** Wired headphones pulled out mid-playback would otherwise blast audio through the speaker. */
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (mediaPlayer?.isPlaying == true) pauseActive()
+            if (!isPreparingPlayback && mediaPlayer?.isPlaying == true) pauseActive()
         }
     }
 
@@ -121,6 +150,7 @@ class LibraryFragment : Fragment() {
             onDelete = { item -> confirmDelete(item) },
             isActive = { uri -> uri == activeUri },
             isPlaying = { uri -> uri == activeUri && mediaPlayer?.isPlaying == true },
+            isPreparing = { uri -> uri == activeUri && isPreparingPlayback },
             playbackPositionMs = { uri -> if (uri == activeUri) (mediaPlayer?.currentPosition ?: 0) else 0 },
             playbackDurationMs = { uri -> if (uri == activeUri) activeDurationMs else 0 },
             playbackSpeedLabel = { uri -> if (uri == activeUri) formatSpeed(currentSpeed) else formatSpeed(1.0f) }
@@ -292,25 +322,48 @@ class LibraryFragment : Fragment() {
         activeUri = item.uri
         currentSpeed = 1.0f
         isPreparingPlayback = true
+        suppressAutoStartOnPrepared = false
         try {
             val player = MediaPlayer().apply {
                 setDataSource(requireContext(), item.uri)
-                setOnCompletionListener { releasePlayer() }
+                // Every callback below takes the MediaPlayer instance it fired on (`mp`) and
+                // checks it's still the one this fragment considers active before doing anything
+                // else. release()'d players are documented to stop firing callbacks, but a
+                // callback already queued on the main looper's message queue at the moment
+                // release() runs can still be delivered afterward -- e.g. switching tracks calls
+                // releasePlayer() on the old player and immediately builds a new one, and a stale
+                // callback for the *old* instance landing after that reassignment must not act on
+                // the new one, or on a view that's since been destroyed (releasePlayer() also runs
+                // from onDestroyView(), nulling mediaPlayer, so the identity check alone covers
+                // that case too: no live mp can ever match a null field).
+                setOnCompletionListener { mp -> if (mp === mediaPlayer) releasePlayer() }
                 setOnPreparedListener { mp ->
+                    if (mp !== mediaPlayer) return@setOnPreparedListener
                     isPreparingPlayback = false
                     activeDurationMs = mp.duration
-                    mp.start()
-                    progressHandler.post(progressTick)
-                    adapter.notifyDataSetChanged()
+                    if (suppressAutoStartOnPrepared) {
+                        // A permanent focus loss (or a still-unresolved transient one) arrived
+                        // while this was preparing -- leave it prepared but paused instead of
+                        // starting into a focus state that's already gone; see audioFocusListener.
+                        suppressAutoStartOnPrepared = false
+                    } else {
+                        mp.start()
+                        progressHandler.post(progressTick)
+                    }
+                    if (_binding != null) adapter.notifyDataSetChanged()
                 }
-                setOnErrorListener { _, what, extra ->
-                    isPreparingPlayback = false
-                    Toast.makeText(
-                        requireContext(),
-                        getString(R.string.playback_failed, "error $what/$extra"),
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    releasePlayer()
+                setOnErrorListener { mp, what, extra ->
+                    if (mp === mediaPlayer) {
+                        isPreparingPlayback = false
+                        if (_binding != null) {
+                            Toast.makeText(
+                                requireContext(),
+                                getString(R.string.playback_failed, "error $what/$extra"),
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        releasePlayer()
+                    }
                     true
                 }
                 // prepare() blocks the calling thread until the MediaExtractor/decoder is ready to
@@ -331,6 +384,7 @@ class LibraryFragment : Fragment() {
     }
 
     private fun pauseActive() {
+        if (isPreparingPlayback) return // pause() before onPrepared is undefined behavior
         mediaPlayer?.pause()
         progressHandler.removeCallbacks(progressTick)
         activeUri?.let { adapter.notifyProgressChanged(it) }
@@ -419,7 +473,8 @@ class LibraryFragment : Fragment() {
         activeDurationMs = 0
         currentSpeed = 1.0f
         isPreparingPlayback = false
-        adapter.notifyDataSetChanged()
+        suppressAutoStartOnPrepared = false
+        if (_binding != null) adapter.notifyDataSetChanged()
     }
 
     override fun onDestroyView() {

@@ -18,6 +18,7 @@ class RecordingsAdapter(
     private val onDelete: (RecordingItem) -> Unit,
     private val isActive: (Uri) -> Boolean,
     private val isPlaying: (Uri) -> Boolean,
+    private val isPreparing: (Uri) -> Boolean,
     private val playbackPositionMs: (Uri) -> Int,
     private val playbackDurationMs: (Uri) -> Int,
     private val playbackSpeedLabel: (Uri) -> String
@@ -63,8 +64,8 @@ class RecordingsAdapter(
         val item = items[position]
         holder.binding.fileName.text = RecordingNameFormatter.friendlyTitle(item.name)
         val active = isActive(item.uri)
-        val playing = active && isPlaying(item.uri)
-        holder.binding.playButton.text = if (playing) "⏸" else "▶"
+        holder.binding.activeAccent.visibility = if (active) View.VISIBLE else View.INVISIBLE
+        bindPlaybackButton(holder, item)
         holder.binding.playButton.setOnClickListener { onPlayPause(item) }
         holder.binding.speedButton.setOnClickListener { onSpeedToggle(item) }
         holder.binding.overflowButton.setOnClickListener { anchor ->
@@ -112,8 +113,31 @@ class RecordingsAdapter(
         }
     }
 
+    /** Shows exactly one of three states at a time: a spinner while [MediaPlayer] is still
+     * preparing (can't accept start()/pause() yet), otherwise a play or pause icon reflecting
+     * whether this specific row is the one actually playing right now. */
+    private fun bindPlaybackButton(holder: ViewHolder, item: RecordingItem) {
+        val active = isActive(item.uri)
+        val preparing = active && isPreparing(item.uri)
+        val playing = active && isPlaying(item.uri)
+        holder.binding.preparingIndicator.visibility = if (preparing) View.VISIBLE else View.GONE
+        holder.binding.preparingIndicator.contentDescription = holder.binding.root.context.getString(
+            R.string.preparing_button_description
+        )
+        holder.binding.playButton.visibility = if (preparing) View.INVISIBLE else View.VISIBLE
+        holder.binding.playButton.isEnabled = !preparing
+        holder.binding.playButton.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+        holder.binding.playButton.contentDescription = holder.binding.root.context.getString(
+            if (playing) R.string.pause_button_description else R.string.play_button_description
+        )
+    }
+
     private fun bindProgress(holder: ViewHolder, item: RecordingItem) {
-        holder.binding.speedButton.text = playbackSpeedLabel(item.uri)
+        val speedLabel = playbackSpeedLabel(item.uri)
+        holder.binding.speedButton.text = speedLabel
+        holder.binding.speedButton.contentDescription =
+            holder.binding.root.context.getString(R.string.playback_speed_description, speedLabel)
+        bindPlaybackButton(holder, item)
         if (holder.userIsSeeking) return
         val durationMs = playbackDurationMs(item.uri).coerceAtLeast(1)
         val positionMs = playbackPositionMs(item.uri).coerceIn(0, durationMs)

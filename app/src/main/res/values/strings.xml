@@ -4,12 +4,14 @@
     <string name="stop_recording">Stop Recording</string>
     <string name="status_idle">Ready to record</string>
     <string name="status_recording">Recording…</string>
+    <string name="status_preparing">Preparing to record…</string>
     <string name="status_recording_part">Recording… (part %1$d)</string>
-    <string name="status_saved">Saved: %1$s</string>
+    <string name="status_saved_title">Recording saved</string>
+    <string name="status_saved_detail">%1$s · %2$s</string>
     <string name="permission_denied">Microphone permission is required to record audio.</string>
     <string name="tab_record">Record</string>
     <string name="tab_library">Library</string>
-    <string name="destination_label">Destination: %1$s</string>
+    <string name="destination_label">%1$s</string>
     <string name="choose_folder">Change</string>
     <string name="empty_recordings">No recordings yet</string>
     <string name="playback_failed">Playback failed: %1$s</string>
@@ -32,13 +34,26 @@
     <string name="audio_focus_denied">Another app is using audio playback right now</string>
     <string name="more_options">More options</string>
 
-    <string name="mic_device_idle">Input: not recording</string>
-    <string name="mic_device_external_verified">Input: %1$s (external, verified)</string>
-    <string name="mic_device_builtin_verified">Input: %1$s</string>
-    <string name="mic_device_unverified">Input: %1$s (unverified)</string>
-    <string name="mic_idle_insta360_connected">%1$s connected — preferred input</string>
-    <string name="mic_idle_external_connected">External microphone connected — preferred input</string>
-    <string name="mic_idle_none_detected">No external microphone detected</string>
+    <!-- Section captions on the Record screen -->
+    <string name="section_destination">Destination</string>
+    <string name="section_input_device">Input device</string>
+    <string name="section_audio_level">Audio level</string>
+    <string name="section_status">Status</string>
+
+    <!-- Pre-recording input-device status: only ever "connected"/"detected", never "verified" or
+         "active"; the real route is only known once recording actually starts. -->
+    <string name="mic_status_connected_title">%1$s connected</string>
+    <string name="mic_status_connected_subtitle">Preferred input — verified after recording starts</string>
+    <string name="mic_status_none_title">No external microphone detected</string>
+    <string name="mic_status_none_subtitle">The phone microphone may be used</string>
+
+    <!-- Post-start input-device status: AudioRecord.getRoutedDevice() has now verified what's
+         actually being captured from. -->
+    <string name="mic_status_verified_external_title">Verified active input</string>
+    <string name="mic_status_verified_builtin_title">Using phone microphone</string>
+    <string name="mic_status_unverified_title">Input in use (unverified)</string>
+    <string name="mic_status_active_subtitle">%1$s</string>
+
     <string name="no_external_mic_confirm_message">No external microphone was detected. Continue using the phone microphone?</string>
     <string name="no_external_mic_confirm_positive">Continue</string>
     <string name="no_external_mic_confirm_cancel">Cancel</string>
@@ -48,4 +63,49 @@
     <string name="recording_needs_verification">Recording stopped, but saving could not be confirmed: %1$s\nPlease check the file before relying on it.</string>
     <string name="recording_needs_verification_unknown_location">Recording stopped, but saving could not be confirmed. Please check the destination folder before relying on it.</string>
     <string name="library_load_failed">Couldn\'t load recordings: %1$s</string>
+
+    <!-- Terminal-outcome notification, shown instead of the ongoing-recording notification when a
+         session ends with no screen attached to display the result live. -->
+    <string name="notification_result_channel_name">Recording results</string>
+    <string name="notification_result_saved_title">Recording saved</string>
+    <string name="notification_result_saved_text">Saved to %1$s</string>
+    <string name="notification_result_saved_text_unknown_location">Recording stopped before any audio was captured.</string>
+    <string name="notification_result_error_title">Recording stopped</string>
+    <string name="notification_result_needs_recovery_title">Recording may need recovery</string>
+    <string name="notification_result_needs_verification_title">Recording needs verification</string>
+
+    <!-- Post-start expected-external-mic mismatch: an external mic was detected/preferred before
+         Record was pressed, but the verified route came back built-in or couldn't be verified. -->
+    <string name="mic_mismatch_title">External microphone not in use</string>
+    <string name="mic_mismatch_message">An external microphone was detected, but recording could not confirm it\'s actually being used. Reconnect it and retry, or continue with the phone microphone.</string>
+    <string name="mic_mismatch_retry">Retry</string>
+    <string name="mic_mismatch_continue_phone">Use phone microphone</string>
+
+    <!-- Shown when POST_NOTIFICATIONS is denied on Android 13+: recording can still legally start,
+         but the ongoing notification and its Stop action won't be visible. -->
+    <string name="no_notification_permission_title">Recording without visible controls?</string>
+    <string name="no_notification_permission_message">Notifications are turned off, so you won\'t see the ongoing recording indicator or a Stop button in the notification shade. Recording will still run normally in the background. Continue anyway?</string>
+    <string name="no_notification_permission_positive">Continue</string>
+    <string name="no_notification_permission_cancel">Cancel</string>
+
+    <!-- Duration formatting, e.g. "13 seconds" or "3 minutes 12 seconds" -->
+    <plurals name="duration_hours">
+        <item quantity="one">%d hour</item>
+        <item quantity="other">%d hours</item>
+    </plurals>
+    <plurals name="duration_minutes">
+        <item quantity="one">%d minute</item>
+        <item quantity="other">%d minutes</item>
+    </plurals>
+    <plurals name="duration_seconds">
+        <item quantity="one">%d second</item>
+        <item quantity="other">%d seconds</item>
+    </plurals>
+
+    <!-- Library row controls -->
+    <string name="default_playback_speed">1.0x</string>
+    <string name="play_button_description">Play</string>
+    <string name="pause_button_description">Pause</string>
+    <string name="preparing_button_description">Preparing playback</string>
+    <string name="playback_speed_description">Playback speed %1$s</string>
 </resources>

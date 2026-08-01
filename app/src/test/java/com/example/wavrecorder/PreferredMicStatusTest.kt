@@ -1,6 +1,8 @@
 package com.example.wavrecorder
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -25,35 +27,47 @@ class PreferredMicStatusTest {
     }
 
     @Test
-    fun `a single external, non-Insta360 device reports ExternalConnected`() {
-        val usbMic = InputDeviceSnapshot(label = "USB microphone", isExternal = true, isInsta360 = false)
-        assertEquals(PreferredMicStatus.ExternalConnected, choosePreferredMicStatus(listOf(usbMic)))
+    fun `a generic USB audio input reports ExternalConnected with its own reported name, not a made-up generic phrase`() {
+        // Stands in for the real Insta360 USB-C receiver reporting itself as a generic
+        // "USB Audio Device" rather than anything containing "Insta360" -- Android doesn't
+        // guarantee the product name identifies the brand, so the exact reported name (not a
+        // fixed "external mic connected" phrase) is what lets the user recognize their hardware.
+        val usbAudioDevice = InputDeviceSnapshot(label = "USB Audio Device", isExternal = true, isInsta360 = false)
+        val result = choosePreferredMicStatus(listOf(usbAudioDevice))
+        assertEquals(PreferredMicStatus.ExternalConnected("USB Audio Device", isInsta360 = false), result)
     }
 
     @Test
-    fun `an Insta360 device reports Insta360Connected with its own label`() {
+    fun `an Insta360-named device reports ExternalConnected with isInsta360 true`() {
         val insta360 = InputDeviceSnapshot(label = "Insta360 Mic Air", isExternal = true, isInsta360 = true)
         val result = choosePreferredMicStatus(listOf(insta360))
-        assertEquals(PreferredMicStatus.Insta360Connected("Insta360 Mic Air"), result)
+        assertEquals(PreferredMicStatus.ExternalConnected("Insta360 Mic Air", isInsta360 = true), result)
     }
 
     @Test
-    fun `an Insta360 device is preferred over another external device attached at the same time`() {
-        val genericUsb = InputDeviceSnapshot(label = "USB microphone", isExternal = true, isInsta360 = false)
+    fun `an Insta360-named device is preferred over a generic external device attached at the same time`() {
+        val genericUsb = InputDeviceSnapshot(label = "USB Audio Device", isExternal = true, isInsta360 = false)
         val insta360 = InputDeviceSnapshot(label = "Insta360 Mic Air", isExternal = true, isInsta360 = true)
 
         // Order shouldn't matter -- Insta360 must win whether it's listed first or last.
-        assertEquals(PreferredMicStatus.Insta360Connected("Insta360 Mic Air"),
-            choosePreferredMicStatus(listOf(genericUsb, insta360)))
-        assertEquals(PreferredMicStatus.Insta360Connected("Insta360 Mic Air"),
-            choosePreferredMicStatus(listOf(insta360, genericUsb)))
+        val expected = PreferredMicStatus.ExternalConnected("Insta360 Mic Air", isInsta360 = true)
+        assertEquals(expected, choosePreferredMicStatus(listOf(genericUsb, insta360)))
+        assertEquals(expected, choosePreferredMicStatus(listOf(insta360, genericUsb)))
     }
 
     @Test
     fun `the built-in mic being present alongside an external device does not affect the preference`() {
         val builtIn = InputDeviceSnapshot(label = "Phone microphone", isExternal = false, isInsta360 = false)
         val insta360 = InputDeviceSnapshot(label = "Insta360 Mic Air", isExternal = true, isInsta360 = true)
-        assertEquals(PreferredMicStatus.Insta360Connected("Insta360 Mic Air"),
+        assertEquals(PreferredMicStatus.ExternalConnected("Insta360 Mic Air", isInsta360 = true),
             choosePreferredMicStatus(listOf(builtIn, insta360)))
+    }
+
+    @Test
+    fun `ExternalConnected reports false for isInsta360 on a generic device even when it is the only candidate`() {
+        val usbHeadset = InputDeviceSnapshot(label = "USB headset microphone", isExternal = true, isInsta360 = false)
+        val result = choosePreferredMicStatus(listOf(usbHeadset)) as PreferredMicStatus.ExternalConnected
+        assertFalse(result.isInsta360)
+        assertTrue(result.label.isNotEmpty())
     }
 }

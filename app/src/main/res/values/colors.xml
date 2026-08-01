@@ -4,4 +4,19 @@
     <color name="teal_200">#FF03DAC5</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- Input-status indicator dot: green once AudioRecord.getRoutedDevice() has actually
+         verified an external input during recording; purple for "connected/preferred" before
+         recording starts (a claim about AudioManager's device list only); orange when no
+         external input is detected at all, whether idle or actually verified as the phone mic. -->
+    <color name="status_verified_green">#2E7D32</color>
+    <color name="status_preferred_purple">#7C4DFF</color>
+    <color name="status_warning_orange">#EF6C00</color>
+
+    <color name="text_secondary">#8A000000</color>
+
+    <!-- Library row: subtle left accent marking the currently active (playing/paused/preparing)
+         recording, reusing the same purple used for "preferred" elsewhere for visual consistency. -->
+    <color name="library_active_accent">#7C4DFF</color>
+    <color name="library_row_stroke">#1F000000</color>
 </resources>

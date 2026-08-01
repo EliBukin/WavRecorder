@@ -3,8 +3,11 @@ package com.example.wavrecorder
 import android.Manifest
 import android.app.Application
 import android.content.ComponentName
+import android.content.DialogInterface
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.os.Looper
+import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.testing.launchFragmentInContainer
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -18,6 +21,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.AudioDeviceInfoBuilder
+import org.robolectric.shadows.ShadowDialog
 import org.robolectric.shadows.ShadowToast
 
 /**
@@ -58,7 +62,7 @@ class RecordFragmentPermissionTest {
     }
 
     @Test
-    fun `mic already granted but notifications denied still starts the recording service`() {
+    fun `mic already granted but notifications denied shows a confirmation before starting without visible notification controls`() {
         shadowOf(app()).grantPermissions(Manifest.permission.RECORD_AUDIO)
         shadowOf(app()).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
 
@@ -70,9 +74,36 @@ class RecordFragmentPermissionTest {
             fragment.handlePermissionResult(mapOf(Manifest.permission.POST_NOTIFICATIONS to false))
         }
 
+        assertNull("recording must not start until the user confirms recording without visible " +
+            "notification controls", shadowOf(app()).nextStartedService)
+        val dialog = ShadowDialog.getLatestDialog() as? AlertDialog
+        assertNotNull("expected a confirmation dialog explaining the missing notification permission",
+            dialog)
+
+        dialog!!.getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        shadowOf(Looper.getMainLooper()).idle() // a dialog button's click dispatches via the main looper
+
         val startedService = shadowOf(app()).nextStartedService
-        assertNotNull("expected RecordingService to be started", startedService)
+        assertNotNull("expected RecordingService to be started once the user confirms", startedService)
         assertEquals(RecordingService::class.java.name, startedService?.component?.className)
+    }
+
+    @Test
+    fun `canceling the missing-notification-permission confirmation leaves recording stopped`() {
+        shadowOf(app()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        shadowOf(app()).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
+
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        shadowOf(app()).nextStartedService
+        scenario.onFragment { fragment ->
+            fragment.handlePermissionResult(mapOf(Manifest.permission.POST_NOTIFICATIONS to false))
+        }
+
+        val dialog = ShadowDialog.getLatestDialog() as AlertDialog
+        dialog.getButton(DialogInterface.BUTTON_NEGATIVE).performClick()
+
+        assertNull("recording must remain stopped after the user cancels",
+            shadowOf(app()).nextStartedService)
     }
 
     @Test

@@ -355,6 +355,18 @@ class WavRecorder(
     ) {
         if (isRecording.get()) return
 
+        // Every start() *attempt* -- successful or not -- gets its own session id and a freshly
+        // reset result, before any fallible step below runs. This is what makes finalization
+        // state properly session-scoped: a synchronous startup failure (mic busy, hardware init
+        // rejected -- before a recording thread, and therefore any real finalization attempt,
+        // ever exists) must never let stop() hand back a *previous* session's stale
+        // FinalizeResult/target. Bumping sessionCounter here (not only on success, as before)
+        // also closes the gap where a genuinely wedged thread from an earlier, timed-out stop()
+        // could otherwise still match the session counter and overwrite this fresh reset out
+        // from under a later, unrelated failure.
+        val mySession = sessionCounter.incrementAndGet()
+        lastFinalizeResult = FinalizeResult.Ok
+
         // AudioRecord setup can fail on real devices (mic in use by another app or a call,
         // hardware quirks) and throws rather than returning an error code, so this must not
         // be allowed to propagate as an uncaught exception on the caller's thread.
@@ -388,9 +400,7 @@ class WavRecorder(
         // not after the first segment/amplitude callback arrives from the background thread.
         onMicrophoneInfo(source.describeMicrophone())
 
-        lastFinalizeResult = FinalizeResult.Ok
         val myGeneration = generation.incrementAndGet()
-        val mySession = sessionCounter.incrementAndGet()
         isRecording.set(true)
         recordingThread = Thread({
             recordLoop(
@@ -617,14 +627,35 @@ class WavRecorder(
         var lastForce = System.currentTimeMillis()
     }
 
-    /** Best-effort: rewrites the header in place without disturbing the write position. */
+    /**
+     * Rewrites the header in place. Must never return having left the writer positioned anywhere
+     * other than [Segment]'s pre-flush append point: a header-patch failure alone (the seek to 0
+     * succeeding but the header bytes failing to write, or vice versa) is recoverable as long as
+     * the append position is confirmed restored afterward -- the header is just stale until the
+     * next periodic flush or the final close patches it correctly, which is not fatal on its own.
+     * But if restoring that position itself fails, there is no way to know where the writer
+     * actually ended up, and letting the caller keep appending PCM data from an unconfirmed
+     * position could silently overwrite the header or already-written audio. That case is not
+     * swallowed: it's rethrown so the caller (recordLoop) routes it through the normal
+     * fatal-error path, which still finalizes (or reports needing recovery) via closeSegment,
+     * exactly like any other fatal failure -- never left to just keep writing from an unsafe spot.
+     */
     private fun flushHeader(segment: Segment, sampleRate: Int) {
+        val writePosition = segment.writer.position()
         try {
-            val writePosition = segment.writer.position()
             patchWavHeader(segment.writer, segment.audioLen, sampleRate)
-            segment.writer.position(writePosition)
         } catch (_: Exception) {
-            // Not fatal: worst case, the next periodic flush (or the final close) catches up.
+            // Deliberately not rethrown here: whether this succeeded or not is irrelevant to
+            // safety on its own -- only whether the position restore below succeeds is.
+        }
+        try {
+            segment.writer.position(writePosition)
+        } catch (e: Exception) {
+            throw IOException(
+                "Failed to restore the write position after a header flush; cannot safely " +
+                    "continue recording without risking overwriting audio already on disk",
+                e
+            )
         }
     }
 

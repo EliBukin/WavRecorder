@@ -1,64 +1,182 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="24dp"
     tools:context=".RecordFragment">
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical">
-
-        <TextView
-            android:id="@+id/destinationLabel"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/destination_label"
-            android:textSize="14sp" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/chooseFolderButton"
-            style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/choose_folder" />
-
-    </LinearLayout>
-
-    <TextView
-        android:id="@+id/micDeviceLabel"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="@string/mic_device_idle"
-        android:textSize="13sp" />
-
-    <com.example.wavrecorder.WaveformView
-        android:id="@+id/waveformView"
-        android:layout_width="match_parent"
-        android:layout_height="160dp"
-        android:layout_marginTop="24dp" />
-
-    <TextView
-        android:id="@+id/statusText"
+    <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:layout_marginTop="16dp"
-        android:gravity="center"
-        android:text="@string/status_idle"
-        android:textSize="18sp" />
+        android:fillViewport="true"
+        android:clipToPadding="false">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <!-- Destination -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/section_destination"
+                android:textAppearance="?attr/textAppearanceCaption"
+                android:textColor="@color/text_secondary" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:id="@+id/destinationLabel"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="8dp"
+                    android:text="@string/destination_label"
+                    android:textSize="16sp"
+                    android:maxLines="1"
+                    android:ellipsize="middle" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/chooseFolderButton"
+                    style="@style/Widget.MaterialComponents.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="48dp"
+                    android:minHeight="48dp"
+                    android:text="@string/choose_folder" />
+
+            </LinearLayout>
+
+            <!-- Input device -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:text="@string/section_input_device"
+                android:textAppearance="?attr/textAppearanceCaption"
+                android:textColor="@color/text_secondary" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <View
+                    android:id="@+id/micStatusDot"
+                    android:layout_width="10dp"
+                    android:layout_height="10dp"
+                    android:layout_marginTop="5dp"
+                    android:layout_marginEnd="10dp"
+                    android:background="@drawable/shape_status_dot"
+                    android:importantForAccessibility="no" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/micStatusTitle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:maxLines="2"
+                        android:ellipsize="end" />
+
+                    <TextView
+                        android:id="@+id/micStatusSubtitle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        android:maxLines="2"
+                        android:ellipsize="end" />
+
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <!-- Audio level: hidden entirely while idle, since a flat idle waveform carries no
+                 information and would just be empty space (see RecordFragment). -->
+            <LinearLayout
+                android:id="@+id/audioLevelSection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:orientation="vertical"
+                android:visibility="gone"
+                tools:visibility="visible">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/section_audio_level"
+                    android:textAppearance="?attr/textAppearanceCaption"
+                    android:textColor="@color/text_secondary" />
+
+                <com.example.wavrecorder.WaveformView
+                    android:id="@+id/waveformView"
+                    android:layout_width="match_parent"
+                    android:layout_height="120dp"
+                    android:layout_marginTop="8dp" />
+
+            </LinearLayout>
+
+            <!-- Status / last recording -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:text="@string/section_status"
+                android:textAppearance="?attr/textAppearanceCaption"
+                android:textColor="@color/text_secondary" />
+
+            <TextView
+                android:id="@+id/statusText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/status_idle"
+                android:textSize="17sp" />
+
+            <TextView
+                android:id="@+id/statusDetailText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textSize="13sp"
+                android:textColor="@color/text_secondary"
+                android:visibility="gone"
+                tools:visibility="visible"
+                tools:text="Jul 27, 2026 · 1:31 AM · 13 seconds" />
+
+        </LinearLayout>
+
+    </ScrollView>
 
     <com.google.android.material.button.MaterialButton
         android:id="@+id/recordButton"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="8dp"
-        android:text="@string/start_recording" />
+        android:layout_height="56dp"
+        android:layout_margin="16dp"
+        android:text="@string/start_recording"
+        app:icon="@drawable/ic_mic"
+        app:iconGravity="textStart"
+        app:iconPadding="8dp"
+        app:cornerRadius="16dp" />
 
 </LinearLayout>

@@ -1029,4 +1029,262 @@ class WavRecorderTest {
         val result = recorder.stop()
         assertTrue(result is WavRecorder.FinalizeResult.Failed)
     }
+
+    /** Regression writer for flushHeader()'s position-safety redesign: [position] (0L) always
+     * succeeds -- standing in for "successfully seeks to zero" -- but every [write] attempted
+     * exactly at file position 0 fails *after* the first one, simulating a header write that
+     * fails right after a successful seek during a later periodic flush (the very first
+     * position-0 write is always the initial placeholder header in openSegment(), which must
+     * succeed or no segment -- and no periodic flush -- would ever happen at all). Once a header
+     * write has actually failed, any *later* attempt to restore the writer to a non-zero position
+     * also fails, standing in for a channel left broken by the earlier failure -- exactly the
+     * case flushHeader must never silently swallow, since continuing to write PCM data from an
+     * unconfirmed position risks overwriting the header or prior audio. */
+    private class HeaderWriteThenBrokenRestoreWriter(private val channel: FileChannel) : SegmentWriter {
+        private var position0WriteCount = 0
+        private var headerWriteFailed = false
+        override fun write(buffer: ByteBuffer): Int {
+            if (channel.position() == 0L) {
+                position0WriteCount++
+                if (position0WriteCount > 1) {
+                    headerWriteFailed = true
+                    throw IOException("simulated header write failure")
+                }
+            }
+            return channel.write(buffer)
+        }
+        override fun position(): Long = channel.position()
+        override fun position(newPosition: Long) {
+            if (headerWriteFailed && newPosition != 0L) {
+                throw IOException("simulated failure restoring write position after a broken header write")
+            }
+            channel.position(newPosition)
+        }
+        override fun close() = channel.close()
+    }
+
+    @Test
+    fun `a header flush that seeks to zero, fails the header write, and then fails to restore position stops recording instead of risking corruption`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount <= 20) {
+                    // A brief per-read delay so the loop actually spends real wall-clock time
+                    // *actively iterating* (rather than racing through in under a millisecond) --
+                    // the periodic header-flush check only ever runs between reads, never while
+                    // blocked in one, so without this the 10ms flush cadence below would never
+                    // get a chance to fire before read 21 blocks forever.
+                    Thread.sleep(5)
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val recorder = WavRecorder(
+            headerFlushIntervalMs = 10, // fast flush cadence so the test doesn't wait out the 3s default
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+            wrapChannel = { channel -> HeaderWriteThenBrokenRestoreWriter(channel) }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        awaitTerminatedAndDeliverCallbacks(recorder)
+
+        assertNotNull("a header flush that can no longer confirm a safe write position must be " +
+            "surfaced as a fatal error, not silently swallowed", reportedError)
+        assertFalse("recording must stop rather than keep writing from an unconfirmed position",
+            recorder.isActive)
+
+        // No PCM data can have landed at/over the header: recordLoop breaks out of its loop the
+        // moment the exception is thrown, before any further write() is attempted at all.
+        assertTrue("expected the audio captured before the broken flush to still be on disk",
+            segmentFile.length() >= WavHeaderWriter.HEADER_SIZE)
+    }
+
+    /** Regression writer for flushHeader()'s recoverable case: the header write fails exactly
+     * once (simulating a transient glitch during a later periodic flush -- the very first
+     * position-0 write is always the initial placeholder header in openSegment(), which must
+     * succeed here too), then succeeds on every subsequent attempt -- including the position
+     * restore, which this writer never fails. */
+    private class TransientHeaderWriteFailureWriter(private val channel: FileChannel) : SegmentWriter {
+        private var position0WriteCount = 0
+        private var failuresRemaining = 1
+        override fun write(buffer: ByteBuffer): Int {
+            if (channel.position() == 0L) {
+                position0WriteCount++
+                if (position0WriteCount > 1 && failuresRemaining > 0) {
+                    failuresRemaining--
+                    throw IOException("simulated transient header write failure")
+                }
+            }
+            return channel.write(buffer)
+        }
+        override fun position(): Long = channel.position()
+        override fun position(newPosition: Long) { channel.position(newPosition) }
+        override fun close() = channel.close()
+    }
+
+    @Test
+    fun `a header flush whose header write fails but whose position restore succeeds does not stop the recording`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount <= 20) {
+                    // A brief per-read delay so the loop actually spends real wall-clock time
+                    // *actively iterating* (rather than racing through in under a millisecond) --
+                    // the periodic header-flush check only ever runs between reads, never while
+                    // blocked in one, so without this the 10ms flush cadence below would never
+                    // get a chance to fire (let alone fire more than once, to prove recovery)
+                    // before read 21 blocks forever.
+                    Thread.sleep(5)
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val recorder = WavRecorder(
+            headerFlushIntervalMs = 10,
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+            wrapChannel = { channel -> TransientHeaderWriteFailureWriter(channel) }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        val deadline = System.currentTimeMillis() + 2000
+        while (readCount < 20 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertNull("a header-write failure that still restores its write position must not be " +
+            "treated as fatal", reportedError)
+        assertTrue("recording must continue normally after a recoverable header-flush failure",
+            recorder.isActive)
+
+        val result = recorder.stop()
+        assertEquals("expected the segment to still finalize cleanly once a later flush (or the " +
+            "final close) succeeds", WavRecorder.FinalizeResult.Ok, result)
+        val finalized = WavRiffParser.parse(segmentFile.inputStream())
+        assertNotNull(finalized)
+        assertTrue("expected the real audio written before/after the transient failure to be intact",
+            (finalized?.dataSize ?: 0L) > 0L)
+    }
+
+    @Test
+    fun `a synchronous startup failure never reuses a previous session's finalization result`() {
+        // Session A: a real recording that ends with a genuine finalization failure at stop() --
+        // reusing the same setup as the header-patch-failure test above, whose result is already
+        // known to be FinalizeResult.Failed.
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        val sessionASource = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount <= 2) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val sessionAFile = tempFolder.newFile("sessionA.wav")
+
+        var startCount = 0
+        val startupFailure = IllegalStateException("simulated: microphone busy")
+        // Session B (the second start() call on this same recorder) fails synchronously while
+        // "opening the microphone" -- before any recording thread, segment, or finalization
+        // attempt of its own could ever exist.
+        val recorder = WavRecorder(
+            openAudioSource = {
+                startCount++
+                if (startCount == 1) {
+                    WavRecorder.RecorderConfig(sessionASource, sampleRate = 48000, bufferSize = chunk.size)
+                } else {
+                    throw startupFailure
+                }
+            },
+            wrapChannel = { channel -> FailingHeaderPatchWriter(channel) }
+        )
+
+        // --- Session A ---
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(sessionAFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {}
+        )
+        val deadline = System.currentTimeMillis() + 2000
+        while (readCount < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        val sessionAResult = recorder.stop()
+        assertTrue("expected session A to end with a genuine finalization failure (test setup " +
+            "check)", sessionAResult is WavRecorder.FinalizeResult.Failed)
+        val sessionAFailure = sessionAResult as WavRecorder.FinalizeResult.Failed
+
+        // --- Session B: fails synchronously at startup. ---
+        var sessionBError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget {
+                throw AssertionError("session B must never get far enough to open a segment")
+            },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> sessionBError = e }
+        )
+
+        assertEquals("expected session B's own startup failure to be reported, not swallowed",
+            startupFailure, sessionBError)
+
+        // Mirrors exactly what RecordingService.onError does: call stop() to inspect the
+        // finalize result after an error.
+        val sessionBResult = recorder.stop()
+        assertEquals(
+            "a synchronous startup failure has nothing of its own to finalize -- must never " +
+                "resurrect a previous session's Failed result",
+            WavRecorder.FinalizeResult.Ok, sessionBResult
+        )
+        assertTrue(
+            "session B's result must not reference session A's target or cause in any way",
+            sessionBResult != sessionAFailure &&
+                (sessionBResult as? WavRecorder.FinalizeResult.Failed)?.target !=
+                    sessionAFailure.target
+        )
+    }
 }

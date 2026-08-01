@@ -10,12 +10,15 @@ import android.media.AudioManager
  * [SystemAudioSource]), and this status must never be worded as if it already confirmed that.
  */
 sealed class PreferredMicStatus {
-    /** An Insta360 accessory (matched by product name) is currently attached and would be
-     * preferred. [label] is that device's own reported name (e.g. "Insta360 Mic Air"). */
-    data class Insta360Connected(val label: String) : PreferredMicStatus()
-
-    /** Some other external input device is attached, but no Insta360 device was found among them. */
-    object ExternalConnected : PreferredMicStatus()
+    /** Some external input device is attached and would be preferred over the phone's own mic.
+     * [label] is always the device's own reported name when Android supplies one (falling back to
+     * a generic type-based label only when it doesn't) -- deliberately shown even when [isInsta360]
+     * is false: the real Insta360 USB-C receiver this app is built around is not guaranteed to
+     * report a name containing "Insta360" at all (Android may report it as a generic
+     * "USB Audio Device"), so the exact reported name is the only way for the user to actually
+     * recognize *their* hardware rather than a made-up generic phrase. [isInsta360] only affects
+     * which of two otherwise-identical status templates is shown. */
+    data class ExternalConnected(val label: String, val isInsta360: Boolean) : PreferredMicStatus()
 
     /** No external input device is currently attached; recording would fall back to the phone's
      * own microphone. */
@@ -37,11 +40,11 @@ internal data class InputDeviceSnapshot(val label: String, val isExternal: Boole
  * external one. */
 internal fun choosePreferredMicStatus(devices: List<InputDeviceSnapshot>): PreferredMicStatus {
     val externalDevices = devices.filter { it.isExternal }
-    val insta360 = externalDevices.firstOrNull { it.isInsta360 }
-    return when {
-        insta360 != null -> PreferredMicStatus.Insta360Connected(insta360.label)
-        externalDevices.isNotEmpty() -> PreferredMicStatus.ExternalConnected
-        else -> PreferredMicStatus.NoneDetected
+    val preferred = externalDevices.firstOrNull { it.isInsta360 } ?: externalDevices.firstOrNull()
+    return if (preferred != null) {
+        PreferredMicStatus.ExternalConnected(preferred.label, preferred.isInsta360)
+    } else {
+        PreferredMicStatus.NoneDetected
     }
 }
 
