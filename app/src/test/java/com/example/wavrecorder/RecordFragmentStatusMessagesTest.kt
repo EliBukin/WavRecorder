@@ -121,7 +121,7 @@ class RecordFragmentStatusMessagesTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         awaitListenerAttached(scenario, service)
 
-        service.startRecording()
+        service.startRecording(1L)
         val deadline = System.currentTimeMillis() + 2000
         while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
         Thread.sleep(20)
@@ -163,7 +163,7 @@ class RecordFragmentStatusMessagesTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         awaitListenerAttached(scenario, service)
 
-        service.startRecording()
+        service.startRecording(1L)
         val segmentOpenedDeadline = System.currentTimeMillis() + 2000
         while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
             Thread.sleep(5)
@@ -211,7 +211,7 @@ class RecordFragmentStatusMessagesTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         awaitListenerAttached(scenario, service)
 
-        service.startRecording()
+        service.startRecording(1L)
         // onSegmentStarted's post to the main looper (which is what sets currentTarget, the
         // value onStopped below reports) needs the looper actually drained, not just wall-clock
         // time for the background thread to reach it -- a plain Thread.sleep() poll on `reads`

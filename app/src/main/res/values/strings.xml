@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">WAV Recorder</string>
+    <string name="app_name">bukin\'s wav recorder</string>
     <string name="start_recording">Start Recording</string>
     <string name="stop_recording">Stop Recording</string>
     <string name="status_idle">Ready to record</string>

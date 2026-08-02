@@ -180,6 +180,9 @@ class RecordFragmentLifecycleTest {
             "expected beginRecording() to have issued a real startForegroundService() call"
         }
         assertEquals(RecordingService.ACTION_START, startIntent.action)
+        val requestId = startIntent.getLongExtra(RecordingService.EXTRA_REQUEST_ID, -1L)
+        assertTrue("expected a real request id to have been attached to the start Intent",
+            requestId >= 0L)
         // Delivers it to onStartCommand() exactly as Android would for a real started service --
         // this is the point at which the service must immediately satisfy its foreground-service
         // obligation on its own (a temporary "preparing" notification + a bounded cleanup
@@ -190,6 +193,7 @@ class RecordFragmentLifecycleTest {
             "'preparing' foreground state immediately, not wait on a future startRecording() " +
             "call", shadowOf(service).lastForegroundNotification)
         assertFalse(service.isRecording)
+        assertEquals(requestId, service.currentRequestId)
 
         // Leave the screen before a new connection (there isn't one pending here -- see above)
         // ever completes.
@@ -199,6 +203,8 @@ class RecordFragmentLifecycleTest {
             "expected onStop() to explicitly retract the pending start via ACTION_CANCEL_START"
         }
         assertEquals(RecordingService.ACTION_CANCEL_START, cancelIntent.action)
+        assertEquals("the cancellation must name the exact same request id it's retracting",
+            requestId, cancelIntent.getLongExtra(RecordingService.EXTRA_REQUEST_ID, -2L))
         controller.withIntent(cancelIntent).startCommand(0, 2)
 
         assertFalse("canceling a pending start must never leave a recording active",

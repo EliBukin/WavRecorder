@@ -52,6 +52,14 @@ class RecordingService : Service() {
         internal const val ACTION_START = "com.example.wavrecorder.action.START"
         internal const val ACTION_CANCEL_START = "com.example.wavrecorder.action.CANCEL_START"
 
+        // Carries the unique id (see currentRequestId below) that correlates a single logical
+        // start attempt across its three independent entry points: the Intent-dispatched
+        // ACTION_START, a direct (already-bound) startRecording() call, and a later
+        // ACTION_CANCEL_START. Attached by RecordFragment to every ACTION_START/ACTION_CANCEL_START
+        // Intent it sends, and passed directly as startRecording()'s own parameter for the bound
+        // path -- see RecordFragment.beginRecording().
+        internal const val EXTRA_REQUEST_ID = "com.example.wavrecorder.extra.REQUEST_ID"
+
         // Upper bound on how long the temporary "preparing to record" foreground state entered by
         // ACTION_START (see handleActionStart) may sit unresolved -- neither fulfilled by a real
         // startRecording() call nor explicitly retracted via ACTION_CANCEL_START -- before this
@@ -108,27 +116,36 @@ class RecordingService : Service() {
     // True from an accepted ACTION_START (a startForegroundService() call already made) until
     // it's *fulfilled* -- startRecording() actually running and replacing the temporary
     // "preparing" foreground state with the real recording one -- or explicitly retracted via
-    // ACTION_CANCEL_START, or the bounded pendingStartTimeoutRunnable below gives up on it.
+    // ACTION_CANCEL_START, or the bounded pending-start timeout below gives up on it.
     // internal (not private) so tests can assert directly that a late/duplicate ACTION_START
     // never marks an already-active recording as pending, without needing an indirect signal.
     internal var startRequestPending = false
         private set
 
-    // Backs PENDING_START_TIMEOUT_MS: posted the moment handleActionStart() enters the temporary
-    // foreground state, removed the moment that state is resolved (fulfilled or canceled). A
-    // real Handler/Looper (not an injected fake) so production behavior is exactly what's under
-    // test -- Robolectric's paused main-looper clock is what tests advance to exercise this
-    // deterministically, rather than this class needing its own separate test seam.
+    // The request id (see EXTRA_REQUEST_ID) of the most recent start attempt this service has
+    // accepted as authoritative -- set the moment either handleActionStart() or startRecording()
+    // first sees it, and never reset back to null afterward, even once that attempt resolves
+    // (fulfilled, canceled, timed out, or failed synchronously). It's a high-water mark, not a
+    // "currently pending" flag: ids are assigned monotonically increasing by RecordFragment, so
+    // "has this exact id (or an older one) already been handled?" is answered by a single
+    // <= comparison against this value, regardless of how that handling concluded. This is what
+    // lets a delayed ACTION_START for an attempt that already resolved (e.g. failed synchronously
+    // before its own Intent was even dispatched -- see startRecording()'s doc) be recognized as
+    // stale and ignored, while a genuinely new, higher id is still always accepted as a fresh
+    // retry. internal (not private) so tests can assert it directly.
+    internal var currentRequestId: Long? = null
+        private set
+
+    // Backs PENDING_START_TIMEOUT_MS. Each accepted ACTION_START posts its own closure capturing
+    // its own request id (see handleActionStart()/handlePendingStartTimeout()) rather than a
+    // single reused Runnable that would need to be proactively removed on every transition to stay
+    // correct: instead, every stale delivery -- through any of the three entry points -- is made
+    // safe purely by comparing against currentRequestId at the moment it actually runs, which is
+    // what's under direct regression-test coverage (see RecordingServiceTest). A real
+    // Handler/Looper (not an injected fake) so production behavior is exactly what's tested --
+    // Robolectric's paused main-looper clock is what tests advance to exercise this
+    // deterministically.
     private val pendingStartHandler = Handler(Looper.getMainLooper())
-    private val pendingStartTimeoutRunnable = Runnable {
-        // Guards again even though this is only ever posted while pending and removed the moment
-        // that stops being true -- cheap, and keeps this runnable safe to reason about in
-        // isolation from exactly when/whether it was successfully removed elsewhere.
-        if (startRequestPending && !recorder.isActive) {
-            startRequestPending = false
-            finishRecording()
-        }
-    }
 
     // Durable (SharedPreferences-backed), not a plain in-memory field: a session that ends with
     // no listener attached -- app backgrounded, screen off, or the process killed outright before
@@ -174,8 +191,8 @@ class RecordingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> stopRecording()
-            ACTION_START -> handleActionStart()
-            ACTION_CANCEL_START -> handleActionCancelStart()
+            ACTION_START -> handleActionStart(intent.getLongExtra(EXTRA_REQUEST_ID, -1L))
+            ACTION_CANCEL_START -> handleActionCancelStart(intent.getLongExtra(EXTRA_REQUEST_ID, -1L))
         }
         return START_NOT_STICKY
     }
@@ -184,8 +201,16 @@ class RecordingService : Service() {
      * a future [startRecording] call a not-yet-connected (or never-connecting) bound client may or
      * may not ever make: enters a temporary "preparing to record" foreground state immediately and
      * arms [PENDING_START_TIMEOUT_MS] as a backstop. [startRecording] transitions this into the
-     * real recording state; [handleActionCancelStart] retracts it explicitly. */
-    private fun handleActionStart() {
+     * real recording state; [handleActionCancelStart] retracts it explicitly.
+     *
+     * [requestId] is what makes this safe against the two entry points (this Intent dispatch, and
+     * a direct [startRecording] call through an already-live binder) arriving in either order, and
+     * against Android redelivering or delaying this call arbitrarily: a delayed ACTION_START for
+     * an id that's already been handled -- whether it was fulfilled, canceled, or already failed
+     * synchronously via a direct [startRecording] call that raced ahead of this same Intent -- is
+     * recognized as stale by comparing against [currentRequestId] and safely ignored, while a
+     * genuinely new (strictly greater) id is always accepted as a fresh retry. */
+    private fun handleActionStart(requestId: Long) {
         // A late ACTION_START can arrive *after* an already-bound Fragment called startRecording()
         // directly through its live binder reference -- Android dispatches a
         // startForegroundService() Intent to onStartCommand() on a separate path from a direct
@@ -194,22 +219,36 @@ class RecordingService : Service() {
         // active recording's notification back to "preparing", and must never arm a timeout that
         // could stop it later.
         if (recorder.isActive) return
-        // A duplicate ACTION_START while one is already pending must not re-arm a second timeout
-        // on top of the first (whichever fires first would then incorrectly stop this session) or
-        // redundantly re-post the same notification.
-        if (startRequestPending) return
+        // Stale: either a duplicate delivery of the id that's already pending right now (must not
+        // re-arm a second timeout on top of the first), or an id that's <= whatever this service
+        // has already moved past -- including one whose direct startRecording() call already ran
+        // and failed synchronously before this very Intent was dispatched (see startRecording()'s
+        // doc). Only a strictly newer id represents a genuinely new attempt.
+        val lastSeen = currentRequestId
+        if (lastSeen != null && requestId <= lastSeen) return
+        currentRequestId = requestId
         startRequestPending = true
         startForegroundCompat(buildPreparingNotification())
-        pendingStartHandler.postDelayed(pendingStartTimeoutRunnable, PENDING_START_TIMEOUT_MS)
+        pendingStartHandler.postDelayed({ handlePendingStartTimeout(requestId) }, PENDING_START_TIMEOUT_MS)
     }
 
-    private fun handleActionCancelStart() {
-        // Only ever retracts a request that's still merely *pending* -- must never stop a
-        // recording that's already actively running, e.g. if a bound Fragment's connection won a
-        // race against this cancellation and already called startRecording() itself.
-        if (startRequestPending && !recorder.isActive) {
+    /** Only acts if [requestId] is still genuinely the current, unresolved request -- a stale
+     * delayed firing for an id that's since been superseded by a newer one (or fulfilled, or
+     * canceled) must never stop a session it no longer has anything to do with. */
+    private fun handlePendingStartTimeout(requestId: Long) {
+        if (currentRequestId == requestId && startRequestPending && !recorder.isActive) {
             startRequestPending = false
-            pendingStartHandler.removeCallbacks(pendingStartTimeoutRunnable)
+            finishRecording()
+        }
+    }
+
+    private fun handleActionCancelStart(requestId: Long) {
+        // Only ever retracts a request that both (a) is still merely *pending*, never a recording
+        // that's already actively running, and (b) is the exact request this cancellation actually
+        // names -- a stale cancellation for an id that's since been superseded by a newer pending
+        // request must leave that newer one completely untouched.
+        if (currentRequestId == requestId && startRequestPending && !recorder.isActive) {
+            startRequestPending = false
             // Already promoted to the foreground (with the temporary "preparing" notification) by
             // handleActionStart() above -- this is the other half of that contract's prompt
             // stopForeground()/stopSelf() obligation.
@@ -217,14 +256,23 @@ class RecordingService : Service() {
         }
     }
 
-    fun startRecording() {
+    /** [requestId] correlates this call with whichever of ACTION_START/ACTION_CANCEL_START also
+     * refer to the same logical attempt (see [EXTRA_REQUEST_ID]/[handleActionStart]). A direct,
+     * already-bound call like this one is always authoritative for its own id regardless of
+     * whatever [currentRequestId] currently holds: it's what lets a later, delayed ACTION_START
+     * Intent for this exact id -- dispatched *before* this call ran but delivered *after* it
+     * already resolved (including a synchronous failure inside [WavRecorder.start] below, which
+     * calls back into `onError` and [finishRecording] before this method even returns) -- be
+     * recognized by [handleActionStart] as already-handled and ignored, rather than mistakenly
+     * re-entering the foreground for an attempt that's already over. */
+    fun startRecording(requestId: Long) {
         if (recorder.isActive) return
         // This start is now being fulfilled -- an ACTION_CANCEL_START arriving after this point
-        // must not retract it (see onStartCommand()'s !recorder.isActive guard above), and the
-        // bounded pending-start timeout must never fire for a session that's already actually
-        // recording.
+        // must not retract it (see handleActionCancelStart()'s !recorder.isActive guard above),
+        // and the bounded pending-start timeout must never fire for a session that's already
+        // actually recording.
+        currentRequestId = requestId
         startRequestPending = false
-        pendingStartHandler.removeCallbacks(pendingStartTimeoutRunnable)
         // Reset every piece of session state up front, before recorder.start() below even runs.
         // Without this, a session that fails or is stopped before its first segment opens (so
         // onSegmentStarted never fires to overwrite currentTarget) would otherwise leave the
@@ -361,7 +409,11 @@ class RecordingService : Service() {
     }
 
     override fun onDestroy() {
-        pendingStartHandler.removeCallbacks(pendingStartTimeoutRunnable)
+        // Safe even though individual timeout closures are never removed on the ordinary
+        // transitions above (see pendingStartHandler's doc) -- this Handler is used for nothing
+        // else, so clearing everything unconditionally at actual teardown can't drop something
+        // unrelated, and avoids a stale closure referencing a destroyed service instance later.
+        pendingStartHandler.removeCallbacksAndMessages(null)
         if (recorder.isActive) recorder.stop()
         super.onDestroy()
     }

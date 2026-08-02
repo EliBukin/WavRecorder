@@ -27,6 +27,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 class RecordFragment : Fragment() {
 
@@ -47,6 +48,13 @@ class RecordFragment : Fragment() {
     // stopped" deterministically, without depending on exactly when Robolectric's bindService()
     // happens to deliver onServiceConnected -- see RecordFragmentLifecycleTest.
     internal var pendingStart = false
+    // The request id (see RecordingService.EXTRA_REQUEST_ID) of the beginRecording() attempt
+    // [pendingStart] refers to, if any -- carried alongside it so a later ACTION_CANCEL_START (see
+    // onStop()) or a fulfilled connection (see serviceConnection below) always names the exact
+    // same attempt the original ACTION_START Intent did, letting RecordingService tell a stale
+    // message for an already-resolved attempt apart from a genuinely new retry. internal for
+    // tests -- see RecordFragmentLifecycleTest.
+    internal var pendingRequestId: Long = 0L
 
     // Snapshotted at the moment a start attempt is actually made (see startAndCheckMicRoute()):
     // whether an external input was detected/preferred beforehand, and whether the user has
@@ -89,7 +97,7 @@ class RecordFragment : Fragment() {
             service.listener = recordingListener
             if (pendingStart) {
                 pendingStart = false
-                startAndCheckMicRoute(service)
+                startAndCheckMicRoute(service, pendingRequestId)
             }
             syncUiWithService()
         }
@@ -328,6 +336,7 @@ class RecordFragment : Fragment() {
             requireContext().startService(
                 Intent(requireContext(), RecordingService::class.java)
                     .setAction(RecordingService.ACTION_CANCEL_START)
+                    .putExtra(RecordingService.EXTRA_REQUEST_ID, pendingRequestId)
             )
         }
 
@@ -413,6 +422,17 @@ class RecordFragment : Fragment() {
         binding.waveformView.clear()
         binding.statusDetailText.visibility = View.GONE
 
+        // A fresh, strictly-increasing id for this one attempt -- attached to the Intent below and
+        // passed directly to startRecording() in the already-bound case, so RecordingService can
+        // correlate the two (and a later ACTION_CANCEL_START) as referring to the same logical
+        // request, regardless of the order they actually arrive in. See
+        // RecordingService.EXTRA_REQUEST_ID/handleActionStart for why this matters: without it, a
+        // delayed ACTION_START for an attempt that already failed synchronously (or a stale
+        // cancellation/timeout for one that's since been superseded by a newer retry) has no way
+        // to be told apart from a genuinely new request.
+        val requestId = requestIdGenerator.incrementAndGet()
+        pendingRequestId = requestId
+
         // Explicitly tagged ACTION_START (rather than a bare Intent) so RecordingService itself
         // has an authoritative record that it now owes either a real startForeground() call or a
         // safe stopSelf() -- see onStop() below for the corresponding cancellation, and
@@ -420,11 +440,12 @@ class RecordFragment : Fragment() {
         // Fragment's own bind connection ever completes.
         val serviceIntent = Intent(requireContext(), RecordingService::class.java)
             .setAction(RecordingService.ACTION_START)
+            .putExtra(RecordingService.EXTRA_REQUEST_ID, requestId)
         ContextCompat.startForegroundService(requireContext(), serviceIntent)
 
         val service = recordingService
         if (service != null) {
-            startAndCheckMicRoute(service)
+            startAndCheckMicRoute(service, requestId)
         } else {
             pendingStart = true
         }
@@ -438,9 +459,9 @@ class RecordFragment : Fragment() {
      * (stopRecording() bails out whenever the recorder doesn't consider itself active yet) and
      * let recording continue unnoticed on the wrong input. Deferring the check to right after
      * startRecording() returns avoids that race entirely. */
-    private fun startAndCheckMicRoute(service: RecordingService) {
+    private fun startAndCheckMicRoute(service: RecordingService, requestId: Long) {
         pendingMicMismatch = false
-        service.startRecording()
+        service.startRecording(requestId)
         if (pendingMicMismatch) {
             pendingMicMismatch = false
             // The session just started (almost certainly before any audio was ever captured, per
@@ -570,5 +591,13 @@ class RecordFragment : Fragment() {
 
     companion object {
         private val SAVED_AT_FORMAT = SimpleDateFormat("MMM d, yyyy · h:mm a", Locale.getDefault())
+        // Companion-scoped (not per-instance) so it survives this Fragment being recreated (e.g.
+        // rotation) while RecordingService -- a longer-lived, separate component -- keeps its own
+        // currentRequestId high-water-mark across that same recreation; a per-instance counter that
+        // reset to 0 on recreation could mint an id low enough to be wrongly rejected as stale by a
+        // service that had already seen higher ones from before the recreation. Only reset by a
+        // fresh process (which also gives RecordingService a fresh instance/state), so the two
+        // always stay consistent with each other.
+        private val requestIdGenerator = AtomicLong(0)
     }
 }
