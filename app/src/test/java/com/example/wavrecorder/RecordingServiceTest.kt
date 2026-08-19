@@ -4,6 +4,7 @@ import android.app.Application
 import android.app.NotificationManager
 import android.content.Intent
 import android.os.Looper
+import android.util.Log
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -17,10 +18,14 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
+import org.robolectric.shadows.ShadowLog
+import java.io.RandomAccessFile
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.system.measureTimeMillis
 
 /** A no-op [RecordingService.Listener]; tests override only the callbacks they care about. */
 private open class StubListener : RecordingService.Listener {
@@ -35,6 +40,17 @@ class RecordingServiceTest {
 
     @get:Rule
     val tempFolder = TemporaryFolder()
+
+    /** stopRecording()/onError now finalize asynchronously (see RecordingService.beginAsyncFinalize):
+     * the actual join happens on a real background thread, so this waits for it to actually finish
+     * (rather than assuming a single idle() call would already find its result queued) before
+     * draining the main looper to deliver whatever it posted. Mirrors WavRecorderTest's own
+     * awaitTerminatedAndDeliverCallbacks for the same reason. */
+    private fun awaitFinalizationAndIdle(service: RecordingService, timeoutMs: Long = 3000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (service.isFinalizing && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        shadowOf(Looper.getMainLooper()).idle()
+    }
 
     @Test
     fun `starting a new session resets currentTarget so stopping before its first segment starts never reports the previous session's file`() {
@@ -106,18 +122,22 @@ class RecordingServiceTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
         service.stopRecording()
+        awaitFinalizationAndIdle(service)
 
         assertTrue("expected session 1 to report a real saved file", session1StoppedCalled)
         assertTrue("expected session 1's onStopped target to be a real file, not null",
             session1StoppedTarget != null)
 
-        // --- Session 2: start, then stop immediately without ever draining the main looper, so
-        // even if the background thread managed to queue an onSegmentStarted post, it can't have
-        // been delivered yet -- currentTarget can only be whatever startRecording() itself just
-        // set synchronously. ---
+        // --- Session 2: start, then stop immediately without ever draining the main looper before
+        // stopRecording() itself captures currentTarget -- so even if the background recording
+        // thread managed to queue an onSegmentStarted post in the meantime, it can't have been
+        // delivered (and mutated currentTarget) yet at the moment beginAsyncFinalize snapshots it.
+        // (The later awaitFinalizationAndIdle below does drain the looper, but by then that stale
+        // post's own generation check already fails, since requestStop() bumped it first.) ---
         onSession1 = false
         service.startRecording(1L)
         service.stopRecording()
+        awaitFinalizationAndIdle(service)
 
         assertTrue("expected session 2 to report a stop (even with no file yet)", session2StoppedCalled)
         assertNull(
@@ -162,7 +182,8 @@ class RecordingServiceTest {
         service.startRecording(1L)
         val deadline = System.currentTimeMillis() + 2000
         while (service.isRecording && System.currentTimeMillis() < deadline) Thread.sleep(5)
-        shadowOf(Looper.getMainLooper()).idle()
+        shadowOf(Looper.getMainLooper()).idle() // delivers the posted onError(e), which kicks off beginAsyncFinalize
+        awaitFinalizationAndIdle(service) // then waits for its own background join + delivers its result
 
         assertTrue("expected the revoked-permission failure to be reported as a SecurityException",
             reportedError is SecurityException)
@@ -217,6 +238,7 @@ class RecordingServiceTest {
         while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
         Thread.sleep(20)
         service.stopRecording()
+        awaitFinalizationAndIdle(service)
 
         assertTrue("expected onFinalizationFailed, not a plain onStopped", !onStoppedCalled)
         assertTrue(finalizationFailedCause is WavFinalizationException)
@@ -271,6 +293,7 @@ class RecordingServiceTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
         service.stopRecording()
+        awaitFinalizationAndIdle(service)
 
         assertTrue("expected onFinalizationUnknown to fire for a thread that never joined in time",
             unknownCalled)
@@ -291,6 +314,705 @@ class RecordingServiceTest {
             channel.position(newPosition)
         }
         override fun close() = channel.close()
+    }
+
+    @Test
+    fun `onCreate runs a startup recovery check for a segment left by a previous process`() {
+        // Simulates a real interrupted segment (crash right after opening: header declares 0
+        // bytes, but 50 real bytes already made it to disk) left behind by a now-gone previous
+        // process -- then confirms onCreate() alone (not any explicit recording action) is what
+        // discovers and repairs it, proving the recovery check is actually wired into service
+        // startup rather than just unit-tested in isolation.
+        val segmentFile = tempFolder.newFile("interrupted.wav")
+        RandomAccessFile(segmentFile, "rw").use { raf ->
+            val header = WavHeaderWriter.build(sampleRate = 48000, channels = 1, bitsPerSample = 16, audioDataLen = 0L)
+            val headerBytes = ByteArray(header.remaining())
+            header.get(headerBytes)
+            raf.write(headerBytes)
+            raf.write(ByteArray(50))
+        }
+        // Simulates the *previous* (now-gone) process's own ACTIVE record, exactly as
+        // WavRecorder.openSegment() would have left it -- onCreate() is what's responsible for
+        // atomically claiming this as a recovery candidate before anything else can touch it.
+        val journal = ActiveSegmentJournal(app())
+        // Tagged with a fake foreign owner id (never this test JVM's own ProcessInstanceId), so
+        // claimActiveAsRecoveryCandidate() genuinely recognizes it as belonging to a real,
+        // previous, now-gone process rather than this same one -- see persistActiveWithOwnerForTest's doc.
+        journal.persistActiveWithOwnerForTest(
+            token = "previous-process-token", ownerProcessId = "simulated-previous-process",
+            target = OutputTarget.FileTarget(segmentFile), sampleRate = 48000, channels = 1, bitsPerSample = 16
+        )
+
+        Robolectric.buildService(RecordingService::class.java).create().get()
+
+        val deadline = System.currentTimeMillis() + 2000
+        while (journal.peekRecoveryCandidates().isNotEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(5)
+
+        assertTrue(
+            "expected onCreate() to claim the leftover ACTIVE record and run WavRecoveryManager, " +
+                "clearing the recovery-pending record once recovery succeeded",
+            journal.peekRecoveryCandidates().isEmpty()
+        )
+        assertNull("the ACTIVE slot itself must also be empty -- it was claimed away, not left behind",
+            journal.peekActive())
+        val format = WavRiffParser.parse(segmentFile.inputStream())
+        assertEquals("expected the header to now declare the real audio bytes found on disk",
+            50L, format?.dataSize)
+    }
+
+    @Test
+    fun `stopRecording returns without waiting for a deliberately blocked recorder stop`() {
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        val blockForever = CountDownLatch(1) // never released -- source ignores stop()
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                blockForever.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() {} // deliberately does NOT unblock read(), standing in for a
+            // genuinely wedged driver
+            override fun release() {}
+        }
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 2000, // the real production default -- what stopRecording() must not block on
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
+        )
+        service.startRecording(1L)
+        val segmentOpenedDeadline = System.currentTimeMillis() + 2000
+        while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+
+        val elapsedMs = measureTimeMillis { service.stopRecording() }
+
+        assertTrue(
+            "stopRecording() must return promptly rather than blocking anywhere near the " +
+                "recorder's own 2000ms join timeout; took ${elapsedMs}ms",
+            elapsedMs < 500
+        )
+
+        blockForever.countDown() // release the wedged background thread so it doesn't linger past the test
+    }
+
+    @Test
+    fun `duplicate Stop calls do not launch overlapping finalization work`() {
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        val stopCallCount = AtomicInteger(0)
+        var reads = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() {
+                stopCallCount.incrementAndGet()
+                blockUntilStopped.countDown()
+            }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        service.recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+        var onStoppedCount = 0
+        service.listener = object : StubListener() {
+            override fun onStopped(lastTarget: OutputTarget?) { onStoppedCount++ }
+        }
+
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+
+        // A rapid triple-tap of Stop (or a notification-tap racing an in-app tap) -- only the
+        // first must actually do anything.
+        service.stopRecording()
+        service.stopRecording()
+        service.stopRecording()
+        awaitFinalizationAndIdle(service)
+
+        assertEquals(
+            "expected the underlying AudioSource to be stopped exactly once, not once per " +
+                "duplicate Stop call",
+            1, stopCallCount.get()
+        )
+        assertEquals("expected exactly one outcome delivery for the duplicate Stop calls combined",
+            1, onStoppedCount)
+    }
+
+    @Test
+    fun `finalization outcome is delivered exactly once and on the main thread`() {
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var reads = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        service.recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+        var deliveryCount = 0
+        var deliveredOnMainThread = false
+        service.listener = object : StubListener() {
+            override fun onStopped(lastTarget: OutputTarget?) {
+                deliveryCount++
+                deliveredOnMainThread = Looper.myLooper() == Looper.getMainLooper()
+            }
+        }
+
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        service.stopRecording()
+        awaitFinalizationAndIdle(service)
+
+        assertEquals(1, deliveryCount)
+        assertTrue("expected the outcome to be delivered on the main thread, not the background " +
+            "finalize thread", deliveredOnMainThread)
+    }
+
+    // ---- Area 1 (serialized sessions): a new start attempt during FINALIZING is rejected, never
+    // silently allowed to open a second, competing WavRecorder session. Supersedes two older tests
+    // that asserted the *opposite* -- that a newer session was allowed to start immediately while
+    // an older one was still finalizing -- which is exactly the race this service-level state
+    // machine (see ServiceState) now closes. ----
+
+    @Test
+    fun `a start attempt while a previous session is still finalizing is rejected -- it never opens a new microphone or output file`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        var session1Reads = 0
+        val session1Source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                session1Reads++
+                if (session1Reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                Thread.sleep(10_000) // never unblocked by stop() -- wedged, stays "finalizing"
+                return -1
+            }
+            override fun stop() {}
+            override fun release() {}
+        }
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        var openAudioSourceCallCount = 0
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget =
+                OutputTarget.FileTarget(tempFolder.newFile("session1.wav"))
+        }
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 300, // short and deterministic: the join gives up quickly, yielding Unknown
+            openAudioSource = {
+                openAudioSourceCallCount++
+                WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size)
+            }
+        )
+        var rejectedCount = 0
+        var session1UnknownDelivered = false
+        service.listener = object : StubListener() {
+            override fun onFinalizationUnknown(target: OutputTarget?) { session1UnknownDelivered = true }
+            override fun onStartRejected() { rejectedCount++ }
+        }
+
+        service.startRecording(1L)
+        val session1Deadline = System.currentTimeMillis() + 2000
+        while (session1Reads < 1 && System.currentTimeMillis() < session1Deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        service.stopRecording()
+        assertTrue("sanity: session 1 must genuinely still be finalizing", service.isFinalizing)
+
+        // The critical action: attempt a second session while session 1 is still finalizing.
+        service.startRecording(2L)
+
+        assertFalse("a start attempt during FINALIZING must never actually begin recording",
+            service.isRecording)
+        assertEquals("must never open a second microphone/AudioSource while an older session is " +
+            "still finalizing", 1, openAudioSourceCallCount)
+        assertEquals("currentRequestId must remain session 1's own -- rejecting a start must " +
+            "never mutate ownership", 1L, service.currentRequestId)
+        assertEquals(1, rejectedCount)
+
+        // Session 1's own finalization must still resolve normally and deliver its real outcome,
+        // proving the rejected attempt didn't corrupt or discard it.
+        val outcomeDeadline = System.currentTimeMillis() + 3000
+        while (!session1UnknownDelivered && System.currentTimeMillis() < outcomeDeadline) {
+            Thread.sleep(10)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        assertTrue("session 1's own finalization outcome must still be delivered, not discarded",
+            session1UnknownDelivered)
+        assertFalse(service.isFinalizing)
+
+        // After session 1 has genuinely reached a terminal outcome, a fresh request must succeed.
+        service.recorder = blockingRecorder()
+        service.startRecording(3L)
+        assertTrue("a genuinely new request after the old session reached a terminal outcome " +
+            "must succeed normally", service.isRecording)
+        service.stopRecording() // cleanup
+    }
+
+    @Test
+    fun `a FinalizationFailed outcome and its journal record survive a rejected start attempt during finalization`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val releaseSession1 = CountDownLatch(1)
+        var reads = 0
+        val session1Source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                releaseSession1.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() {} // deliberately does not unblock -- the test controls timing explicitly
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("failing-session.wav")
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 5000, // comfortably longer than this test's own explicit release timing
+            openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) },
+            wrapChannel = { channel -> AlwaysFailingHeaderWriter(channel) }
+        )
+        var finalizationFailedDelivered = false
+        service.listener = object : StubListener() {
+            override fun onFinalizationFailed(target: OutputTarget?, cause: Exception) { finalizationFailedDelivered = true }
+        }
+
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        service.stopRecording()
+        assertTrue(service.isFinalizing)
+
+        service.startRecording(2L) // rejected -- session 1's own segment/journal record must survive this
+        assertFalse(service.isRecording)
+
+        val journal = ActiveSegmentJournal(app())
+        assertEquals("session 1's own still-active journal record must be completely undisturbed " +
+            "by the rejected start attempt", segmentFile.absolutePath,
+            (journal.peekActive()?.target as? OutputTarget.FileTarget)?.file?.absolutePath)
+
+        releaseSession1.countDown() // now let session 1 actually finish finalizing (and fail to patch its header)
+        awaitFinalizationAndIdle(service)
+
+        assertTrue("expected FinalizationFailed to still be delivered for session 1", finalizationFailedDelivered)
+        assertNotNull("a failed finalization must still leave its journal record in place for a " +
+            "later recovery pass -- it must never be lost", journal.peekActive())
+        assertEquals(segmentFile.absolutePath,
+            (journal.peekActive()?.target as? OutputTarget.FileTarget)?.file?.absolutePath)
+    }
+
+    @Test
+    fun `a FinalizationUnknown outcome survives a rejected start attempt during finalization`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockForever = CountDownLatch(1) // never released -- the thread stays wedged past the join timeout
+        val session1Source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                blockForever.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() {}
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("unknown-session.wav")
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 200,
+            openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+        var unknownDelivered = false
+        var unknownTarget: OutputTarget? = null
+        service.listener = object : StubListener() {
+            override fun onFinalizationUnknown(target: OutputTarget?) {
+                unknownDelivered = true
+                unknownTarget = target
+            }
+        }
+
+        service.startRecording(1L)
+        val segmentOpenedDeadline = System.currentTimeMillis() + 2000
+        while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        service.stopRecording()
+        assertTrue(service.isFinalizing)
+
+        service.startRecording(2L) // rejected while still finalizing
+        assertFalse(service.isRecording)
+
+        awaitFinalizationAndIdle(service)
+
+        assertTrue("expected FinalizationUnknown to still be delivered for session 1", unknownDelivered)
+        assertEquals(segmentFile.absolutePath, (unknownTarget as? OutputTarget.FileTarget)?.file?.absolutePath)
+
+        blockForever.countDown() // release the wedged background thread so it doesn't linger past the test
+    }
+
+    @Test
+    fun `an ACTION_START arriving during FINALIZING cannot change the old session's request id or make its result stale`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        var reads = 0
+        val session1Source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                Thread.sleep(10_000)
+                return -1
+            }
+            override fun stop() {}
+            override fun release() {}
+        }
+        val controller = Robolectric.buildService(RecordingService::class.java)
+        val service = controller.create().get()
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(tempFolder.newFile("s1.wav"))
+        }
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 200,
+            openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+        var rejectedCount = 0
+        var unknownDelivered = false
+        service.listener = object : StubListener() {
+            override fun onFinalizationUnknown(target: OutputTarget?) { unknownDelivered = true }
+            override fun onStartRejected() { rejectedCount++ }
+        }
+
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        service.stopRecording()
+        assertTrue(service.isFinalizing)
+
+        // A brand new ACTION_START Intent (not a direct startRecording() call) for an unrelated,
+        // much higher id arrives while session 1 is still finalizing.
+        controller.withIntent(startIntent(99L)).startCommand(0, 1)
+
+        assertEquals("an ACTION_START during FINALIZING must never overwrite currentRequestId -- " +
+            "the still-in-flight background join checks this to decide whether its own outcome " +
+            "is still current", 1L, service.currentRequestId)
+        assertFalse("must never enter a pending state for the rejected attempt", service.startRequestPending)
+        assertEquals(1, rejectedCount)
+
+        awaitFinalizationAndIdle(service)
+        assertTrue("session 1's outcome must not have been made stale by the rejected ACTION_START",
+            unknownDelivered)
+    }
+
+    @Test
+    fun `rapid repeated start attempts during finalization never open more than one AudioSource`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        var reads = 0
+        val session1Source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                Thread.sleep(10_000)
+                return -1
+            }
+            override fun stop() {}
+            override fun release() {}
+        }
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        var openAudioSourceCallCount = 0
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(tempFolder.newFile("s1.wav"))
+        }
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 200,
+            openAudioSource = {
+                openAudioSourceCallCount++
+                WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size)
+            }
+        )
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        service.stopRecording()
+        assertTrue(service.isFinalizing)
+
+        // A rapid burst of Record taps landing while session 1 is still finalizing.
+        repeat(5) { service.startRecording(100L + it) }
+
+        assertFalse(service.isRecording)
+        assertEquals("every rapid start attempt during FINALIZING must be rejected -- never more " +
+            "than the one already-open AudioSource from session 1 itself", 1, openAudioSourceCallCount)
+
+        awaitFinalizationAndIdle(service)
+    }
+
+    @Test
+    fun `ACTION_STOP from the notification and a direct stopRecording call from the UI follow the same path`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var reads = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        service.recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+        var onStoppedCalled = false
+        service.listener = object : StubListener() {
+            override fun onStopped(lastTarget: OutputTarget?) { onStoppedCalled = true }
+        }
+
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+
+        val elapsedMs = measureTimeMillis {
+            // Exactly what the notification's Stop action's PendingIntent triggers.
+            service.onStartCommand(Intent(app(), RecordingService::class.java).setAction("com.example.wavrecorder.action.STOP"), 0, 1)
+        }
+
+        assertTrue("ACTION_STOP must go through the same async, non-blocking path as a direct " +
+            "stopRecording() call", elapsedMs < 500)
+        awaitFinalizationAndIdle(service)
+        assertTrue(onStoppedCalled)
+        assertFalse(service.isRecording)
+    }
+
+    @Test
+    fun `a synchronous microphone-open failure produces a plain Failed outcome, never FailedButSaved without a file`() {
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        service.recorder = alwaysFailsSynchronously()
+        // Deliberately no listener attached, so the outcome is durably persisted and can be
+        // inspected directly as a RecordingOutcome (Listener.onError can't distinguish Failed
+        // from FailedButSaved -- both map to the same callback -- so this is the only way to
+        // assert on the actual outcome type).
+
+        service.startRecording(1L)
+        awaitFinalizationAndIdle(service)
+
+        val outcome = service.consumePendingOutcome()
+        assertTrue("expected a plain Failed outcome (no segment ever existed), got: $outcome",
+            outcome is RecordingOutcome.Failed)
+        assertFalse("must never be classified as FailedButSaved when no file was ever created",
+            outcome is RecordingOutcome.FailedButSaved)
+    }
+
+    @Test
+    fun `onDestroy does not block the calling thread waiting for the recording thread join timeout`() {
+        val blockForever = CountDownLatch(1) // never released -- source ignores stop()
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                blockForever.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() {} // deliberately does not unblock read()
+            override fun release() {}
+        }
+        val controller = Robolectric.buildService(RecordingService::class.java)
+        val service = controller.create().get()
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 2000, // the real production default
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
+        )
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (service.lastTarget == null && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        assertTrue("sanity: expected recording to actually be active before destroying the service",
+            service.isRecording)
+
+        val elapsedMs = measureTimeMillis { controller.destroy() }
+
+        assertTrue(
+            "onDestroy() must not block anywhere near the recorder's own 2000ms join timeout; " +
+                "took ${elapsedMs}ms",
+            elapsedMs < 500
+        )
+
+        blockForever.countDown() // release the wedged background thread so it doesn't linger past the test
+    }
+
+    @Test
+    fun `Failed, FinalizationFailed, and FinalizationUnknown outcomes are each delivered on the main thread exactly once`() {
+        // FinalizationFailed case.
+        run {
+            val service = Robolectric.buildService(RecordingService::class.java).create().get()
+            val chunk = byteArrayOf(1, 2, 3, 4)
+            val blockUntilStopped = CountDownLatch(1)
+            var reads = 0
+            val source = object : AudioSource {
+                override fun startRecording() {}
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    reads++
+                    if (reads == 1) {
+                        System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                        return chunk.size
+                    }
+                    blockUntilStopped.await(5, TimeUnit.SECONDS)
+                    return -1
+                }
+                override fun stop() { blockUntilStopped.countDown() }
+                override fun release() {}
+            }
+            service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+                override fun createOutputFile(fileName: String): OutputTarget =
+                    OutputTarget.FileTarget(tempFolder.newFile("failed.wav"))
+            }
+            service.recorder = WavRecorder(
+                openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+                wrapChannel = { channel -> AlwaysFailingHeaderWriter(channel) }
+            )
+            var deliveryCount = 0
+            var onMainThread = false
+            service.listener = object : StubListener() {
+                override fun onFinalizationFailed(target: OutputTarget?, cause: Exception) {
+                    deliveryCount++
+                    onMainThread = Looper.myLooper() == Looper.getMainLooper()
+                }
+            }
+            service.startRecording(1L)
+            val deadline = System.currentTimeMillis() + 2000
+            while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+            Thread.sleep(20)
+            service.stopRecording()
+            awaitFinalizationAndIdle(service)
+            assertEquals(1, deliveryCount)
+            assertTrue(onMainThread)
+        }
+        // This block's own segment failed to finalize, so its journal ACTIVE record was
+        // deliberately never cleared (see WavRecorder.closeSegment's doc) -- and since every
+        // `run{}` block here shares one Application/journal within this single @Test method
+        // (not genuinely separate processes, the boundary persistActive()'s protection actually
+        // cares about), the next block's own fresh service would otherwise be correctly refused
+        // when it tries to persist its own first segment. Clearing here simulates the record
+        // having already been dealt with (recovered, or genuinely a different process) before the
+        // next scenario begins -- not a workaround for a bug, but for this test's own deliberately
+        // shared state.
+        ActiveSegmentJournal(app()).clearActiveForTest()
+
+        // FinalizationUnknown case.
+        run {
+            val service = Robolectric.buildService(RecordingService::class.java).create().get()
+            val blockForever = CountDownLatch(1)
+            val source = object : AudioSource {
+                override fun startRecording() {}
+                override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                    blockForever.await(5, TimeUnit.SECONDS)
+                    return -1
+                }
+                override fun stop() {}
+                override fun release() {}
+            }
+            service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
+                override fun createOutputFile(fileName: String): OutputTarget =
+                    OutputTarget.FileTarget(tempFolder.newFile("unknown.wav"))
+            }
+            service.recorder = WavRecorder(
+                threadJoinTimeoutMs = 50,
+                openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
+            )
+            var deliveryCount = 0
+            var onMainThread = false
+            service.listener = object : StubListener() {
+                override fun onFinalizationUnknown(target: OutputTarget?) {
+                    deliveryCount++
+                    onMainThread = Looper.myLooper() == Looper.getMainLooper()
+                }
+            }
+            service.startRecording(1L)
+            val deadline = System.currentTimeMillis() + 2000
+            while (service.lastTarget == null && System.currentTimeMillis() < deadline) {
+                Thread.sleep(5)
+                shadowOf(Looper.getMainLooper()).idle()
+            }
+            service.stopRecording()
+            awaitFinalizationAndIdle(service)
+            assertEquals(1, deliveryCount)
+            assertTrue(onMainThread)
+            blockForever.countDown()
+        }
+        // This block's own segment never resolved as a normal clean stop either (the join timed
+        // out as Unknown) -- see the identical note above for why this reset is needed between
+        // blocks that deliberately share one Application/journal.
+        ActiveSegmentJournal(app()).clearActiveForTest()
+
+        // Failed case (synchronous mic-open failure, no listener -- checked via consumePendingOutcome).
+        run {
+            val service = Robolectric.buildService(RecordingService::class.java).create().get()
+            service.recorder = alwaysFailsSynchronously()
+            service.startRecording(1L)
+            awaitFinalizationAndIdle(service)
+            assertTrue(service.consumePendingOutcome() is RecordingOutcome.Failed)
+        }
     }
 
     @Test
@@ -337,6 +1059,7 @@ class RecordingServiceTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
         service.stopRecording()
+        awaitFinalizationAndIdle(service)
 
         val pending = service.consumePendingOutcome()
         assertTrue("expected a Saved outcome to be persisted for a later bind to pick up",
@@ -375,6 +1098,7 @@ class RecordingServiceTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
         service.stopRecording()
+        awaitFinalizationAndIdle(service)
 
         assertNull("no outcome should be persisted when a listener was attached to receive it live",
             service.consumePendingOutcome())
@@ -382,6 +1106,62 @@ class RecordingServiceTest {
             "no terminal notification should be raised when the outcome was already delivered live",
             postedNotificationTitles().contains(app().getString(R.string.notification_result_saved_title))
         )
+    }
+
+    @Test
+    fun `live outcome delivery still reports this session's own outcome even when clearing an older stale one fails, and logs it`() {
+        ShadowLog.stream = null
+        ShadowLog.clear()
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        // A pending outcome store whose commitEditor seam calls the real editor.commit() (so its
+        // in-memory mutation is genuine) and then forces the caller-visible result to false -- see
+        // PendingOutcomeStoreTest's identical falseReportingCommitStore() for why this (not a
+        // hand-rolled fake) is the right way to exercise same-process behavior after a false
+        // result. This does not reproduce an actual failed disk write or process restart.
+        val failingStore = PendingOutcomeStore(app(), commitEditor = { editor -> editor.commit(); false })
+        // Simulates a genuinely stale, still-unconsumed outcome from an *older*, unrelated session
+        // that nobody ever picked up.
+        failingStore.persist(11L, RecordingOutcome.FinalizationUnknown(null), null)
+        service.pendingOutcomeStore = failingStore
+
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                return chunk.size
+            }
+            override fun stop() {}
+            override fun release() {}
+        }
+        service.recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+        var stoppedTarget: OutputTarget? = null
+        var onStoppedCalled = false
+        service.listener = object : StubListener() {
+            override fun onStopped(lastTarget: OutputTarget?) {
+                onStoppedCalled = true
+                stoppedTarget = lastTarget
+            }
+        }
+
+        service.startRecording(1L)
+        val segmentOpenedDeadline = System.currentTimeMillis() + 2000
+        while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        service.stopRecording()
+        awaitFinalizationAndIdle(service)
+
+        assertTrue("this session's own outcome must still be delivered live, never blocked by a " +
+            "failure clearing a different, older stale record", onStoppedCalled)
+        assertNotNull(stoppedTarget)
+        val warnings = ShadowLog.getLogsForTag("RecordingService").filter { it.type == Log.WARN }
+        assertTrue("expected a warning naming the stale session's id when clearing it fails, got: " +
+            "${ShadowLog.getLogs().map { it.msg }}",
+            warnings.any { it.msg.contains("11") })
     }
 
     @Test
@@ -433,7 +1213,8 @@ class RecordingServiceTest {
 
         val deadline = System.currentTimeMillis() + 2000
         while (service.isRecording && System.currentTimeMillis() < deadline) Thread.sleep(5)
-        shadowOf(Looper.getMainLooper()).idle()
+        shadowOf(Looper.getMainLooper()).idle() // delivers the posted onError(e), which kicks off beginAsyncFinalize
+        awaitFinalizationAndIdle(service) // then waits for its own background join + delivers its result
 
         assertNull(
             "a finalization failure must take precedence -- the generic onError callback must " +
@@ -480,6 +1261,7 @@ class RecordingServiceTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
         service1.stopRecording()
+        awaitFinalizationAndIdle(service1)
 
         controller1.destroy()
 
@@ -630,6 +1412,12 @@ class RecordingServiceTest {
         // -- resolving this attempt, self-stopping -- all before the Intent-dispatched
         // ACTION_START for this very same attempt (id 1) has been delivered.
         service.startRecording(1L)
+        // The synchronous mic-open failure inside recorder.start() already triggered onError ->
+        // beginAsyncFinalize() before startRecording() returned, but that call's own
+        // finishRecording() (and thus the self-stop) is delivered asynchronously via
+        // mainHandler.post -- see beginAsyncFinalize()'s doc for why a second, synchronous
+        // finishRecording() call right here was removed (it used to race the async one).
+        awaitFinalizationAndIdle(service)
         assertFalse(service.isRecording)
         assertEquals(1L, service.currentRequestId)
         assertTrue("sanity: the synchronous failure already resolved via a safe self-stop",
@@ -652,6 +1440,15 @@ class RecordingServiceTest {
 
         service.startRecording(1L) // attempt 1 fails synchronously
         assertFalse(service.isRecording)
+        // The synchronous failure's own beginAsyncFinalize() still runs its (here, effectively
+        // instant, since there's no real recording thread to join) background completion
+        // asynchronously -- see beginAsyncFinalize()'s doc. Attempt 1 must reach its own terminal
+        // state (state != FINALIZING) before a retry is accepted; a retry arriving in that brief
+        // window is correctly rejected by the same FINALIZING guard that protects every other
+        // still-finalizing session, exactly like `a delayed ACTION_START for an attempt that
+        // already failed synchronously is ignored` above -- this test is about a genuinely new,
+        // higher id being accepted only once attempt 1 is actually done, not about racing it.
+        awaitFinalizationAndIdle(service)
 
         // The user retries -- a fresh, strictly higher id, delivered the normal (not-yet-bound)
         // way via ACTION_START.

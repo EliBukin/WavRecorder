@@ -16,8 +16,15 @@ sealed class RecordingOutcome {
 
     /** Recording failed (mic disconnected, route changed, an I/O error, ...), but the last
      * segment's header/writer still finalized cleanly -- the file is safe to use up to the point
-     * of the failure. */
-    data class FailedButSaved(val target: OutputTarget?, val cause: Exception) : RecordingOutcome()
+     * of the failure. [target] is always non-null here -- a failure before any segment ever
+     * existed is [Failed], never this, so this is never mistaken for "a file exists but no
+     * indication it's actually usable." */
+    data class FailedButSaved(val target: OutputTarget, val cause: Exception) : RecordingOutcome()
+
+    /** Recording failed before any segment was ever opened -- there is no file, saved or
+     * otherwise, to point to at all. Distinct from [FailedButSaved] specifically so a startup
+     * failure (e.g. the microphone was busy) is never classified as if some file had been saved. */
+    data class Failed(val cause: Exception) : RecordingOutcome()
 
     /** The last segment's header patch or writer close failed; [target] (if known) may be
      * truncated or carry a stale header and should be treated as needing recovery. */

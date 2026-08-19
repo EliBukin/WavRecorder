@@ -19,10 +19,17 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.example.wavrecorder.databinding.DialogStatsBinding
 import com.example.wavrecorder.databinding.FragmentLibraryBinding
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
+import java.lang.ref.WeakReference
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -35,6 +42,8 @@ class LibraryFragment : Fragment() {
     // subclass that fails on command, e.g. simulating a revoked SAF permission.
     internal lateinit var destinationManager: DestinationManager
     private lateinit var adapter: RecordingsAdapter
+
+    private val mediaPlayerFactory: () -> MediaPlayer = { MediaPlayer() }
 
     /** The currently loaded MediaPlayer, if any. It stays alive across pause/resume. */
     private var mediaPlayer: MediaPlayer? = null
@@ -53,10 +62,20 @@ class LibraryFragment : Fragment() {
     private var suppressAutoStartOnPrepared = false
 
     // Bumped on every refreshList() call; a scan result only gets applied if it's still the most
-    // recent one requested. Concurrent scans (e.g. onResume() firing again before a slow SAF
-    // listing finishes) can otherwise complete out of order and let a stale result clobber a
-    // newer one.
+    // recent one requested. Kept as a *secondary* guard alongside the Job-cancellation coalescing
+    // below (see refreshJob) -- listRecordings() itself is a plain blocking call, not a suspending
+    // one, so cancelling its Job can't interrupt it mid-call; this is what still guarantees a
+    // result that happens to complete late is never applied.
     private val refreshRequestId = AtomicInteger(0)
+
+    // The currently in-flight (or most recently launched) refreshList() coroutine, if any --
+    // cancelled at the top of every new refreshList() call so a rapid burst of requests (e.g.
+    // onResume() firing repeatedly) coalesces to "only the newest one matters" instead of
+    // accumulating unbounded background work. Both this Job and showStats()'s own per-call Job are
+    // launched via viewLifecycleOwner.lifecycleScope, which is itself cancelled the moment this
+    // Fragment's view is destroyed -- see onDestroyView() -- so queued/running work is genuinely
+    // cancelled there too, not merely left to finish and have its result discarded.
+    private var refreshJob: Job? = null
 
     private val progressHandler = Handler(Looper.getMainLooper())
     private val progressTick = object : Runnable {
@@ -176,6 +195,12 @@ class LibraryFragment : Fragment() {
     // internal for testing: a test swaps in a DestinationManager that throws, then calls this
     // directly to exercise the failure path without waiting on the fragment's own onResume().
     internal fun refreshList() {
+        // Guards viewLifecycleOwner below, which throws IllegalStateException with no view --
+        // production never calls this without one (onResume() can't fire before onViewCreated(),
+        // and the one other caller, deleteRecording(), already checks _binding itself first), but
+        // this keeps the same graceful no-op safety the old backgroundExecutor?.execute() seam had
+        // for any caller (a test included) that does.
+        if (_binding == null) return
         // Listing a SAF-picked folder walks DocumentFile, which is one Binder round-trip to the
         // storage provider per file (name, mime type, last-modified are each a separate query) -
         // enough to visibly stutter the tab on a slower provider, so this runs off the main thread.
@@ -184,61 +209,119 @@ class LibraryFragment : Fragment() {
         val manager = destinationManager
         val appContext = requireContext().applicationContext
         val requestId = refreshRequestId.incrementAndGet()
-        Thread({
+        // Coalesce: a rapid burst of refresh requests (e.g. onResume() firing repeatedly) cancels
+        // whatever was previously in flight/queued rather than piling up unbounded background
+        // work -- only the newest request is ever allowed to actually apply a result.
+        refreshJob?.cancel()
+        refreshJob = viewLifecycleOwner.lifecycleScope.launch {
+            // runInterruptible (not plain withContext) so cancelling this Job also interrupts the
+            // underlying thread -- listRecordings() and the per-file interruption check it now
+            // does (see DestinationManager) can then actually notice and bail out, rather than
+            // running the full scan to completion regardless of cancellation.
+            //
             // listRecordings() can throw -- a revoked SAF permission (folder deleted, permission
             // pulled from Settings) surfaces as a SecurityException, and other provider failures
             // are possible too. Previously nothing caught this, so the scan thread would die
             // silently: no crash, but also no list update and no indication anything went wrong.
+            // CancellationException is deliberately never caught here as an ordinary failure --
+            // rethrowing it is what actually lets this coroutine finish cancelling, instead of
+            // swallowing it and continuing to run "cancelled" code (an anti-pattern
+            // kotlinx.coroutines itself warns against).
             val result = try {
-                Result.success(manager.listRecordings())
+                Result.success(runInterruptible(Dispatchers.IO) { manager.listRecordings() })
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Result.failure(e)
             }
-            Handler(Looper.getMainLooper()).post {
-                if (_binding == null) return@post
-                // A newer refreshList() has since been requested; this result is stale (the two
-                // scans raced and this one lost) and must not overwrite the list with newer data
-                // -- true whether this scan succeeded or failed.
-                if (requestId != refreshRequestId.get()) return@post
-                result.fold(
-                    onSuccess = { items ->
-                        adapter.submitList(items)
-                        binding.emptyText.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
-                    },
-                    onFailure = { e ->
-                        // Deliberately leaves the previously-shown list (if any) in place rather
-                        // than clearing it to empty -- a transient/permission failure shouldn't
-                        // make existing recordings look like they've vanished.
-                        Toast.makeText(
-                            appContext,
-                            getString(R.string.library_load_failed, e.message ?: e.javaClass.simpleName),
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-                )
-            }
-        }, "LibraryScanThread").start()
+            if (_binding == null) return@launch
+            // Secondary guard alongside this coroutine's own cancellation above: listRecordings()
+            // is a plain blocking call, not a suspending one, so a cancelled Job can't interrupt
+            // it mid-call -- if it happens to finish anyway, this still keeps its now-stale result
+            // from overwriting a newer one that already landed.
+            if (requestId != refreshRequestId.get()) return@launch
+            result.fold(
+                onSuccess = { items ->
+                    adapter.submitList(items)
+                    binding.emptyText.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+                },
+                onFailure = { e ->
+                    // Deliberately leaves the previously-shown list (if any) in place rather
+                    // than clearing it to empty -- a transient/permission failure shouldn't
+                    // make existing recordings look like they've vanished.
+                    Toast.makeText(
+                        appContext,
+                        getString(R.string.library_load_failed, e.message ?: e.javaClass.simpleName),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            )
+        }
     }
 
-    private fun showStats(item: RecordingItem) {
+    // internal for testing: lets a test substitute a fake reader that blocks on command, without
+    // needing a real (uncontrollable-timing) file read to deterministically exercise
+    // showStats()'s dismiss-cancellation/view-destruction paths -- same rationale as
+    // destinationManager's own internal+var seam above.
+    internal var statsReader: (Context, Uri) -> AudioStats? = AudioStatsReader::read
+
+    // The currently-shown statistics dialog, if any -- tracked (rather than left purely local to
+    // showStats()) specifically so onDestroyView() can dismiss it explicitly. A Dialog built from
+    // an Activity Context isn't torn down just because this Fragment's *view* is destroyed (the
+    // two lifecycles are independent), so without this a dialog left open while navigating away
+    // from this tab would linger on screen indefinitely with a stale window reference, even though
+    // its own backing coroutine is already correctly cancelled via viewLifecycleOwner.lifecycleScope.
+    private var activeStatsDialog: androidx.appcompat.app.AlertDialog? = null
+
+    // internal for testing: same rationale as refreshList() -- lets a test drive this directly.
+    internal fun showStats(item: RecordingItem) {
+        if (_binding == null) return
         val dialogBinding = DialogStatsBinding.inflate(LayoutInflater.from(requireContext()))
+        // Assigned right after the coroutine below actually launches; the dismiss listener only
+        // ever fires later (a user interaction, or the positive "Close" button), by which point it
+        // always sees the real Job.
+        var statsJob: Job? = null
         val dialog = MaterialAlertDialogBuilder(requireContext())
             .setTitle(item.name)
             .setView(dialogBinding.root)
             .setPositiveButton(R.string.stats_close, null)
+            // Cancels the scan the moment the user dismisses the dialog (Close button, tap
+            // outside, back press, or onDestroyView() explicitly dismissing it below) -- previously
+            // this kept scanning a potentially large WAV file to completion regardless, wastefully
+            // holding dialogBinding/dialog alive for no purpose once nothing could ever display
+            // the result.
+            .setOnDismissListener {
+                statsJob?.cancel()
+                if (activeStatsDialog === it) activeStatsDialog = null
+            }
             .show()
+        activeStatsDialog = dialog
 
         val context = requireContext().applicationContext
-        Thread({
-            val stats = AudioStatsReader.read(context, item.uri)
-            Handler(Looper.getMainLooper()).post {
-                if (!isAdded || !dialog.isShowing) return@post
-                dialogBinding.statsProgress.visibility = View.GONE
-                dialogBinding.statsText.visibility = View.VISIBLE
-                dialogBinding.statsText.text = stats?.let { formatStats(it) }
-                    ?: getString(R.string.stats_read_failed)
+        val uri = item.uri
+        // Held weakly across the suspension point below rather than captured directly: a
+        // Kotlin coroutine's local variables live in its own heap-allocated continuation object
+        // for the coroutine's full lifetime, including while genuinely suspended inside
+        // runInterruptible waiting on a blocking read that may not even be interruptible in
+        // practice (some providers ignore it) -- a strong reference here would keep the dialog and
+        // its binding artificially alive for that whole window even after the dialog is dismissed
+        // and the Job cancelled. A dismissed dialog can now be collected immediately instead.
+        val dialogRef = WeakReference(dialog)
+        val dialogBindingRef = WeakReference(dialogBinding)
+        statsJob = viewLifecycleOwner.lifecycleScope.launch {
+            val stats = try {
+                runInterruptible(Dispatchers.IO) { statsReader(context, uri) }
+            } catch (e: CancellationException) {
+                throw e
             }
-        }, "AudioStatsThread").start()
+            val liveDialog = dialogRef.get() ?: return@launch
+            val liveBinding = dialogBindingRef.get() ?: return@launch
+            if (!isAdded || !liveDialog.isShowing) return@launch
+            liveBinding.statsProgress.visibility = View.GONE
+            liveBinding.statsText.visibility = View.VISIBLE
+            liveBinding.statsText.text = stats?.let { formatStats(it) }
+                ?: getString(R.string.stats_read_failed)
+        }
     }
 
     private fun formatStats(s: AudioStats): String {
@@ -285,6 +368,14 @@ class LibraryFragment : Fragment() {
         // DocumentFile.delete() on a SAF uri is a content-provider round trip like the listing
         // above, and File.delete() itself can block on I/O too; either can janks the UI thread if
         // run synchronously from this button-click handler.
+        //
+        // Deliberately its own raw Thread, not viewLifecycleOwner.lifecycleScope like
+        // refreshList()/showStats(): the user just explicitly confirmed a destructive, one-shot
+        // action, and unlike a scan (whose result is simply redundant once superseded/torn-down)
+        // a confirmed delete must actually finish even if this screen is destroyed a moment later
+        // -- lifecycleScope would cancel it right along with everything else on view destruction,
+        // which is exactly wrong here. A plain independent Thread keeps that guarantee explicit
+        // and unaffected by this fragment's view lifecycle.
         val manager = destinationManager
         val appContext = requireContext().applicationContext
         Thread({
@@ -324,57 +415,73 @@ class LibraryFragment : Fragment() {
         isPreparingPlayback = true
         suppressAutoStartOnPrepared = false
         try {
-            val player = MediaPlayer().apply {
-                setDataSource(requireContext(), item.uri)
-                // Every callback below takes the MediaPlayer instance it fired on (`mp`) and
-                // checks it's still the one this fragment considers active before doing anything
-                // else. release()'d players are documented to stop firing callbacks, but a
-                // callback already queued on the main looper's message queue at the moment
-                // release() runs can still be delivered afterward -- e.g. switching tracks calls
-                // releasePlayer() on the old player and immediately builds a new one, and a stale
-                // callback for the *old* instance landing after that reassignment must not act on
-                // the new one, or on a view that's since been destroyed (releasePlayer() also runs
-                // from onDestroyView(), nulling mediaPlayer, so the identity check alone covers
-                // that case too: no live mp can ever match a null field).
-                setOnCompletionListener { mp -> if (mp === mediaPlayer) releasePlayer() }
-                setOnPreparedListener { mp ->
-                    if (mp !== mediaPlayer) return@setOnPreparedListener
-                    isPreparingPlayback = false
-                    activeDurationMs = mp.duration
-                    if (suppressAutoStartOnPrepared) {
-                        // A permanent focus loss (or a still-unresolved transient one) arrived
-                        // while this was preparing -- leave it prepared but paused instead of
-                        // starting into a focus state that's already gone; see audioFocusListener.
-                        suppressAutoStartOnPrepared = false
-                    } else {
-                        mp.start()
-                        progressHandler.post(progressTick)
-                    }
-                    if (_binding != null) adapter.notifyDataSetChanged()
-                }
-                setOnErrorListener { mp, what, extra ->
-                    if (mp === mediaPlayer) {
+            // createConfigureOrRelease() releases the just-created player itself if configure
+            // throws -- previously, a failure in setDataSource()/prepareAsync() left the
+            // freshly-created MediaPlayer unreachable from any variable (the old `apply` block's
+            // result was never assigned to `mediaPlayer`), leaking the underlying native
+            // decoder/codec handle it holds rather than just JVM-collectible memory.
+            val player = createConfigureOrRelease(
+                create = mediaPlayerFactory,
+                configure = { p ->
+                    p.setDataSource(requireContext(), item.uri)
+                    // Every callback below takes the MediaPlayer instance it fired on (`mp`) and
+                    // checks it's still the one this fragment considers active before doing
+                    // anything else. release()'d players are documented to stop firing callbacks,
+                    // but a callback already queued on the main looper's message queue at the
+                    // moment release() runs can still be delivered afterward -- e.g. switching
+                    // tracks calls releasePlayer() on the old player and immediately builds a new
+                    // one, and a stale callback for the *old* instance landing after that
+                    // reassignment must not act on the new one, or on a view that's since been
+                    // destroyed (releasePlayer() also runs from onDestroyView(), nulling
+                    // mediaPlayer, so the identity check alone covers that case too: no live mp
+                    // can ever match a null field).
+                    p.setOnCompletionListener { mp -> if (mp === mediaPlayer) releasePlayer() }
+                    p.setOnPreparedListener { mp ->
+                        if (mp !== mediaPlayer) return@setOnPreparedListener
                         isPreparingPlayback = false
-                        if (_binding != null) {
-                            Toast.makeText(
-                                requireContext(),
-                                getString(R.string.playback_failed, "error $what/$extra"),
-                                Toast.LENGTH_SHORT
-                            ).show()
+                        activeDurationMs = mp.duration
+                        if (suppressAutoStartOnPrepared) {
+                            // A permanent focus loss (or a still-unresolved transient one)
+                            // arrived while this was preparing -- leave it prepared but paused
+                            // instead of starting into a focus state that's already gone; see
+                            // audioFocusListener.
+                            suppressAutoStartOnPrepared = false
+                        } else {
+                            mp.start()
+                            progressHandler.post(progressTick)
                         }
-                        releasePlayer()
+                        if (_binding != null) adapter.notifyDataSetChanged()
                     }
-                    true
-                }
-                // prepare() blocks the calling thread until the MediaExtractor/decoder is ready to
-                // go, which can take long enough on a slow SAF provider or large file to visibly
-                // stall the UI thread this is always called from. prepareAsync() hands the same
-                // work to MediaPlayer's own internal thread instead; setOnPreparedListener above
-                // is what actually starts playback once it's done.
-                prepareAsync()
-            }
+                    p.setOnErrorListener { mp, what, extra ->
+                        if (mp === mediaPlayer) {
+                            isPreparingPlayback = false
+                            if (_binding != null) {
+                                Toast.makeText(
+                                    requireContext(),
+                                    getString(R.string.playback_failed, "error $what/$extra"),
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                            releasePlayer()
+                        }
+                        true
+                    }
+                    // prepare() blocks the calling thread until the MediaExtractor/decoder is
+                    // ready to go, which can take long enough on a slow SAF provider or large
+                    // file to visibly stall the UI thread this is always called from.
+                    // prepareAsync() hands the same work to MediaPlayer's own internal thread
+                    // instead; setOnPreparedListener above is what actually starts playback once
+                    // it's done.
+                    p.prepareAsync()
+                },
+                release = { it.release() }
+            )
             mediaPlayer = player
         } catch (e: Exception) {
+            // The just-created player (if any) was already released by createConfigureOrRelease()
+            // itself above; releasePlayer() here only resets this fragment's own state (focus,
+            // activeUri, preparing flags) -- `mediaPlayer` was never actually assigned on this
+            // failure path, so it has nothing of its own left to release.
             isPreparingPlayback = false
             Toast.makeText(requireContext(), getString(R.string.playback_failed, e.message), Toast.LENGTH_SHORT).show()
             releasePlayer()
@@ -480,7 +587,39 @@ class LibraryFragment : Fragment() {
     override fun onDestroyView() {
         super.onDestroyView()
         releasePlayer()
+        // Explicit, rather than left to whatever the OS/window manager eventually does: a Dialog
+        // built from an Activity Context has its own independent lifecycle from this Fragment's
+        // view, so it would otherwise linger on screen (with a now-stale window reference) even
+        // though the coroutine backing it is about to be cancelled below regardless -- see
+        // activeStatsDialog's own doc. dismiss() itself triggers the dismiss listener, which
+        // cancels statsJob -- redundant with the lifecycleScope cancellation just after, but
+        // harmless (Job.cancel() is idempotent).
+        activeStatsDialog?.dismiss()
+        activeStatsDialog = null
+        // No explicit job cancellation needed here beyond the above: viewLifecycleOwner's own
+        // Lifecycle already moves to DESTROYED just after this returns, which is what actually
+        // cancels viewLifecycleOwner.lifecycleScope (and therefore refreshList()'s/showStats()'s
+        // in-flight coroutines) -- see refreshJob's doc.
         requireContext().unregisterReceiver(becomingNoisyReceiver)
         _binding = null
     }
+}
+
+/**
+ * Constructs an instance via [create], then runs [configure] against it -- if [configure] throws,
+ * the just-created instance is released via [release] before the exception propagates, so a
+ * caller's own failure handling never has to reach into a partially-configured instance it never
+ * got a chance to assign anywhere itself. Pulled out (rather than inlined in
+ * [LibraryFragment.playNew]) so this ordering guarantee is directly unit-testable without a real
+ * (`final`, so unsubclassable/unmockable here) [android.media.MediaPlayer].
+ */
+internal fun <T> createConfigureOrRelease(create: () -> T, configure: (T) -> Unit, release: (T) -> Unit): T {
+    val instance = create()
+    try {
+        configure(instance)
+    } catch (e: Exception) {
+        release(instance)
+        throw e
+    }
+    return instance
 }

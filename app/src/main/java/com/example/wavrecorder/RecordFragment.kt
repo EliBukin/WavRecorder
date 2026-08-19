@@ -127,6 +127,34 @@ class RecordFragment : Fragment() {
             if (_binding != null) handleError(e)
         }
 
+        override fun onStopping() {
+            // Immediate feedback the instant a stop is requested (from either this screen's own
+            // button or the notification, while visible) -- the actual outcome now arrives
+            // asynchronously, up to a couple of seconds later (see RecordingService's
+            // beginAsyncFinalize), so without this the status text would keep showing stale
+            // "Recording…" text for that whole window. The button is also disabled for the same
+            // window: RecordingService now structurally rejects a new start attempted while a
+            // previous session is still finalizing (see ServiceState), but a tappable button that
+            // still read "Stop Recording" during that gap would look actionable and, before this
+            // fix, silently mutate the still-finalizing session's own ownership -- disabling it
+            // here removes that confusing path entirely rather than only guarding against it
+            // server-side. Re-enabled by resetToIdle() once a terminal outcome actually arrives.
+            if (_binding != null) {
+                binding.statusText.text = getString(R.string.status_finalizing)
+                binding.recordButton.isEnabled = false
+            }
+        }
+
+        override fun onStartRejected() {
+            // Defense in depth: the record button is already disabled for this exact window (see
+            // onStopping() above), so this should be unreachable from a normal tap -- but a
+            // still-in-flight ACTION_START Intent (e.g. a notification tap racing this screen's own
+            // state) can reach RecordingService directly, bypassing this screen's button entirely.
+            if (_binding != null) {
+                Toast.makeText(requireContext(), R.string.recording_still_finalizing, Toast.LENGTH_SHORT).show()
+            }
+        }
+
         override fun onStopped(lastTarget: OutputTarget?) {
             if (_binding != null) handleSaved(lastTarget, recordingService?.lastSessionStartedAtMillis)
         }
@@ -210,6 +238,7 @@ class RecordFragment : Fragment() {
         when (outcome) {
             is RecordingOutcome.Saved -> handleSaved(outcome.target, outcome.startedAtMillis)
             is RecordingOutcome.FailedButSaved -> handleError(outcome.cause)
+            is RecordingOutcome.Failed -> handleError(outcome.cause)
             is RecordingOutcome.FinalizationFailed -> handleFinalizationFailed(outcome.target, outcome.cause)
             is RecordingOutcome.FinalizationUnknown -> handleFinalizationUnknown(outcome.target)
         }
@@ -358,10 +387,17 @@ class RecordFragment : Fragment() {
             currentTarget = service.lastTarget
             currentPartNumber = service.lastPartNumber
             binding.recordButton.text = getString(R.string.stop_recording)
+            binding.recordButton.isEnabled = true
             binding.audioLevelSection.visibility = View.VISIBLE
             binding.statusDetailText.visibility = View.GONE
             updateRecordingStatus()
             service.lastMicrophoneInfo?.let { updateMicDeviceLabel(it) }
+        } else if (service.isFinalizing) {
+            // Reconnecting (e.g. after rotation) while a previous session's background join is
+            // still in flight -- mirrors onStopping()'s live callback so this screen shows the
+            // same "Finalizing…"/disabled state it would have if it had never been torn down.
+            binding.statusText.text = getString(R.string.status_finalizing)
+            binding.recordButton.isEnabled = false
         } else {
             // Catches this screen up on whatever happened while it wasn't around to see it live
             // (or wasn't bound yet) -- see RecordingService.consumePendingOutcome.
@@ -573,6 +609,7 @@ class RecordFragment : Fragment() {
 
     private fun resetToIdle() {
         binding.recordButton.text = getString(R.string.start_recording)
+        binding.recordButton.isEnabled = true
         binding.statusText.text = getString(R.string.status_idle)
         binding.statusDetailText.visibility = View.GONE
         binding.audioLevelSection.visibility = View.GONE

@@ -73,6 +73,16 @@ class RecordFragmentStatusMessagesTest {
         }
     }
 
+    /** stopRecording() now finalizes asynchronously (see RecordingService.beginAsyncFinalize): the
+     * actual join happens on a real background thread, so this waits for it to actually finish
+     * before draining the main looper to deliver whatever it posted -- a single idle() right after
+     * stopRecording() isn't guaranteed to already find that result queued. */
+    private fun awaitFinalizationAndIdle(service: RecordingService, timeoutMs: Long = 3000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (service.isFinalizing && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        shadowOf(Looper.getMainLooper()).idle()
+    }
+
     private fun statusText(scenario: androidx.fragment.app.testing.FragmentScenario<RecordFragment>): String {
         var text: String? = null
         scenario.onFragment { fragment ->
@@ -126,7 +136,7 @@ class RecordFragmentStatusMessagesTest {
         while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
         Thread.sleep(20)
         service.stopRecording()
-        shadowOf(Looper.getMainLooper()).idle()
+        awaitFinalizationAndIdle(service)
 
         val text = statusText(scenario)
         val savedTitle = app().getString(R.string.status_saved_title)
@@ -170,7 +180,7 @@ class RecordFragmentStatusMessagesTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
         service.stopRecording()
-        shadowOf(Looper.getMainLooper()).idle()
+        awaitFinalizationAndIdle(service)
 
         val text = statusText(scenario)
         val savedTitle = app().getString(R.string.status_saved_title)
@@ -178,6 +188,70 @@ class RecordFragmentStatusMessagesTest {
             text.contains(savedTitle))
         assertFalse("the friendly saved date/duration detail must stay hidden when unconfirmed",
             detailVisible(scenario))
+    }
+
+    @Test
+    fun `the record button is disabled and shows Finalizing until a terminal outcome arrives, then re-enabled`() {
+        val service = bindRealService()
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val releaseSession = CountDownLatch(1)
+        var reads = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                releaseSession.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() {} // deliberately does not unblock -- the test controls the window explicitly
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        service.destinationManager = object : DestinationManager(app()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 5000,
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        awaitListenerAttached(scenario, service)
+
+        service.startRecording(1L)
+        val deadline = System.currentTimeMillis() + 2000
+        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+        service.stopRecording()
+        shadowOf(Looper.getMainLooper()).idle() // delivers onStopping()
+
+        assertEquals(app().getString(R.string.status_finalizing), statusText(scenario))
+        var buttonEnabled = true
+        scenario.onFragment { fragment ->
+            buttonEnabled = fragment.view!!.findViewById<View>(R.id.recordButton).isEnabled
+        }
+        assertFalse("the record button must be disabled for the whole finalizing window -- a " +
+            "tappable button that still read 'Stop Recording' here could start a second, " +
+            "competing session", buttonEnabled)
+
+        // A start attempt during this window (e.g. a racing notification tap) must still be
+        // rejected server-side even though the button itself is disabled -- defense in depth.
+        service.startRecording(2L)
+        assertFalse(service.isRecording)
+
+        releaseSession.countDown()
+        awaitFinalizationAndIdle(service)
+
+        scenario.onFragment { fragment ->
+            buttonEnabled = fragment.view!!.findViewById<View>(R.id.recordButton).isEnabled
+        }
+        assertTrue("the record button must be re-enabled once a terminal outcome actually arrives",
+            buttonEnabled)
+        assertFalse(statusText(scenario) == app().getString(R.string.status_finalizing))
     }
 
     @Test
@@ -225,7 +299,7 @@ class RecordFragmentStatusMessagesTest {
         while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
         Thread.sleep(20)
         service.stopRecording()
-        shadowOf(Looper.getMainLooper()).idle()
+        awaitFinalizationAndIdle(service)
 
         assertEquals(app().getString(R.string.status_saved_title), statusText(scenario))
         assertTrue("expected the friendly date/duration detail to be shown", detailVisible(scenario))

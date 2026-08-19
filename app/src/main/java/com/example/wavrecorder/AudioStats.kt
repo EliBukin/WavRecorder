@@ -91,6 +91,12 @@ object AudioStatsReader {
                     clippedSamples = scan?.clippedSamples ?: 0L
                 )
             }
+        } catch (e: InterruptedException) {
+            // Never swallowed as an ordinary read failure: a caller running this inside
+            // kotlinx.coroutines.runInterruptible relies on this propagating out so it can convert
+            // it into a genuine coroutine cancellation, rather than a stray null this class would
+            // otherwise report indistinguishably from "the file was actually unreadable".
+            throw e
         } catch (e: Exception) {
             null
         }
@@ -123,6 +129,12 @@ internal fun scanPcm16Samples(input: InputStream, dataSize: Long): Pcm16ScanResu
     var remaining = dataSize
     val buffer = ByteArray(8192)
     while (remaining > 0) {
+        // Checked once per chunk (not per sample): cooperative cancellation only needs to be
+        // noticed promptly, not instantly, and this is cheap enough to not matter either way. A
+        // cancelled coroutine's runInterruptible() wrapper (see LibraryFragment.showStats) marks
+        // this thread interrupted; without a check somewhere in this loop a large file would keep
+        // scanning to completion regardless of cancellation, exactly the gap this closes.
+        if (Thread.interrupted()) throw InterruptedException("Audio stats scan interrupted")
         val toRead = minOf(buffer.size.toLong(), remaining).toInt()
         val n = input.read(buffer, 0, toRead)
         if (n < 0) break

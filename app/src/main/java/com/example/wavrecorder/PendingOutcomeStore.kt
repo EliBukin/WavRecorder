@@ -3,6 +3,7 @@ package com.example.wavrecorder
 import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
+import android.util.Log
 import java.io.File
 
 /** Reconstructed from durable storage in place of the original cause -- see [PendingOutcomeStore].
@@ -38,12 +39,23 @@ class PersistedOutcomeException(message: String) : Exception(message)
  * `consumePendingOutcome()` calls) can't interleave a read with a concurrent clear/write and
  * either double-deliver the same outcome or observe a half-written record.
  */
-internal class PendingOutcomeStore(context: Context) {
+internal class PendingOutcomeStore(
+    context: Context,
+    // Seam over the final commit step -- defaults to the real, synchronous
+    // SharedPreferences.Editor.commit(). A test overrides this to force a "disk write failed"
+    // result while still calling the real editor.commit() first, so the in-memory
+    // SharedPreferences map is genuinely mutated exactly the way a real commit() failure would
+    // leave it (SharedPreferencesImpl applies an edit to memory before attempting the disk write,
+    // regardless of that write's outcome -- see ActiveSegmentJournal's class doc for the same
+    // note in more detail). Production code must never have a reason to override this.
+    private val commitEditor: (SharedPreferences.Editor) -> Boolean = { it.commit() }
+) {
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val lock = Any()
 
     companion object {
+        private const val TAG = "PendingOutcomeStore"
         private const val PREFS_NAME = "wav_recorder_pending_outcome"
         private const val KEY_SESSION_ID = "session_id"
         private const val KEY_CATEGORY = "category"
@@ -56,6 +68,7 @@ internal class PendingOutcomeStore(context: Context) {
 
         private const val CATEGORY_SAVED = "SAVED"
         private const val CATEGORY_FAILED_BUT_SAVED = "FAILED_BUT_SAVED"
+        private const val CATEGORY_FAILED = "FAILED"
         private const val CATEGORY_FINALIZATION_FAILED = "FINALIZATION_FAILED"
         private const val CATEGORY_FINALIZATION_UNKNOWN = "FINALIZATION_UNKNOWN"
 
@@ -79,22 +92,36 @@ internal class PendingOutcomeStore(context: Context) {
         if (safeMessage != null) editor.putString(KEY_MESSAGE, safeMessage) else editor.remove(KEY_MESSAGE)
         val startedAt = (outcome as? RecordingOutcome.Saved)?.startedAtMillis
         if (startedAt != null) editor.putLong(KEY_STARTED_AT, startedAt) else editor.remove(KEY_STARTED_AT)
-        editor.commit()
+        commitEditor(editor)
     }
 
-    /** Returns and clears the persisted record, if any -- consumed exactly once: a second call
-     * with nothing new persisted in between returns null. Atomic with respect to [persist]/[clear]
-     * (see class doc): a concurrent call can never observe this record half-cleared. */
+    /** Returns and clears the persisted record, if any. The returned outcome is always the real,
+     * correctly-decoded record -- a failure clearing it durably afterward doesn't change what's
+     * handed back, since the value being returned right now is genuinely correct regardless. What
+     * it *can't* promise is that this was the last time this exact record is ever returned: if the
+     * durable clear fails, the same bytes are still on disk, and a later process restart (a fresh
+     * [PendingOutcomeStore] reading the SharedPreferences file back from disk, not carrying over
+     * this process's in-memory state) would read and redeliver it again. That failure is never
+     * silent -- it's logged, including the originating session id, so it's traceable -- but this
+     * method cannot itself close the gap: retrying the clear here is the only real mitigation
+     * available, which is exactly what happens (see [clearLocked]). */
     fun consume(): RecordingOutcome? = synchronized(lock) {
         val category = prefs.getString(KEY_CATEGORY, null) ?: return@synchronized null
+        val sessionId = peekSessionId()
         val target = readTarget()
         val message = prefs.getString(KEY_MESSAGE, null)
         val startedAt = if (prefs.contains(KEY_STARTED_AT)) prefs.getLong(KEY_STARTED_AT, 0L) else null
-        clearLocked()
+        if (!clearLocked()) {
+            Log.w(TAG, "Failed to durably clear a consumed pending outcome (session id " +
+                "$sessionId, category $category); if this process dies before a later write " +
+                "clears it, the same outcome may be read and delivered again after a restart")
+        }
         when (category) {
             CATEGORY_SAVED -> RecordingOutcome.Saved(target, startedAt)
-            CATEGORY_FAILED_BUT_SAVED ->
-                RecordingOutcome.FailedButSaved(target, PersistedOutcomeException(message.orEmpty()))
+            CATEGORY_FAILED_BUT_SAVED -> target?.let {
+                RecordingOutcome.FailedButSaved(it, PersistedOutcomeException(message.orEmpty()))
+            } ?: RecordingOutcome.Failed(PersistedOutcomeException(message.orEmpty()))
+            CATEGORY_FAILED -> RecordingOutcome.Failed(PersistedOutcomeException(message.orEmpty()))
             CATEGORY_FINALIZATION_FAILED ->
                 RecordingOutcome.FinalizationFailed(target, PersistedOutcomeException(message.orEmpty()))
             CATEGORY_FINALIZATION_UNKNOWN -> RecordingOutcome.FinalizationUnknown(target)
@@ -108,11 +135,17 @@ internal class PendingOutcomeStore(context: Context) {
 
     fun clear(): Boolean = synchronized(lock) { clearLocked() }
 
-    private fun clearLocked(): Boolean = prefs.edit().clear().commit()
+    /** A single immediate retry on top of the plain [SharedPreferences.Editor.commit]: clearing is
+     * idempotent (retrying after a real success is a harmless no-op), and a synchronous commit()
+     * failure is most often a transient disk hiccup that's already resolved a moment later -- worth
+     * the small, bounded extra attempt given what's at stake (see [consume]'s doc). This does not
+     * make the clear durably guaranteed; a caller must still check the final result. */
+    private fun clearLocked(): Boolean = commitEditor(prefs.edit().clear()) || commitEditor(prefs.edit().clear())
 
     private fun categoryOf(outcome: RecordingOutcome): String = when (outcome) {
         is RecordingOutcome.Saved -> CATEGORY_SAVED
         is RecordingOutcome.FailedButSaved -> CATEGORY_FAILED_BUT_SAVED
+        is RecordingOutcome.Failed -> CATEGORY_FAILED
         is RecordingOutcome.FinalizationFailed -> CATEGORY_FINALIZATION_FAILED
         is RecordingOutcome.FinalizationUnknown -> CATEGORY_FINALIZATION_UNKNOWN
     }
@@ -120,6 +153,7 @@ internal class PendingOutcomeStore(context: Context) {
     private fun targetOf(outcome: RecordingOutcome): OutputTarget? = when (outcome) {
         is RecordingOutcome.Saved -> outcome.target
         is RecordingOutcome.FailedButSaved -> outcome.target
+        is RecordingOutcome.Failed -> null
         is RecordingOutcome.FinalizationFailed -> outcome.target
         is RecordingOutcome.FinalizationUnknown -> outcome.target
     }

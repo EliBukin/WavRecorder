@@ -5,6 +5,8 @@
     <string name="status_idle">Ready to record</string>
     <string name="status_recording">Recording…</string>
     <string name="status_preparing">Preparing to record…</string>
+    <string name="status_finalizing">Finalizing recording…</string>
+    <string name="recording_still_finalizing">Still finishing the previous recording — try again in a moment.</string>
     <string name="status_recording_part">Recording… (part %1$d)</string>
     <string name="status_saved_title">Recording saved</string>
     <string name="status_saved_detail">%1$s · %2$s</string>

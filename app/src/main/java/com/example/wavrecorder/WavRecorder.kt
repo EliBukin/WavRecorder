@@ -12,12 +12,14 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
@@ -185,9 +187,12 @@ private class SystemAudioSource(
         audioRecord.read(buffer, offset, length)
     override fun stop() = audioRecord.stop()
     override fun release() {
-        deviceCallback?.let { audioManager.unregisterAudioDeviceCallback(it) }
+        val callback = deviceCallback
         deviceCallback = null
-        audioRecord.release()
+        releaseAudioSourceSafely(
+            unregisterCallback = { callback?.let { audioManager.unregisterAudioDeviceCallback(it) } },
+            releaseSource = { audioRecord.release() }
+        )
     }
     override fun describeMicrophone(): MicrophoneInfo = micInfo
 
@@ -256,7 +261,7 @@ private class FileChannelSegmentWriter(private val channel: FileChannel) : Segme
  * [segmentMaxSeconds] (60 minutes of audio by default), the current file is finalized and
  * a new one is opened via [NextTarget] for the next segment, transparently to the caller.
  */
-class WavRecorder(
+internal class WavRecorder(
     private val segmentMaxSeconds: Long = SEGMENT_MAX_SECONDS,
     private val threadJoinTimeoutMs: Long = THREAD_JOIN_TIMEOUT_MS,
     // Configurable (like the two above) purely so tests can shrink the real-time cost of
@@ -264,10 +269,15 @@ class WavRecorder(
     // default every time.
     private val headerFlushIntervalMs: Long = HEADER_FLUSH_INTERVAL_MS,
     private val openAudioSource: (Context) -> RecorderConfig = ::openBestAudioRecord,
-    private val wrapChannel: (FileChannel) -> SegmentWriter = { FileChannelSegmentWriter(it) }
+    private val wrapChannel: (FileChannel) -> SegmentWriter = { FileChannelSegmentWriter(it) },
+    // Seam so tests can substitute a journal that fails on command, or inspect exactly what was
+    // persisted/cleared without a real Context-backed SharedPreferences file.
+    private val journalFor: (Context) -> ActiveSegmentJournal = { ActiveSegmentJournal(it) }
 ) {
 
     companion object {
+        private const val TAG = "WavRecorder"
+
         // Preferred sample rates in order, highest quality first. 48kHz is the native rate most
         // external USB/BT mics (including the Insta360 Mic Air) actually capture at, so recording
         // at 44.1kHz would force an extra resample step in the driver for no benefit; we fall back
@@ -434,7 +444,19 @@ class WavRecorder(
      * already known -- callers use this to decide whether it's safe to report a plain "saved" or
      * whether the file may need recovery, instead of always assuming success.
      */
-    fun stop(): FinalizeResult {
+    fun stop(): FinalizeResult = awaitFinalization(requestStop())
+
+    /**
+     * The fast, non-blocking prefix of [stop]: flips [isRecording] false, bumps [generation], and
+     * stops/releases the [AudioSource] -- but does not wait for the recording thread to actually
+     * finish. Split out from [stop] so a caller that must not block its own thread for up to
+     * [threadJoinTimeoutMs] (e.g. RecordingService, on the main thread) can call this seam
+     * synchronously -- which is what actually makes a subsequent [start] safe to begin
+     * immediately afterward, since [isRecording] is already false by the time this returns -- and
+     * do the *actual* blocking wait (see [awaitFinalization]) on a background thread instead.
+     * Returns the recording thread to later join, or null if none was running.
+     */
+    fun requestStop(): Thread? {
         isRecording.set(false)
         // Invalidate this session's generation too: a callback the recording thread already
         // posted to the main looper before observing isRecording=false (e.g. the amplitude
@@ -451,6 +473,17 @@ class WavRecorder(
 
         val thread = recordingThread
         recordingThread = null
+        return thread
+    }
+
+    /**
+     * The blocking remainder of [stop]: waits up to [threadJoinTimeoutMs] for [thread] (from
+     * [requestStop]) to finish, then returns the finalize result exactly like the old, single
+     * blocking [stop] call did. Safe to call from a background thread -- this is the part that
+     * can actually block -- once [requestStop] has already run synchronously on the caller's own
+     * thread.
+     */
+    fun awaitFinalization(thread: Thread?): FinalizeResult {
         if (thread != null) {
             thread.join(threadJoinTimeoutMs)
             if (thread.isAlive) {
@@ -467,6 +500,10 @@ class WavRecorder(
         return lastFinalizeResult
     }
 
+    // segmentFinalized's `true` assignment below is flagged as an unused value: the compiler's
+    // dataflow analysis doesn't model openSegment() throwing between it and the following `false`
+    // reset, but that exception path is exactly why the flag exists -- see its declaration.
+    @Suppress("UNUSED_VALUE")
     private fun recordLoop(
         myGeneration: Int,
         mySession: Int,
@@ -483,11 +520,21 @@ class WavRecorder(
         val handler = Handler(Looper.getMainLooper())
         val buffer = ByteArray(bufferSize)
         var segment = try {
-            openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted)
+            // previousToken = null: this is the very first segment of the session, so the journal
+            // must currently be empty -- see persistActive()'s expectedPreviousToken doc.
+            openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted, sampleRate, previousToken = null)
         } catch (e: Exception) {
             reportFatal(myGeneration, handler, onError, e)
             return
         }
+        // True exactly when `segment` has already been finalized (closeSegment succeeded or
+        // threw) and must not be finalized again. Rollover finalizes the current segment and then
+        // opens the next one as two separate steps; if opening the next one fails, `segment`
+        // still refers to the just-finalized (already closed) one -- without this flag, the
+        // outer `finally` below would call closeSegment on it a second time, patching a header
+        // onto an already-closed writer and misreporting a perfectly healthy, already-saved file
+        // as needing recovery.
+        var segmentFinalized = false
 
         try {
             while (isRecording.get() && generation.get() == myGeneration) {
@@ -565,8 +612,14 @@ class WavRecorder(
                         // propagate here means a rollover that fails to finalize is treated as
                         // fatal via the same catch below, instead of silently opening a new
                         // segment and continuing as if nothing happened.
+                        val justClosedToken = segment.token
                         closeSegment(context, segment, sampleRate)
-                        segment = openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted)
+                        segmentFinalized = true
+                        // previousToken = the just-closed segment's own token: whether or not its
+                        // clearActiveIfMatches() above actually succeeded, this new segment is the
+                        // only thing allowed to legitimately supersede it in the ACTIVE slot.
+                        segment = openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted, sampleRate, previousToken = justClosedToken)
+                        segmentFinalized = false
                     }
                 } catch (e: Exception) {
                     reportFatal(myGeneration, handler, onError, e)
@@ -581,7 +634,10 @@ class WavRecorder(
             // is instead handed to stop() (see lastFinalizeResult/FinalizeResult) so the caller
             // can tell a genuine save apart from a segment that needs recovery.
             try {
-                closeSegment(context, segment, sampleRate)
+                // See segmentFinalized's doc above: `segment` was already finalized by the
+                // rollover branch above and its destination's open failed, so it must not be
+                // finalized (and its journal record cleared) a second time here.
+                if (!segmentFinalized) closeSegment(context, segment, sampleRate)
                 if (sessionCounter.get() == mySession) lastFinalizeResult = FinalizeResult.Ok
             } catch (e: Exception) {
                 if (sessionCounter.get() == mySession) {
@@ -621,7 +677,16 @@ class WavRecorder(
         }
     }
 
-    private class Segment(val target: OutputTarget, val writer: SegmentWriter, val pfd: ParcelFileDescriptor?) {
+    private class Segment(
+        val target: OutputTarget,
+        val writer: SegmentWriter,
+        val pfd: ParcelFileDescriptor?,
+        /** Uniquely identifies this segment for [ActiveSegmentJournal.clearActiveIfMatches] -- a
+         * random UUID (not a resettable in-process counter), so it can never collide with a
+         * still-outstanding record from an *earlier* process -- see [ActiveSegmentJournal]'s own
+         * doc for why that matters. */
+        val token: String
+    ) {
         var audioLen = 0L
         var lastHeaderFlush = System.currentTimeMillis()
         var lastForce = System.currentTimeMillis()
@@ -664,7 +729,13 @@ class WavRecorder(
         context: Context,
         nextTarget: NextTarget,
         handler: Handler,
-        onSegmentStarted: (OutputTarget) -> Unit
+        onSegmentStarted: (OutputTarget) -> Unit,
+        sampleRate: Int,
+        // The token this segment's own journal write is allowed to legitimately supersede -- see
+        // ActiveSegmentJournal.persistActive()'s expectedPreviousToken doc. null for the very
+        // first segment of a session (expecting the ACTIVE slot to already be empty); the
+        // just-closed segment's own token for every rollover after.
+        previousToken: String?
     ): Segment {
         val target = nextTarget.create()
         // Declared outside the try so a failure partway through construction (a bad truncate, a
@@ -692,9 +763,30 @@ class WavRecorder(
                 }
             }
             val writer = wrapChannel(channel!!)
-            writeFully(writer, WavHeaderWriter.placeholder())
+            // A valid, zero-length header -- not the old 44-zero-byte placeholder -- so that a
+            // process death before this segment's very first periodic header flush (up to
+            // headerFlushIntervalMs away) still leaves a parseable, playable (silent) WAV file
+            // rather than an unreadable one. See WavRecoveryManager for the complementary
+            // durable-journal-driven recovery of everything captured *after* this point.
+            writeFully(writer, WavHeaderWriter.build(sampleRate, CHANNELS, BITS_PER_SAMPLE, 0L))
+            val token = UUID.randomUUID().toString()
+            // Fail-before-capture policy: if this app cannot durably establish the crash-recovery
+            // guarantee for this segment, it must not proceed to capture PCM believing that
+            // guarantee exists. A silently-ignored journal write here previously meant recording
+            // could carry on with zero crash protection and no indication to anyone. The catch
+            // block below (shared with every other openSegment() failure) cleans up and deletes
+            // this partially-opened segment exactly like any other open failure.
+            val persisted = journalFor(context).persistActive(token, previousToken, target, sampleRate, CHANNELS, BITS_PER_SAMPLE)
+            if (!persisted) {
+                throw IOException(
+                    "Could not durably record this segment for crash recovery; refusing to start " +
+                        "capturing audio without that guarantee -- either the durable write itself " +
+                        "failed, or an unrelated, still-unclaimed segment record already occupies " +
+                        "the active slot"
+                )
+            }
             postIfCurrent(myGeneration, handler) { onSegmentStarted(target) }
-            return Segment(target, writer, pfd)
+            return Segment(target, writer, pfd, token)
         } catch (e: Exception) {
             // Without this, any of the failures above would leak the FileChannel/RandomAccessFile
             // (or, for SAF, the ParcelFileDescriptor's underlying fd) and leave a partial/empty
@@ -751,6 +843,33 @@ class WavRecorder(
 
         if (segment.audioLen <= 0L) {
             deleteSegmentFile(context, segment.target)
+        }
+
+        if (failure == null) {
+            // Only clear the durable "this segment might need recovery" record once finalization
+            // is actually confirmed -- a failure below leaves it in place on purpose, so a later
+            // process-start recovery pass (see WavRecoveryManager) still finds it and can try to
+            // repair the file. clearActiveIfMatches (not a plain clear) guards against this call
+            // clobbering a *newer* segment's own still-active record -- e.g. a stale thread from
+            // an already-superseded session finally finishing its own finalization late.
+            //
+            // A false/failed clear here is deliberately *not* escalated to a finalization failure:
+            // the WAV file itself is already correct and fully closed at this point (failure ==
+            // null), so misreporting it as needing recovery would be worse than the actual, much
+            // smaller problem -- a stale journal entry that a later recovery pass will find,
+            // harmlessly re-verify against the (already correct) file, and clear on its own. Still
+            // surfaced (never silently dropped), per the honest-degraded-state policy documented
+            // on ActiveSegmentJournal.
+            val cleared = try {
+                journalFor(context).clearActiveIfMatches(segment.token)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to clear the active-segment journal record after a clean finalization", e)
+                false
+            }
+            if (!cleared) {
+                Log.w(TAG, "Active-segment journal record for ${segment.target.displayPath} was not " +
+                    "cleared after a clean finalization; a later recovery pass will re-verify it")
+            }
         }
 
         if (failure != null) {
@@ -813,6 +932,23 @@ private fun writeFully(writer: SegmentWriter, data: ByteBuffer) {
         if (written <= 0) {
             throw IOException("Segment write made no progress (returned $written)")
         }
+    }
+}
+
+/**
+ * Runs both cleanup steps of [SystemAudioSource.release] such that [releaseSource] (the actual
+ * AudioRecord release -- the one that must never be skipped, since it's what actually frees the
+ * underlying microphone hardware) still runs even if [unregisterCallback] throws.
+ * AudioManager.unregisterAudioDeviceCallback isn't documented as exception-free, and before this
+ * a failure there would skip audioRecord.release() entirely, leaking it. Pulled out as a small,
+ * Android-independent function (rather than inlined in [SystemAudioSource.release]) so this
+ * ordering guarantee is directly unit-testable without a real AudioRecord/AudioManager.
+ */
+internal fun releaseAudioSourceSafely(unregisterCallback: () -> Unit, releaseSource: () -> Unit) {
+    try {
+        unregisterCallback()
+    } finally {
+        releaseSource()
     }
 }
 

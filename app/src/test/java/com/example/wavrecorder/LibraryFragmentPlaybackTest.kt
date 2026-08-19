@@ -9,6 +9,7 @@ import androidx.fragment.app.testing.launchFragmentInContainer
 import androidx.lifecycle.Lifecycle
 import androidx.recyclerview.widget.RecyclerView
 import androidx.test.core.app.ApplicationProvider
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -194,6 +195,51 @@ class LibraryFragmentPlaybackTest {
                 "must never mark it (or anything else) as active",
             firstDescription != app().getString(R.string.pause_button_description)
         )
+    }
+
+    @Test
+    fun `createConfigureOrRelease releases the newly created instance when configure throws`() {
+        // Regression test for playNew()'s MediaPlayer leak: setDataSource()/prepareAsync() are
+        // both real methods on a `final` android.media.MediaPlayer, which can't be subclassed or
+        // faked directly in a JVM unit test -- so this exercises the exact ordering guarantee
+        // playNew() now relies on (see LibraryFragment.createConfigureOrRelease) with a plain
+        // fake instead, proving the just-created instance is always released before the failure
+        // propagates, regardless of which configure() step throws.
+        var released = false
+        var configureRan = false
+        var thrown: Exception? = null
+
+        try {
+            createConfigureOrRelease(
+                create = { "fake-player" },
+                configure = {
+                    configureRan = true
+                    throw IllegalStateException("simulated: setDataSource()/prepareAsync() failed")
+                },
+                release = { released = true }
+            )
+        } catch (e: Exception) {
+            thrown = e
+        }
+
+        assertTrue(configureRan)
+        assertTrue("the just-created instance must be released when configure() throws, not " +
+            "left unreachable and leaked", released)
+        assertTrue("the failure must still propagate to the caller after cleanup",
+            thrown is IllegalStateException)
+    }
+
+    @Test
+    fun `createConfigureOrRelease does not release the instance when configure succeeds`() {
+        var released = false
+        val result = createConfigureOrRelease(
+            create = { "fake-player" },
+            configure = { },
+            release = { released = true }
+        )
+        assertEquals("fake-player", result)
+        assertFalse("a successfully configured instance must not be released out from under the " +
+            "caller, who still needs to use it", released)
     }
 
     @Test

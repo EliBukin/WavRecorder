@@ -14,6 +14,7 @@ import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
+import org.robolectric.shadows.ShadowLog
 import java.io.File
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -494,6 +495,17 @@ class WavRecorderTest {
         recorder.stop()
         assertTrue("expected AudioSource#stop() to have been called", session1StopCalled.get())
         assertFalse(recorder.isActive)
+        // Session 1's own recording thread is still alive and blocked (that's this test's whole
+        // premise), so its ACTIVE journal record was never cleared -- persistActive()'s own
+        // foreign-record protection (see ActiveSegmentJournal) would otherwise correctly refuse to
+        // let session 2 open its first segment over it, which is a *different*, already-covered
+        // invariant (see ActiveSegmentJournalTest/WavRecorderTest's journal-specific tests). What
+        // this test is actually about is WavRecorder's own generation-counter defense once a new
+        // session *is* allowed to start -- production only reaches that state because
+        // RecordingService's own ServiceState gate (see RecordingServiceTest) already prevented a
+        // real overlapping start entirely, which this lower-level test bypasses on purpose. Reset
+        // here so the two concerns stay independently testable.
+        ActiveSegmentJournal(ApplicationProvider.getApplicationContext()).clearActiveForTest()
 
         // Start a brand new session while session 1's background thread is still alive, blocked
         // inside read().
@@ -524,6 +536,388 @@ class WavRecorderTest {
         while (recorder.isActive && System.currentTimeMillis() < session2Deadline) Thread.sleep(5)
         shadowOf(Looper.getMainLooper()).idle()
         assertNotNull("session 2's own failure should still be reported normally", session2ErrorReported)
+    }
+
+    @Test
+    fun `releaseAudioSourceSafely still releases the audio source even if unregistering the callback throws`() {
+        // Regression test for SystemAudioSource#release(): before this, a callback-unregister
+        // failure (AudioManager can throw here) skipped audioRecord.release() entirely, leaking
+        // the underlying microphone hardware handle. SystemAudioSource itself needs a real
+        // AudioRecord/AudioManager to construct, so this exercises the extracted ordering
+        // guarantee directly instead.
+        var callbackUnregisterAttempted = false
+        var sourceReleased = false
+        var thrown: Exception? = null
+
+        try {
+            releaseAudioSourceSafely(
+                unregisterCallback = {
+                    callbackUnregisterAttempted = true
+                    throw IllegalArgumentException("simulated: callback was never registered")
+                },
+                releaseSource = { sourceReleased = true }
+            )
+        } catch (e: Exception) {
+            thrown = e
+        }
+
+        assertTrue("expected the unregister step to have been attempted", callbackUnregisterAttempted)
+        assertTrue("the audio source must still be released even though unregistering the " +
+            "callback threw", sourceReleased)
+        assertTrue("the unregister failure should still propagate to the caller (WavRecorder's " +
+            "own release()/start() call sites already swallow it)", thrown is IllegalArgumentException)
+    }
+
+    @Test
+    fun `releaseAudioSourceSafely releases the source exactly once when unregistering succeeds`() {
+        var releaseCount = 0
+        releaseAudioSourceSafely(unregisterCallback = {}, releaseSource = { releaseCount++ })
+        assertEquals(1, releaseCount)
+    }
+
+    @Test
+    fun `a newly opened segment already contains a valid, immediately-parseable zero-data header`() {
+        // Regression test for openSegment(): before this, a new segment received
+        // WavHeaderWriter.placeholder() -- 44 zero bytes -- which isn't a valid RIFF/WAVE header
+        // at all, so a process death before the first periodic header flush (headerFlushIntervalMs
+        // away) left an unreadable file. Blocking the fake source right after the segment opens
+        // (before any audio is read) lets this inspect the file exactly at that vulnerable moment.
+        val blockForever = CountDownLatch(1)
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                blockForever.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockForever.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 44100, bufferSize = 4) }
+        )
+
+        var segmentStarted = false
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = { segmentStarted = true },
+            onAmplitude = {},
+            onError = {}
+        )
+        val deadline = System.currentTimeMillis() + 2000
+        while (!segmentStarted && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        assertTrue("sanity: expected the segment to have actually opened", segmentStarted)
+
+        val format = WavRiffParser.parse(segmentFile.inputStream())
+        assertNotNull("expected an immediately-valid WAV header, not the old zero-byte placeholder",
+            format)
+        assertEquals(44100, format?.sampleRate)
+        assertEquals(1, format?.channels)
+        assertEquals(16, format?.bitsPerSample)
+        assertEquals(0L, format?.dataSize)
+
+        recorder.stop()
+    }
+
+    @Test
+    fun `opening a segment persists a durable active-segment journal record, cleared once it finalizes successfully`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val journal = ActiveSegmentJournal(ApplicationProvider.getApplicationContext())
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+            journalFor = { journal }
+        )
+
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {}
+        )
+        val deadline = System.currentTimeMillis() + 2000
+        while (readCount < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20) // let the read's write actually land before inspecting the journal
+
+        val recordWhileOpen = journal.peekActive()
+        assertNotNull("expected a durable record identifying the just-opened segment", recordWhileOpen)
+        assertEquals(segmentFile.absolutePath,
+            (recordWhileOpen?.target as? OutputTarget.FileTarget)?.file?.absolutePath)
+        assertEquals(48000, recordWhileOpen?.sampleRate)
+        assertEquals(1, recordWhileOpen?.channels)
+        assertEquals(16, recordWhileOpen?.bitsPerSample)
+
+        val result = recorder.stop()
+
+        assertEquals(WavRecorder.FinalizeResult.Ok, result)
+        assertNull("a successfully finalized segment must have its journal record cleared",
+            journal.peekActive())
+    }
+
+    @Test
+    fun `a finalization failure leaves the active-segment journal record in place for later recovery`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount <= 2) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val journal = ActiveSegmentJournal(ApplicationProvider.getApplicationContext())
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+            wrapChannel = { channel -> FailingHeaderPatchWriter(channel) },
+            journalFor = { journal }
+        )
+
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {}
+        )
+        val deadline = System.currentTimeMillis() + 2000
+        while (readCount < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+
+        assertNotNull("sanity: expected a journal record while the segment is still open", journal.peekActive())
+        val result = recorder.stop()
+
+        assertTrue(result is WavRecorder.FinalizeResult.Failed)
+        assertNotNull(
+            "a segment that failed to finalize must keep its journal record so a later " +
+                "recovery pass can still find and repair it",
+            journal.peekActive()
+        )
+    }
+
+    @Test
+    fun `opening the next segment after a rollover overwrites the previous segment's now-cleared journal record`() {
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val blockUntilStopped = CountDownLatch(1)
+        var readCount = 0
+        // Delivers exactly one chunk (triggering exactly one rollover, since sampleRate=1 +
+        // segmentMaxSeconds=1 => segmentMaxBytes=2), then blocks -- so the second segment stays
+        // "current" indefinitely, giving a stable window to inspect the journal instead of racing
+        // a fully scripted-then-exhausted source through to natural completion.
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readCount++
+                if (readCount == 1) {
+                    System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                    return chunk.size
+                }
+                blockUntilStopped.await(5, TimeUnit.SECONDS)
+                return -1
+            }
+            override fun stop() { blockUntilStopped.countDown() }
+            override fun release() {}
+        }
+        val journal = ActiveSegmentJournal(ApplicationProvider.getApplicationContext())
+        val recorder = WavRecorder(
+            segmentMaxSeconds = 1,
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 1, bufferSize = chunk.size) },
+            journalFor = { journal }
+        )
+
+        val segmentFiles = mutableListOf<File>()
+        var segmentCreateCount = 0
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget {
+                segmentCreateCount++
+                val file = tempFolder.newFile("segment$segmentCreateCount.wav")
+                segmentFiles += file
+                OutputTarget.FileTarget(file)
+            },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {}
+        )
+
+        val deadline = System.currentTimeMillis() + 2000
+        while (segmentCreateCount < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        Thread.sleep(20)
+
+        // The first segment finalized cleanly during rollover, so its own record must already be
+        // gone -- and the second (now-current) segment's own record must be the one in its place,
+        // never left pointing at the already-finalized first file.
+        val recordDuringSecondSegment = journal.peekActive()
+        assertNotNull(recordDuringSecondSegment)
+        assertEquals(segmentFiles[1].absolutePath,
+            (recordDuringSecondSegment?.target as? OutputTarget.FileTarget)?.file?.absolutePath)
+
+        recorder.stop()
+        assertNull("the final segment finalized cleanly too, so nothing should remain", journal.peekActive())
+    }
+
+    @Test
+    fun `a failed durable journal write fails the segment open before any audio can be captured`() {
+        // Fail-before-capture policy: if this app cannot durably establish the crash-recovery
+        // guarantee for a segment, it must refuse to start capturing audio for it at all rather
+        // than silently proceeding with degraded (nonexistent) crash protection.
+        val failingJournal = object : ActiveSegmentJournal(ApplicationProvider.getApplicationContext()) {
+            override fun persistActive(
+                token: String, expectedPreviousToken: String?, target: OutputTarget,
+                sampleRate: Int, channels: Int, bitsPerSample: Int
+            ): Boolean = false
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val fake = FakeAudioSource() // never actually read from -- open must fail before any read
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) },
+            journalFor = { failingJournal }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = { throw AssertionError("must never report a segment as started when its durable journal write failed") },
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        awaitTerminatedAndDeliverCallbacks(recorder)
+
+        assertNotNull("expected the journal-write failure to be reported like any other openSegment failure",
+            reportedError)
+        assertFalse(recorder.isActive)
+        assertFalse("the partially-opened segment file must be cleaned up, not left behind with " +
+            "no crash-recovery guarantee behind it", segmentFile.exists())
+    }
+
+    @Test
+    fun `a failed journal clear after a clean finalization is logged honestly and does not corrupt the finalize result`() {
+        ShadowLog.stream = null
+        ShadowLog.clear()
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val doneLatch = CountDownLatch(1)
+        val fake = FakeAudioSource(scriptedReads = listOf(chunk), onExhausted = { doneLatch.countDown() })
+        val segmentFile = tempFolder.newFile("segment.wav")
+        val clearFailingJournal = object : ActiveSegmentJournal(ApplicationProvider.getApplicationContext()) {
+            override fun clearActiveIfMatches(token: String): Boolean = false
+        }
+        val recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) },
+            journalFor = { clearFailingJournal }
+        )
+
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = WavRecorder.NextTarget { OutputTarget.FileTarget(segmentFile) },
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = {}
+        )
+        assertTrue(doneLatch.await(2, TimeUnit.SECONDS))
+        val result = recorder.stop()
+
+        // The WAV file itself is genuinely fine -- a journal-clear failure alone must never be
+        // escalated into telling the user their good recording needs recovery.
+        assertEquals(WavRecorder.FinalizeResult.Ok, result)
+        val format = WavRiffParser.parse(segmentFile.inputStream())
+        assertEquals(chunk.size.toLong(), format?.dataSize)
+
+        // But the degraded state must not be silently dropped either -- it must be surfaced (here,
+        // via a clear, honest log line) rather than never mentioned anywhere.
+        val warnings = ShadowLog.getLogsForTag("WavRecorder").filter { it.type == android.util.Log.WARN }
+        assertTrue(
+            "expected a warning to be logged when the journal clear failed after a clean " +
+                "finalization, got: ${ShadowLog.getLogs().map { it.msg }}",
+            warnings.isNotEmpty()
+        )
+    }
+
+    @Test
+    fun `segment 1 is not double-finalized when opening segment 2 during rollover fails`() {
+        // Regression test for the rollover double-finalization bug: closeSegment(segment1)
+        // succeeds, but segment = openSegment(segment2) then fails -- `segment` still refers to
+        // the already-closed segment1 by the time the outer finally runs. Before the
+        // segmentFinalized guard, that finally block called closeSegment on segment1 a *second*
+        // time, patching a header onto its now-closed writer and reporting the perfectly healthy,
+        // already-saved file as FinalizeResult.Failed -- corruption that was never real.
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val goodFile = tempFolder.newFile("segment1.wav")
+        val undoableTarget = tempFolder.newFolder("not-a-file")
+        var createCount = 0
+        val nextTarget = WavRecorder.NextTarget {
+            createCount++
+            OutputTarget.FileTarget(if (createCount == 1) goodFile else undoableTarget)
+        }
+        // sampleRate=1 + segmentMaxSeconds=1 => segmentMaxBytes=2, so the first 4-byte chunk
+        // immediately triggers a rollover into the broken second target.
+        val fake = FakeAudioSource(scriptedReads = listOf(chunk, chunk))
+        val recorder = WavRecorder(
+            segmentMaxSeconds = 1,
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 1, bufferSize = chunk.size) }
+        )
+
+        var reportedError: Exception? = null
+        recorder.start(
+            context = ApplicationProvider.getApplicationContext(),
+            nextTarget = nextTarget,
+            onSegmentStarted = {},
+            onAmplitude = {},
+            onError = { e -> reportedError = e }
+        )
+
+        awaitTerminatedAndDeliverCallbacks(recorder)
+
+        assertNotNull("expected the broken second segment's open failure to be reported", reportedError)
+        assertFalse(recorder.isActive)
+
+        // The healthy first segment must still be intact and parseable...
+        val firstSegment = WavRiffParser.parse(goodFile.inputStream())
+        assertEquals(chunk.size.toLong(), firstSegment?.dataSize)
+        // ...and no partial second segment (undoableTarget was a directory, never a real file
+        // recording could have written to) should remain either.
+        assertFalse(undoableTarget.listFiles()?.isNotEmpty() ?: false)
+
+        // The key regression assertion: stop() must report the first segment as cleanly saved,
+        // never as a finalization failure -- the actual failure is "recording stopped due to a
+        // rollover error", which is already reported above via onError, not via a corrupted-file
+        // claim about the perfectly good first segment.
+        val result = recorder.stop()
+        assertEquals(
+            "the already-finalized, healthy first segment must not be reported as needing " +
+                "recovery just because the *next* segment's destination failed to open",
+            WavRecorder.FinalizeResult.Ok, result
+        )
     }
 
     @Test
@@ -629,6 +1023,11 @@ class WavRecorderTest {
         recorder.stop()
         assertTrue("expected AudioSource#stop() to have been called", session1StopCalled.get())
         assertFalse(recorder.isActive)
+        // See the identical note in the test above -- session 1's thread is still alive, so its
+        // ACTIVE journal record was never cleared; reset it so this test's actual focus (the
+        // generation-counter defense) stays independent of the journal's own, separately-tested
+        // foreign-record protection.
+        ActiveSegmentJournal(ApplicationProvider.getApplicationContext()).clearActiveForTest()
 
         var session2ErrorReported: Exception? = null
         var session2SegmentCreateCount = 0

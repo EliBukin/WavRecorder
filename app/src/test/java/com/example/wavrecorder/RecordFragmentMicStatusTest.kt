@@ -61,6 +61,16 @@ class RecordFragmentMicStatusTest {
         return service
     }
 
+    /** The mismatch-triggered stop's own background join runs on a real, uncontrolled-by-Robolectric
+     * thread; a retry/continue action must wait for it to genuinely reach a terminal state (not just
+     * for the fake source's read() to unblock) before RecordingService will accept a new session --
+     * see ServiceState's FINALIZING guard. Mirrors every other test file's identical helper. */
+    private fun awaitFinalizationAndIdle(service: RecordingService, timeoutMs: Long = 3000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (service.isFinalizing && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        shadowOf(Looper.getMainLooper()).idle()
+    }
+
     private fun usbDevice(): AudioDeviceInfo =
         AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_USB_DEVICE).build()
 
@@ -351,6 +361,9 @@ class RecordFragmentMicStatusTest {
         scenario.onFragment { fragment ->
             fragment.view!!.findViewById<View>(R.id.recordButton).performClick()
         }
+        // The mismatch-triggered stop must reach a genuine terminal state before RecordingService
+        // will accept the dialog's retry/continue action as a new session -- see ServiceState.
+        awaitFinalizationAndIdle(service)
 
         val dialog = ShadowDialog.getLatestDialog() as AlertDialog
         dialog.getButton(DialogInterface.BUTTON_POSITIVE).performClick()
@@ -379,11 +392,15 @@ class RecordFragmentMicStatusTest {
             fragment.view!!.findViewById<View>(R.id.recordButton).performClick()
         }
         latestBlockLatch[0]?.countDown()
+        // The mismatch-triggered stop must reach a genuine terminal state before RecordingService
+        // will accept the retry as a new session -- see ServiceState.
+        awaitFinalizationAndIdle(service)
 
         val firstDialog = ShadowDialog.getLatestDialog() as AlertDialog
         firstDialog.getButton(DialogInterface.BUTTON_NEGATIVE).performClick() // Retry
         shadowOf(Looper.getMainLooper()).idle() // a dialog button's click dispatches via the main looper
         latestBlockLatch[0]?.countDown()
+        awaitFinalizationAndIdle(service)
 
         assertFalse("recording must still not be active after a retry into the same mismatch",
             service.isRecording)

@@ -134,6 +134,11 @@ open class DestinationManager(private val context: Context) {
         }
 
         return nameToUri.map { (name, uri) ->
+            // Checked once per file (a per-file content-provider round trip is already the
+            // dominant cost here, so this is cheap relative to it): without this, a cancelled
+            // caller running this inside kotlinx.coroutines.runInterruptible would still scan
+            // every remaining file in a large folder to completion regardless of cancellation.
+            if (Thread.interrupted()) throw InterruptedException("Recording list scan interrupted")
             val info = WavFileInfo.read(context, uri)
             RecordingItem(
                 name = name,

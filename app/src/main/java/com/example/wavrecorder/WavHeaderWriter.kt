@@ -12,8 +12,6 @@ import java.nio.ByteOrder
 object WavHeaderWriter {
     const val HEADER_SIZE = 44
 
-    fun placeholder(): ByteBuffer = ByteBuffer.allocate(HEADER_SIZE)
-
     fun build(sampleRate: Int, channels: Int, bitsPerSample: Int, audioDataLen: Long): ByteBuffer {
         val byteRate = sampleRate * channels * bitsPerSample / 8
         val blockAlign = channels * bitsPerSample / 8

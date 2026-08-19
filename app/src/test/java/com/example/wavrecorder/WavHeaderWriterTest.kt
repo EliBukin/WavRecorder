@@ -8,12 +8,20 @@ import java.nio.ByteOrder
 class WavHeaderWriterTest {
 
     @Test
-    fun `placeholder is 44 zero bytes`() {
-        val placeholder = WavHeaderWriter.placeholder()
-        assertEquals(44, placeholder.remaining())
-        val bytes = ByteArray(44)
-        placeholder.duplicate().get(bytes)
-        assertEquals(0, bytes.sum())
+    fun `build with a zero audioDataLen writes a valid, immediately-parseable empty-data header`() {
+        // WavRecorder.openSegment() writes exactly this (sampleRate, mono, 16-bit, 0 audio bytes)
+        // the instant a segment is created, instead of the old 44-zero-byte placeholder -- so a
+        // process death before this segment's first periodic header flush still leaves a
+        // parseable (silent) WAV rather than an unreadable one.
+        val header = WavHeaderWriter.build(sampleRate = 48000, channels = 1, bitsPerSample = 16, audioDataLen = 0L)
+        val bytes = ByteArray(header.remaining())
+        header.duplicate().get(bytes)
+
+        val format = WavRiffParser.parse(bytes.inputStream())
+        assertEquals(48000, format?.sampleRate)
+        assertEquals(1, format?.channels)
+        assertEquals(16, format?.bitsPerSample)
+        assertEquals(0L, format?.dataSize)
     }
 
     @Test
