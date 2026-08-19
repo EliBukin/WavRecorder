@@ -6,6 +6,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.PopupMenu
 import android.widget.SeekBar
+import androidx.core.view.ViewCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.example.wavrecorder.databinding.ItemRecordingBinding
 import java.util.Locale
@@ -21,7 +22,14 @@ class RecordingsAdapter(
     private val isPreparing: (Uri) -> Boolean,
     private val playbackPositionMs: (Uri) -> Int,
     private val playbackDurationMs: (Uri) -> Int,
-    private val playbackSpeedLabel: (Uri) -> String
+    private val playbackSpeedLabel: (Uri) -> String,
+    // Bulk-selection: a tap or long-press anywhere on the row is routed through these rather than
+    // the individual play/overflow buttons whenever selection mode is active -- see
+    // LibraryFragment.enterSelectionMode/toggleSelection.
+    private val isSelectionModeActive: () -> Boolean = { false },
+    private val isSelected: (Uri) -> Boolean = { false },
+    private val onToggleSelect: (RecordingItem) -> Unit = {},
+    private val onLongPress: (RecordingItem) -> Unit = {}
 ) : RecyclerView.Adapter<RecordingsAdapter.ViewHolder>() {
 
     private var items: List<RecordingItem> = emptyList()
@@ -53,7 +61,10 @@ class RecordingsAdapter(
     override fun getItemCount(): Int = items.size
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int, payloads: MutableList<Any>) {
-        if (payloads.contains(PROGRESS_PAYLOAD)) {
+        // A ticking progress payload must never partially rebind a row that's currently showing
+        // the selection UI instead of the normal playback one -- fall through to the full rebind
+        // (below, which itself short-circuits into the selection branch) rather than corrupting it.
+        if (payloads.contains(PROGRESS_PAYLOAD) && !isSelectionModeActive()) {
             bindProgress(holder, items[position])
         } else {
             onBindViewHolder(holder, position)
@@ -63,8 +74,56 @@ class RecordingsAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val item = items[position]
         holder.binding.fileName.text = RecordingNameFormatter.friendlyTitle(item.name)
+
+        val selectionMode = isSelectionModeActive()
+        val selected = selectionMode && isSelected(item.uri)
+        holder.binding.root.isActivated = selected
+        holder.binding.root.setOnClickListener { if (isSelectionModeActive()) onToggleSelect(item) }
+        holder.binding.root.setOnLongClickListener { onLongPress(item); true }
+        holder.binding.selectionCheckbox.visibility = if (selectionMode) View.VISIBLE else View.GONE
+        holder.binding.selectionCheckbox.isChecked = selected
+        // isActivated above only drives the visual (background) selected state -- TalkBack doesn't
+        // announce it. A localized state description does, layered on top of (not replacing) the
+        // row's default "speak children" announcement, so the filename (from the fileName TextView
+        // below) stays audible alongside it. Explicitly cleared outside selection mode so a
+        // recycled row never keeps announcing a stale selected/not-selected state from whatever it
+        // last showed.
+        ViewCompat.setStateDescription(
+            holder.binding.root,
+            if (selectionMode) {
+                holder.binding.root.context.getString(
+                    if (selected) R.string.selection_row_selected_description
+                    else R.string.selection_row_not_selected_description
+                )
+            } else {
+                null
+            }
+        )
+
+        if (selectionMode) {
+            // Suppresses every normal per-row control while selecting -- the whole row is the tap
+            // target instead (wired above), and showing playback controls or an active-row accent
+            // for a row currently mid-selection would be confusing (and, for the overflow menu's
+            // own delete action, redundant with the bulk one).
+            holder.binding.activeAccent.visibility = View.INVISIBLE
+            holder.binding.preparingIndicator.visibility = View.GONE
+            holder.binding.playButton.visibility = View.INVISIBLE
+            holder.binding.playButton.setOnClickListener(null)
+            holder.binding.overflowButton.visibility = View.INVISIBLE
+            holder.binding.overflowButton.setOnClickListener(null)
+            holder.binding.fileMeta.visibility = View.VISIBLE
+            holder.binding.seekRow.visibility = View.GONE
+            holder.binding.seekBar.setOnSeekBarChangeListener(null)
+            holder.binding.fileMeta.text = String.format(
+                Locale.US, "%.1fs • %s", item.durationSeconds, formatSize(item.sizeBytes)
+            )
+            return
+        }
+
         val active = isActive(item.uri)
         holder.binding.activeAccent.visibility = if (active) View.VISIBLE else View.INVISIBLE
+        holder.binding.playButton.visibility = View.VISIBLE
+        holder.binding.overflowButton.visibility = View.VISIBLE
         bindPlaybackButton(holder, item)
         holder.binding.playButton.setOnClickListener { onPlayPause(item) }
         holder.binding.speedButton.setOnClickListener { onSpeedToggle(item) }

@@ -104,7 +104,7 @@ open class DestinationManager(private val context: Context) {
         else "${fileName}_$attempt"
     }
 
-    fun deleteRecording(uri: Uri): Boolean {
+    open fun deleteRecording(uri: Uri): Boolean {
         return try {
             if (uri.scheme == "file") {
                 val path = uri.path ?: return false

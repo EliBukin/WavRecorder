@@ -18,6 +18,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -47,7 +48,10 @@ class LibraryFragment : Fragment() {
 
     /** The currently loaded MediaPlayer, if any. It stays alive across pause/resume. */
     private var mediaPlayer: MediaPlayer? = null
-    private var activeUri: Uri? = null
+    // internal (not private) so a test can assert genuine active playback was actually established
+    // (and later released) around a bulk delete, rather than only exercising performBulkDelete()'s
+    // release call against an always-null activeUri -- see LibraryFragmentBulkDeleteTest.
+    internal var activeUri: Uri? = null
     private var activeDurationMs = 0
     private var currentSpeed = 1.0f
     // True from the moment prepareAsync() is called until onPrepared/onError fires. MediaPlayer
@@ -76,6 +80,29 @@ class LibraryFragment : Fragment() {
     // Fragment's view is destroyed -- see onDestroyView() -- so queued/running work is genuinely
     // cancelled there too, not merely left to finish and have its result discarded.
     private var refreshJob: Job? = null
+
+    // ---- Bulk selection/deletion ----
+    internal var selectionMode = false
+    internal val selectedUris = mutableSetOf<Uri>()
+    // Guards against a second bulk-delete starting while one is already running -- deletion
+    // always runs to completion on its own Thread regardless of the fragment's view lifecycle
+    // (see performBulkDelete()'s doc, mirroring deleteRecording()'s existing rationale), so
+    // without this a rapid double-tap on the delete action could kick off two independent delete
+    // passes racing over the same files.
+    internal var bulkDeleteInProgress = false
+    // Bumped every time a new bulk-delete actually starts; the completing background Thread
+    // checks this (alongside the existing _binding != null guard) before touching any UI, so a
+    // job that somehow outlives a newer one (or the view) can never apply a stale result -- same
+    // defensive pattern as refreshList()'s own refreshRequestId.
+    private val bulkDeleteGeneration = AtomicInteger(0)
+    private var selectionBackCallback: OnBackPressedCallback? = null
+    // The currently-showing bulk-delete confirmation dialog, if any -- tracked (mirroring
+    // activeStatsDialog's identical rationale) so a second rapid tap on the delete action can't
+    // open a duplicate confirmation while one is already up. Cleared via the dialog's own
+    // setOnDismissListener regardless of how it closes (positive, negative, back, tap-outside),
+    // and explicitly dismissed in onDestroyView() -- a Dialog built from an Activity Context isn't
+    // torn down just because this Fragment's view is.
+    private var activeBulkDeleteDialog: androidx.appcompat.app.AlertDialog? = null
 
     private val progressHandler = Handler(Looper.getMainLooper())
     private val progressTick = object : Runnable {
@@ -172,10 +199,24 @@ class LibraryFragment : Fragment() {
             isPreparing = { uri -> uri == activeUri && isPreparingPlayback },
             playbackPositionMs = { uri -> if (uri == activeUri) (mediaPlayer?.currentPosition ?: 0) else 0 },
             playbackDurationMs = { uri -> if (uri == activeUri) activeDurationMs else 0 },
-            playbackSpeedLabel = { uri -> if (uri == activeUri) formatSpeed(currentSpeed) else formatSpeed(1.0f) }
+            playbackSpeedLabel = { uri -> if (uri == activeUri) formatSpeed(currentSpeed) else formatSpeed(1.0f) },
+            isSelectionModeActive = { selectionMode },
+            isSelected = { uri -> selectedUris.contains(uri) },
+            onToggleSelect = { item -> toggleSelection(item) },
+            onLongPress = { item -> if (!selectionMode) enterSelectionMode(item) else toggleSelection(item) }
         )
         binding.recordingsList.layoutManager = LinearLayoutManager(requireContext())
         binding.recordingsList.adapter = adapter
+
+        binding.selectionCancelButton.setOnClickListener { exitSelectionMode() }
+        binding.selectionDeleteButton.setOnClickListener { confirmBulkDelete() }
+
+        // Back/cancel exits selection mode without deleting anything, rather than navigating away
+        // from this screen -- enabled only while actually selecting (see updateSelectionToolbar()).
+        selectionBackCallback = object : OnBackPressedCallback(false) {
+            override fun handleOnBackPressed() = exitSelectionMode()
+        }
+        requireActivity().onBackPressedDispatcher.addCallback(viewLifecycleOwner, selectionBackCallback!!)
     }
 
     private fun formatSpeed(speed: Float): String {
@@ -390,6 +431,116 @@ class LibraryFragment : Fragment() {
         }, "DeleteRecordingThread").start()
     }
 
+    internal fun enterSelectionMode(firstSelected: RecordingItem) {
+        selectionMode = true
+        selectedUris.clear()
+        selectedUris.add(firstSelected.uri)
+        updateSelectionToolbar()
+        adapter.notifyDataSetChanged()
+    }
+
+    internal fun exitSelectionMode() {
+        selectionMode = false
+        selectedUris.clear()
+        updateSelectionToolbar()
+        if (_binding != null) adapter.notifyDataSetChanged()
+    }
+
+    internal fun toggleSelection(item: RecordingItem) {
+        if (!selectedUris.remove(item.uri)) selectedUris.add(item.uri)
+        if (selectedUris.isEmpty()) {
+            exitSelectionMode()
+            return
+        }
+        updateSelectionToolbar()
+        adapter.notifyDataSetChanged()
+    }
+
+    private fun updateSelectionToolbar() {
+        selectionBackCallback?.isEnabled = selectionMode
+        if (_binding == null) return
+        binding.selectionToolbar.visibility = if (selectionMode) View.VISIBLE else View.GONE
+        if (selectionMode) {
+            binding.selectionCountText.text =
+                resources.getQuantityString(R.plurals.selection_count, selectedUris.size, selectedUris.size)
+        }
+        // Never disabled while merely a delete is pending confirmation -- only once the delete
+        // itself has actually started, so the user can still cancel the whole selection right up
+        // until they confirm; see confirmBulkDelete()/performBulkDelete().
+        binding.selectionDeleteButton.isEnabled = !bulkDeleteInProgress
+        binding.selectionCancelButton.isEnabled = !bulkDeleteInProgress
+    }
+
+    internal fun confirmBulkDelete() {
+        // Ignores a second rapid tap on the delete action outright: either a deletion is already
+        // running, or a confirmation dialog for the first tap is already showing -- opening a
+        // second one would let the user confirm both and start two overlapping delete passes over
+        // the same files. See performBulkDelete()'s own defensive guard for the second, independent
+        // layer of protection against that.
+        if (bulkDeleteInProgress || activeBulkDeleteDialog != null || selectedUris.isEmpty()) return
+        val count = selectedUris.size
+        val targets = selectedUris.toSet()
+        val dialog = MaterialAlertDialogBuilder(requireContext())
+            .setTitle(resources.getQuantityString(R.plurals.bulk_delete_confirm_title, count, count))
+            .setMessage(R.string.bulk_delete_confirm_message)
+            .setNegativeButton(R.string.delete_confirm_cancel, null)
+            .setPositiveButton(R.string.delete_confirm_positive) { _, _ -> performBulkDelete(targets) }
+            .setOnDismissListener { activeBulkDeleteDialog = null }
+            .show()
+        activeBulkDeleteDialog = dialog
+    }
+
+    /** Deletes every recording named in [targets], off the main thread, via the same
+     * [DestinationManager.deleteRecording] every single-item delete already goes through --
+     * reused, not duplicated. Deliberately a raw [Thread] (not `viewLifecycleOwner.lifecycleScope`)
+     * for the identical reason [deleteRecording] already is: the user just confirmed a destructive,
+     * one-shot action, and it must actually finish even if this screen is destroyed a moment later,
+     * which a lifecycle-scoped coroutine would instead cancel outright. Honest about partial
+     * failure: never reports total success unless every target actually succeeded, and never
+     * removes a failed target from the list -- the closing [refreshList] call re-derives the
+     * displayed list from what's actually still on disk/in the SAF folder, so a failed delete's
+     * target simply reappears (still there, still selectable for a retry) while succeeded ones
+     * genuinely vanish, with no separate bookkeeping needed to track which is which. */
+    internal fun performBulkDelete(targets: Set<Uri>) {
+        // Defensive guard independent of confirmBulkDelete()'s own dialog-dedup: this is what
+        // actually protects any caller of this internal entry point (a test, or a future one)
+        // against starting a second overlapping deletion pass while one is already running, not
+        // just the specific two-dialogs race the UI-level guard above closes.
+        if (bulkDeleteInProgress) return
+        bulkDeleteInProgress = true
+        updateSelectionToolbar()
+        // A selected recording that's currently playing must be stopped/released before its file
+        // is deleted out from under the still-open MediaPlayer.
+        if (activeUri != null && targets.contains(activeUri)) releasePlayer()
+
+        val manager = destinationManager
+        val appContext = requireContext().applicationContext
+        val myGeneration = bulkDeleteGeneration.incrementAndGet()
+        Thread({
+            var succeeded = 0
+            var failed = 0
+            for (uri in targets) {
+                if (manager.deleteRecording(uri)) succeeded++ else failed++
+            }
+            Handler(Looper.getMainLooper()).post {
+                if (myGeneration != bulkDeleteGeneration.get()) return@post
+                bulkDeleteInProgress = false
+                // Safe even if the view has since been destroyed -- it resets this fragment
+                // instance's own selection state unconditionally and only touches the view
+                // internally when one still exists (see exitSelectionMode()/updateSelectionToolbar()).
+                exitSelectionMode()
+                if (_binding == null) return@post
+                refreshList()
+                val message = if (failed == 0) {
+                    resources.getQuantityString(R.plurals.bulk_delete_success, succeeded, succeeded)
+                } else {
+                    getString(R.string.bulk_delete_partial, succeeded, failed)
+                }
+                Toast.makeText(appContext, message, Toast.LENGTH_LONG).show()
+            }
+        }, "BulkDeleteThread").start()
+    }
+
     private fun togglePlayPause(item: RecordingItem) {
         when {
             activeUri != item.uri -> playNew(item)
@@ -596,6 +747,12 @@ class LibraryFragment : Fragment() {
         // harmless (Job.cancel() is idempotent).
         activeStatsDialog?.dismiss()
         activeStatsDialog = null
+        // Same rationale as activeStatsDialog just above: dismissing here only ever discards an
+        // unconfirmed confirmation prompt -- a deletion the user already confirmed is already
+        // running on its own independent Thread (see performBulkDelete()'s own doc) and is
+        // completely unaffected by this.
+        activeBulkDeleteDialog?.dismiss()
+        activeBulkDeleteDialog = null
         // No explicit job cancellation needed here beyond the above: viewLifecycleOwner's own
         // Lifecycle already moves to DESTROYED just after this returns, which is what actually
         // cancels viewLifecycleOwner.lifecycleScope (and therefore refreshList()'s/showStats()'s

@@ -110,6 +110,22 @@
 
             </LinearLayout>
 
+            <!-- Live microphone test: verifies the selected input is receiving sound without
+                 saving anything — shares the Audio level section below with real recording's
+                 own amplitude display, since the two are mutually exclusive (see RecordFragment). -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/testMicButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:minHeight="48dp"
+                android:text="@string/test_microphone"
+                app:icon="@drawable/ic_mic"
+                app:iconGravity="textStart"
+                app:iconPadding="8dp"
+                app:cornerRadius="16dp" />
+
             <!-- Audio level: hidden entirely while idle, since a flat idle waveform carries no
                  information and would just be empty space (see RecordFragment). -->
             <LinearLayout

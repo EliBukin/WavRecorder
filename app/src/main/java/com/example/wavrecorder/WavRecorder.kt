@@ -888,34 +888,41 @@ internal class WavRecorder(
         }
     }
 
-    private fun peakAmplitude(buffer: ByteArray, length: Int): Float {
-        var max = 0
-        var i = 0
-        while (i + 1 < length) {
-            val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)).toShort()
-            val magnitude = abs(sample.toInt())
-            if (magnitude > max) max = magnitude
-            i += 2
-        }
-        if (max <= 0) return 0f
-
-        // A straight linear peak ratio barely moves for normal speech, since speech rarely gets
-        // anywhere near full scale (and using AudioSource.UNPROCESSED for recording quality means
-        // there's no automatic gain control quietly boosting it either). Ears - and eyes watching
-        // a level meter - perceive loudness on a log scale, so map dBFS onto a fixed floor..0dB
-        // range instead, the way a real VU/peak meter does. -45dBFS is a normal quiet-room noise
-        // floor; anything at or above 0dBFS (full scale) reads as maxed out.
-        val linear = max / 32767f
-        val dbfs = 20f * log10(linear)
-        val floorDb = -45f
-        return ((dbfs - floorDb) / -floorDb).coerceIn(0f, 1f)
-    }
-
     private fun patchWavHeader(writer: SegmentWriter, totalAudioLen: Long, sampleRate: Int) {
         val header = WavHeaderWriter.build(sampleRate, CHANNELS, BITS_PER_SAMPLE, totalAudioLen)
         writer.position(0)
         writeFully(writer, header)
     }
+}
+
+/**
+ * Converts a raw 16-bit PCM buffer into a normalized 0f..1f level, on a perceptual (log/dBFS)
+ * scale rather than a straight linear peak ratio -- see the inline note below. Top-level (not a
+ * private method on [WavRecorder]) so [MicTestSession] can reuse the exact same level computation
+ * the real recording path's [WaveformView] display already relies on, instead of a second,
+ * independently-maintained implementation that could quietly drift from it.
+ */
+internal fun peakAmplitude(buffer: ByteArray, length: Int): Float {
+    var max = 0
+    var i = 0
+    while (i + 1 < length) {
+        val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)).toShort()
+        val magnitude = abs(sample.toInt())
+        if (magnitude > max) max = magnitude
+        i += 2
+    }
+    if (max <= 0) return 0f
+
+    // A straight linear peak ratio barely moves for normal speech, since speech rarely gets
+    // anywhere near full scale (and using AudioSource.UNPROCESSED for recording quality means
+    // there's no automatic gain control quietly boosting it either). Ears - and eyes watching
+    // a level meter - perceive loudness on a log scale, so map dBFS onto a fixed floor..0dB
+    // range instead, the way a real VU/peak meter does. -45dBFS is a normal quiet-room noise
+    // floor; anything at or above 0dBFS (full scale) reads as maxed out.
+    val linear = max / 32767f
+    val dbfs = 20f * log10(linear)
+    val floorDb = -45f
+    return ((dbfs - floorDb) / -floorDb).coerceIn(0f, 1f)
 }
 
 /**
@@ -967,9 +974,15 @@ internal fun releaseAudioSourceSafely(unregisterCallback: () -> Unit, releaseSou
  * back to the built-in mic if the preferred device becomes unusable between selection and start
  * -- so [SystemAudioSource] verifies the *actual* routed device once recording begins rather than
  * trusting this preference; see [SystemAudioSource.startRecording].
+ *
+ * internal (not private): this is the one source of truth for picking and opening an input device
+ * -- [MicTestSession] reuses it as-is (via the same seam-default pattern [WavRecorder] itself
+ * uses) so live microphone testing shares real discovery/source-selection/sample-rate-negotiation/
+ * routing-verification logic rather than a second, independently-maintained implementation that
+ * could quietly drift from it.
  */
 @SuppressLint("MissingPermission")
-private fun openBestAudioRecord(context: Context): WavRecorder.RecorderConfig {
+internal fun openBestAudioRecord(context: Context): WavRecorder.RecorderConfig {
     val channelConfig = WavRecorder.CHANNEL_CONFIG
     val audioFormat = WavRecorder.AUDIO_FORMAT
     // A required system service; only nullable in the framework's generic getSystemService(Class)
