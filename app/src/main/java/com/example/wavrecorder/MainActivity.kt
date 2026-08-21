@@ -13,6 +13,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Runs on every normal app launch, independent of RecordingService/recording state -- see
+        // LegacyNotificationCleanup's own doc for why this is the right place for it.
+        LegacyNotificationCleanup.run(applicationContext)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
