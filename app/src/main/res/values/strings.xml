@@ -3,6 +3,7 @@
     <string name="start_recording">Start Recording</string>
     <string name="stop_recording">Stop Recording</string>
     <string name="status_idle">Ready to record</string>
+    <string name="status_reconnecting">Reconnecting…</string>
     <string name="status_recording">Recording…</string>
     <string name="status_preparing">Preparing to record…</string>
     <string name="status_finalizing">Finalizing recording…</string>
@@ -66,16 +67,6 @@
     <string name="recording_needs_verification_unknown_location">Recording stopped, but saving could not be confirmed. Please check the destination folder before relying on it.</string>
     <string name="library_load_failed">Couldn\'t load recordings: %1$s</string>
 
-    <!-- Terminal-outcome notification, shown instead of the ongoing-recording notification when a
-         session ends with no screen attached to display the result live. -->
-    <string name="notification_result_channel_name">Recording results</string>
-    <string name="notification_result_saved_title">Recording saved</string>
-    <string name="notification_result_saved_text">Saved to %1$s</string>
-    <string name="notification_result_saved_text_unknown_location">Recording stopped before any audio was captured.</string>
-    <string name="notification_result_error_title">Recording stopped</string>
-    <string name="notification_result_needs_recovery_title">Recording may need recovery</string>
-    <string name="notification_result_needs_verification_title">Recording needs verification</string>
-
     <!-- Post-start expected-external-mic mismatch: an external mic was detected/preferred before
          Record was pressed, but the verified route came back built-in or couldn't be verified. -->
     <string name="mic_mismatch_title">External microphone not in use</string>
@@ -110,4 +101,38 @@
     <string name="pause_button_description">Pause</string>
     <string name="preparing_button_description">Preparing playback</string>
     <string name="playback_speed_description">Playback speed %1$s</string>
+
+    <!-- Live microphone test: lets the user visually confirm the selected mic is receiving sound
+         without saving anything; never worded as "recording" since nothing is captured. -->
+    <string name="test_microphone">Test microphone</string>
+    <string name="stop_test">Stop test</string>
+    <string name="mic_test_permission_denied">Microphone permission is required to test the microphone.</string>
+    <string name="mic_test_disconnected_error">Microphone disconnected. Test stopped.</string>
+    <string name="mic_test_route_changed_error">Microphone input changed unexpectedly. Test stopped.</string>
+    <string name="mic_test_route_mismatch_error">An external microphone was expected, but the test could not confirm it\'s the one being used. Test stopped.</string>
+    <string name="mic_test_error">Microphone test error: %1$s</string>
+    <string name="mic_test_status_active">Testing microphone — speak or make a sound and watch the meter</string>
+    <string name="mic_test_status_waiting">Waiting for signal…</string>
+    <string name="mic_test_status_signal_detected">Signal detected</string>
+
+    <!-- Bulk selection/deletion in the Library -->
+    <string name="selection_mode_cancel">Cancel selection</string>
+    <string name="bulk_delete_action">Delete selected</string>
+    <string name="selection_checkbox_description">Select recording</string>
+    <string name="selection_row_selected_description">Selected</string>
+    <string name="selection_row_not_selected_description">Not selected</string>
+    <plurals name="selection_count">
+        <item quantity="one">%1$d selected</item>
+        <item quantity="other">%1$d selected</item>
+    </plurals>
+    <plurals name="bulk_delete_confirm_title">
+        <item quantity="one">Delete %1$d recording?</item>
+        <item quantity="other">Delete %1$d recordings?</item>
+    </plurals>
+    <string name="bulk_delete_confirm_message">This can\'t be undone.</string>
+    <plurals name="bulk_delete_success">
+        <item quantity="one">Deleted %1$d recording</item>
+        <item quantity="other">Deleted %1$d recordings</item>
+    </plurals>
+    <string name="bulk_delete_partial">%1$d deleted, %2$d could not be deleted</string>
 </resources>

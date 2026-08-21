@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_marginBottom="8dp"
@@ -15,6 +16,26 @@
         android:background="@color/library_active_accent"
         android:visibility="invisible"
         android:importantForAccessibility="no" />
+
+    <!-- Shown only while bulk-selection mode is active (see RecordingsAdapter); the whole row is
+         the actual tap target in that mode (isClickable=false here on purpose) — this is purely
+         the visual indicator, so its own touch-target size doesn't need to individually meet the
+         48dp minimum the row as a whole already comfortably exceeds. importantForAccessibility=no
+         since the row itself now carries a localized selected/not-selected state description (see
+         RecordingsAdapter) — without this, TalkBack's default "speak children" fallback would
+         announce this checkbox's own static "Select recording" description right alongside that,
+         redundantly. -->
+    <com.google.android.material.checkbox.MaterialCheckBox
+        android:id="@+id/selectionCheckbox"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="8dp"
+        android:clickable="false"
+        android:focusable="false"
+        android:importantForAccessibility="no"
+        android:contentDescription="@string/selection_checkbox_description"
+        android:visibility="gone"
+        tools:visibility="visible" />
 
     <LinearLayout
         android:layout_width="0dp"

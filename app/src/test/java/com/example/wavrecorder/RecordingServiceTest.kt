@@ -1034,8 +1034,66 @@ class RecordingServiceTest {
             it.notification.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString()
         }
 
+    /** Covers the foreground "Recording…" channel/notification/Stop-action itself -- the one piece
+     * of notification behavior removing the terminal-outcome notification must never regress --
+     * independent of the (now-deleted) result channel/notification this file used to also test. */
     @Test
-    fun `a session that ends with no listener attached persists its outcome and raises a terminal notification`() {
+    fun `the foreground recording channel exists with low importance after the service is created`() {
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        val manager = app().getSystemService(NotificationManager::class.java)
+
+        val channel = manager.getNotificationChannel("recording_channel")
+
+        assertNotNull("expected the foreground recording channel to exist", channel)
+        assertEquals(
+            "the ongoing-recording channel must stay silent/low-importance, unlike the removed result channel",
+            NotificationManager.IMPORTANCE_LOW, channel!!.importance
+        )
+        service.onDestroy()
+    }
+
+    @Test
+    fun `the active recording notification is ongoing, on the recording channel, and offers a Stop action`() {
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int { Thread.sleep(20); return 4 }
+            override fun stop() {}
+            override fun release() {}
+        }
+        service.recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
+        )
+
+        service.startRecording(1L)
+
+        val posted = app().getSystemService(NotificationManager::class.java).activeNotifications
+            .firstOrNull { it.id == 1001 }
+        assertNotNull("expected the foreground recording notification (id 1001) to be active", posted)
+        val notification = posted!!.notification
+        assertEquals("recording_channel", notification.channelId)
+        assertTrue(
+            "the recording notification must stay ongoing (undismissable) while capture is active",
+            notification.flags and android.app.Notification.FLAG_ONGOING_EVENT != 0
+        )
+        assertEquals(
+            app().getString(R.string.status_recording),
+            notification.extras.getCharSequence(android.app.Notification.EXTRA_TEXT)?.toString()
+        )
+        assertEquals(
+            "expected exactly one action (Stop) on the active recording notification",
+            1, notification.actions?.size ?: 0
+        )
+        assertEquals(
+            app().getString(R.string.stop_recording),
+            notification.actions[0].title.toString()
+        )
+        service.stopRecording()
+        awaitFinalizationAndIdle(service)
+    }
+
+    @Test
+    fun `a session that ends with no listener attached persists its outcome without raising any notification`() {
         val service = Robolectric.buildService(RecordingService::class.java).create().get()
         val chunk = byteArrayOf(1, 2, 3, 4)
         val source = object : AudioSource {
@@ -1067,14 +1125,18 @@ class RecordingServiceTest {
         assertNull("consumePendingOutcome must clear the outcome so it isn't redelivered",
             service.consumePendingOutcome())
 
+        // finishRecording() already removed the foreground notification by the time finalization
+        // completes above -- an unattended recording must leave zero active notifications behind,
+        // not raise a replacement "terminal outcome" one (see LegacyNotificationCleanup for why
+        // that was removed).
         assertTrue(
-            "expected a terminal 'Recording saved' notification, got: ${postedNotificationTitles()}",
-            postedNotificationTitles().contains(app().getString(R.string.notification_result_saved_title))
+            "an unattended recording must not raise any notification, got: ${postedNotificationTitles()}",
+            postedNotificationTitles().isEmpty()
         )
     }
 
     @Test
-    fun `a session that ends with a listener attached does not persist an outcome or raise a terminal notification`() {
+    fun `a session that ends with a listener attached does not persist an outcome or raise any notification`() {
         val service = Robolectric.buildService(RecordingService::class.java).create().get()
         val chunk = byteArrayOf(1, 2, 3, 4)
         val source = object : AudioSource {
@@ -1102,9 +1164,9 @@ class RecordingServiceTest {
 
         assertNull("no outcome should be persisted when a listener was attached to receive it live",
             service.consumePendingOutcome())
-        assertFalse(
-            "no terminal notification should be raised when the outcome was already delivered live",
-            postedNotificationTitles().contains(app().getString(R.string.notification_result_saved_title))
+        assertTrue(
+            "no notification should remain once a live-delivered session's foreground notification is removed",
+            postedNotificationTitles().isEmpty()
         )
     }
 

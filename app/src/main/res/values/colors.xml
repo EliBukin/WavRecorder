@@ -19,4 +19,9 @@
          recording, reusing the same purple used for "preferred" elsewhere for visual consistency. -->
     <color name="library_active_accent">#7C4DFF</color>
     <color name="library_row_stroke">#1F000000</color>
+
+    <!-- Bulk-selection: a row's background while selected, at low alpha over the same
+         library_active_accent purple used for the "currently playing" accent bar and selection
+         border, for visual consistency between the two "this row is special" states. -->
+    <color name="library_selected_row_background">#1F7C4DFF</color>
 </resources>

@@ -37,12 +37,7 @@ class RecordingService : Service() {
     companion object {
         private const val TAG = "RecordingService"
         private const val CHANNEL_ID = "recording_channel"
-        // Separate from CHANNEL_ID/IMPORTANCE_LOW: a terminal outcome (especially a failure) is
-        // meant to actually get the user's attention once they're no longer looking at the app,
-        // which the silent, low-importance ongoing-recording channel is deliberately not.
-        private const val RESULT_CHANNEL_ID = "recording_result_channel"
         private const val NOTIFICATION_ID = 1001
-        private const val RESULT_NOTIFICATION_ID = 1002
         private const val ACTION_STOP = "com.example.wavrecorder.action.STOP"
         // internal (not private): RecordFragment sends these explicitly rather than a bare,
         // action-less Intent, so this service has its own authoritative record of "a
@@ -570,9 +565,10 @@ class RecordingService : Service() {
     }
 
     /** Delivers [outcome] live if a Fragment is actually attached right now, exactly like before;
-     * otherwise durably persists it (see [pendingOutcomeStore]) and raises a terminal notification
-     * so an unattended failure -- or even just a save -- is never communicated by silently
-     * removing the ongoing-recording notification and leaving no explanation. */
+     * otherwise durably persists it (see [pendingOutcomeStore]) so it's still available in-app the
+     * next time the user opens WavRecorder -- see [consumePendingOutcome]. Deliberately raises no
+     * Android notification or launcher badge for an unattended outcome (the app used to; see
+     * [LegacyNotificationCleanup] for why that was removed and how the old one is retracted). */
     private fun reportOutcome(outcome: RecordingOutcome) {
         val currentListener = listener
         if (currentListener != null) {
@@ -607,13 +603,12 @@ class RecordingService : Service() {
             val persisted = pendingOutcomeStore.persist(sessionId, outcome, safeMessageFor(outcome))
             if (!persisted) {
                 // The synchronous, durable write itself failed (e.g. disk I/O error) -- rare, and
-                // there's no listener attached to inform right now anyway. The terminal
-                // notification below is raised regardless, so it remains the user's fallback
-                // signal even here; only the in-app "catch up on reopen" path is affected.
+                // there's no listener attached to inform right now anyway, and (deliberately) no
+                // notification either -- see this method's own doc. If the process doesn't
+                // survive, this outcome is simply lost; logged so it's at least traceable.
                 Log.w(TAG, "Failed to durably persist terminal recording outcome ($outcome); " +
-                    "only the notification will inform the user if the process doesn't survive")
+                    "the user will not be informed if the process doesn't survive")
             }
-            showTerminalOutcomeNotification(outcome)
         }
     }
 
@@ -690,17 +685,6 @@ class RecordingService : Service() {
                     NotificationManager.IMPORTANCE_LOW
                 )
             )
-            // Deliberately DEFAULT (not LOW like the silent, ongoing recording channel above): a
-            // terminal outcome -- especially a failure -- is exactly the kind of thing a user who
-            // isn't currently looking at the app should actually be alerted to, not have arrive as
-            // silently as the persistent "recording in progress" notification does.
-            manager.createNotificationChannel(
-                NotificationChannel(
-                    RESULT_CHANNEL_ID,
-                    getString(R.string.notification_result_channel_name),
-                    NotificationManager.IMPORTANCE_DEFAULT
-                )
-            )
         }
     }
 
@@ -708,49 +692,6 @@ class RecordingService : Service() {
         is MicrophoneDisconnectedException -> getString(R.string.mic_disconnected_error)
         is MicrophoneRouteChangedException -> getString(R.string.mic_route_changed_error)
         else -> getString(R.string.recording_error, e.message)
-    }
-
-    private fun outcomeNotificationContent(outcome: RecordingOutcome): Pair<String, String> = when (outcome) {
-        is RecordingOutcome.Saved -> getString(R.string.notification_result_saved_title) to
-            (outcome.target?.let { getString(R.string.notification_result_saved_text, it.displayPath) }
-                ?: getString(R.string.notification_result_saved_text_unknown_location))
-        is RecordingOutcome.FailedButSaved ->
-            getString(R.string.notification_result_error_title) to errorMessageFor(outcome.cause)
-        is RecordingOutcome.Failed ->
-            getString(R.string.notification_result_error_title) to errorMessageFor(outcome.cause)
-        is RecordingOutcome.FinalizationFailed -> getString(R.string.notification_result_needs_recovery_title) to
-            (outcome.target?.let {
-                getString(R.string.recording_needs_recovery, it.displayPath, outcome.cause.message ?: "")
-            } ?: getString(R.string.recording_error, outcome.cause.message))
-        is RecordingOutcome.FinalizationUnknown ->
-            getString(R.string.notification_result_needs_verification_title) to
-                (outcome.target?.let { getString(R.string.recording_needs_verification, it.displayPath) }
-                    ?: getString(R.string.recording_needs_verification_unknown_location))
-    }
-
-    /** Raised in place of the just-removed ongoing-recording notification whenever a session ends
-     * with no Fragment attached to show the result live -- an ordinary (non-ongoing, dismissible)
-     * notification, on its own channel/id so it survives independently of the recording
-     * notification's own lifecycle and never contends with a later recording's notification. */
-    private fun showTerminalOutcomeNotification(outcome: RecordingOutcome) {
-        val (title, text) = outcomeNotificationContent(outcome)
-        val openAppIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val contentPendingIntent = PendingIntent.getActivity(
-            this, 0, openAppIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val notification = NotificationCompat.Builder(this, RESULT_CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-            .setSmallIcon(R.drawable.ic_notification_mic)
-            .setOngoing(false)
-            .setAutoCancel(true)
-            .setContentIntent(contentPendingIntent)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(RESULT_NOTIFICATION_ID, notification)
     }
 
     /** Shown only for the brief, bounded window between an accepted ACTION_START and it either

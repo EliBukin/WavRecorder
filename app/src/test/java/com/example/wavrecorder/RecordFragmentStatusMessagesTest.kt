@@ -9,6 +9,7 @@ import androidx.fragment.app.testing.launchFragmentInContainer
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -311,5 +312,69 @@ class RecordFragmentStatusMessagesTest {
         assertFalse("the raw segment file name must not appear in the friendly summary",
             detailText!!.contains(segmentFile.name))
         assertTrue("expected a duration to be shown", detailText!!.contains("second"))
+    }
+
+    @Test
+    fun `an outcome persisted while unattended is still consumed and shown once the app is reopened`() {
+        // No fragment/listener bound at all yet -- simulates a recording finishing while the app
+        // is fully backgrounded, exactly like RecordingServiceTest's identical "no listener
+        // attached" scenario, but carried through to actually reopening the app afterward: this is
+        // what proves the terminal outcome is still available *in the app* even though removing
+        // the legacy notification means it's no longer also announced by the system.
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        shadowOf(app()).setComponentNameAndServiceForBindService(
+            ComponentName(app(), RecordingService::class.java),
+            service.LocalBinder()
+        )
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                System.arraycopy(chunk, 0, buffer, offset, chunk.size)
+                return chunk.size
+            }
+            override fun stop() {}
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        service.destinationManager = object : DestinationManager(app()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        service.recorder = WavRecorder(
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
+        )
+
+        service.startRecording(1L)
+        val segmentOpenedDeadline = System.currentTimeMillis() + 2000
+        while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        service.stopRecording()
+        awaitFinalizationAndIdle(service)
+        assertTrue(
+            "sanity: the outcome must genuinely be pending before the app is ever reopened",
+            service.pendingOutcomeStore.peekSessionId() != null
+        )
+
+        // The user now opens the app -- RecordFragment binds to the already-running service and
+        // must catch up on the outcome it wasn't around to see live (see
+        // RecordFragment.syncUiWithService).
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        val deadline = System.currentTimeMillis() + 2000
+        while (
+            statusText(scenario) != app().getString(R.string.status_saved_title) &&
+            System.currentTimeMillis() < deadline
+        ) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+
+        assertEquals(app().getString(R.string.status_saved_title), statusText(scenario))
+        assertTrue("expected the friendly date/duration detail to be shown", detailVisible(scenario))
+        assertNull(
+            "the pending outcome must be consumed (cleared) once delivered in-app, not redelivered",
+            service.pendingOutcomeStore.peekSessionId()
+        )
     }
 }

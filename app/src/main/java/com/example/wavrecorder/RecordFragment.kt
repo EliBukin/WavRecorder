@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.Lifecycle
 import com.example.wavrecorder.databinding.FragmentRecordBinding
+import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -38,7 +39,25 @@ class RecordFragment : Fragment() {
     private var currentTarget: OutputTarget? = null
     private var currentPartNumber = 1
 
+    // Captured once, right after the binding is created (see onViewCreated) -- the record
+    // button's own default, theme-driven (colorPrimary-based) tint/text, including MaterialButton's
+    // correct disabled-state dimming. setRecordButtonRecording(false) restores exactly these,
+    // rather than relying on backgroundTintList/setTextColor "reset to null" semantics that aren't
+    // guaranteed to reproduce the original style-driven state precisely.
+    private lateinit var defaultRecordButtonBackgroundTint: ColorStateList
+    private lateinit var defaultRecordButtonTextColor: ColorStateList
+
     private var recordingService: RecordingService? = null
+    // False from the moment onStart() requests a bind until a connection actually delivers the
+    // service's real state (or the bind request itself is refused outright) -- recordingBusy()
+    // treats "unknown" as "busy" (never as "idle") specifically so the microphone-test button
+    // can't be enabled during this window: bindService() only reports whether the *request* was
+    // accepted, not whether a recording might already be under way in the service on the other
+    // end, and reading a still-null recordingService as "definitely idle" is exactly the bug this
+    // closes. Reset to false again on disconnect (see serviceConnection.onServiceDisconnected)
+    // since a lost connection means this Fragment no longer has live information either. internal
+    // for tests -- see RecordFragmentServiceStateGateTest.
+    internal var serviceStateKnown = false
     // True from a successful bindService() call in onStart() until onStop() undoes it -- tracked
     // separately from onServiceConnected() actually having run, since that callback is
     // asynchronous and can otherwise land (or never land at all) after this screen has already
@@ -68,6 +87,45 @@ class RecordFragment : Fragment() {
     // can't just call stopRecording() reentrantly from inside the callback itself.
     private var pendingMicMismatch = false
 
+    // internal (not private) + var so a test can substitute a MicTestSession wired to a fake
+    // AudioSource, mirroring RecordingService's own recorder/destinationManager test seams.
+    internal var micTestSession: MicTestSession = MicTestSession()
+    // True from the moment the test button is tapped (before route verification even completes)
+    // until it's fully stopped -- see startMicTest()/stopMicTest(). Gates real recording off
+    // immediately, not just once the background test loop actually starts.
+    private var micTestActive = false
+    // Snapshotted the moment a test attempt begins: whether an external input was
+    // detected/preferred beforehand -- mirrors expectedExternalMic's identical rationale for real
+    // recording (see below). If true and the route MicTestSession actually verifies doesn't back
+    // that up, the test must stop rather than silently continue against the built-in mic.
+    private var expectedExternalMicForTest = false
+    // Set synchronously from within MicTestSession's onMicrophoneInfo callback and only acted on
+    // once MicTestSession.start() has actually returned -- mirrors pendingMicMismatch's identical
+    // timing constraint below. MicTestSession.start() has not finished its own start transition
+    // (generation/isActive/testThread) at the moment onMicrophoneInfo fires -- see that method's
+    // doc -- so calling MicTestSession.stop() reentrantly from inside it here would race the
+    // still-in-flight start() and could release the AudioSource out from under the background
+    // thread start() is about to spin up against it.
+    private var pendingTestMicMismatch = false
+    // One-way per test session: true once a level has crossed MIC_TEST_SIGNAL_THRESHOLD, so the
+    // "Signal detected" status is written at most once per test rather than toggling back and
+    // forth on every throttled level update -- see updateMicTestSignalStatus().
+    private var micTestSignalDetected = false
+    // True from the moment resetMicTestUiForServiceUnavailable() runs (a service disconnect caught
+    // mid-test) until a subsequent connection actually confirms genuine state -- lets
+    // syncUiWithService() tell "this Fragment is showing a real, known idle state" apart from
+    // "it's merely showing the honest 'service state unknown' status" when a reconnect reveals
+    // idle, so the latter gets explicitly replaced with a real idle reset instead of being left
+    // stuck (syncUiWithService's own else-branch otherwise only acts when there's an actual
+    // pending outcome to display).
+    private var micTestServiceUnavailableShown = false
+
+    private enum class PendingPermissionAction { RECORD, MIC_TEST }
+    // Which flow a just-launched permission request belongs to, consulted only from within
+    // handlePermissionResult() once the launcher's callback actually fires -- see
+    // requestPermissionAndRecord()/the test button's click listener for where this is set.
+    private var pendingPermissionAction = PendingPermissionAction.RECORD
+
     private var audioManager: AudioManager? = null
     // Defaults to "none detected" rather than an optimistic guess: until the first real query
     // runs (see refreshPreferredMicStatus(), called from onStart()), there's nothing to back up
@@ -95,16 +153,37 @@ class RecordFragment : Fragment() {
             val service = (binder as RecordingService.LocalBinder).getService()
             recordingService = service
             service.listener = recordingListener
+            // The real state is now known -- syncUiWithService() below (via its own leading
+            // refreshTestButtonEnabled() call) is what actually defends against a mic test that's
+            // unexpectedly still active against this now-known state; see that method's doc.
+            serviceStateKnown = true
             if (pendingStart) {
                 pendingStart = false
                 startAndCheckMicRoute(service, pendingRequestId)
             }
             syncUiWithService()
+            refreshTestButtonEnabled()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             recordingService?.listener = null
             recordingService = null
+            // A lost connection means this Fragment no longer has live information about whether
+            // recording is busy -- back to "unknown" (never "idle") until a new connection lands.
+            serviceStateKnown = false
+            if (micTestActive) {
+                // Unlike stopMicTestForRecordingConflict()'s deliberately partial reset (used only
+                // when a *known*-busy service connects and is about to render its own real
+                // recording UI immediately afterward via syncUiWithService()), nothing renders
+                // anything here -- recordingService is now null, so nothing will ever come along
+                // to clean up a leftover "Testing microphone" status/waveform/level section on its
+                // own. Every piece of mic-test UI state must be fully reset right here, exactly
+                // once, alongside actually stopping/releasing the session.
+                micTestSession.stop()
+                resetMicTestUiForServiceUnavailable()
+            } else {
+                refreshTestButtonEnabled()
+            }
         }
     }
 
@@ -117,9 +196,10 @@ class RecordFragment : Fragment() {
             if (_binding != null) {
                 currentTarget = target
                 currentPartNumber = partNumber
-                binding.recordButton.text = getString(R.string.stop_recording)
+                setRecordButtonRecording(true)
                 binding.audioLevelSection.visibility = View.VISIBLE
                 updateRecordingStatus()
+                refreshTestButtonEnabled()
             }
         }
 
@@ -143,6 +223,7 @@ class RecordFragment : Fragment() {
                 binding.statusText.text = getString(R.string.status_finalizing)
                 binding.recordButton.isEnabled = false
             }
+            refreshTestButtonEnabled()
         }
 
         override fun onStartRejected() {
@@ -256,13 +337,23 @@ class RecordFragment : Fragment() {
     @Suppress("UNUSED_PARAMETER")
     internal fun handlePermissionResult(results: Map<String, Boolean>) {
         if (!hasMicrophonePermission()) {
-            Toast.makeText(requireContext(), R.string.permission_denied, Toast.LENGTH_LONG).show()
+            val deniedMessage = if (pendingPermissionAction == PendingPermissionAction.MIC_TEST) {
+                R.string.mic_test_permission_denied
+            } else {
+                R.string.permission_denied
+            }
+            Toast.makeText(requireContext(), deniedMessage, Toast.LENGTH_LONG).show()
             return
         }
-        if (notificationPermissionDenied()) {
-            confirmRecordWithoutNotificationPermission()
-        } else {
-            beginRecording()
+        when (pendingPermissionAction) {
+            // The test never touches POST_NOTIFICATIONS -- it never starts a foreground service or
+            // shows a notification -- so unlike RECORD's flow below, RECORD_AUDIO alone is enough.
+            PendingPermissionAction.MIC_TEST -> startMicTest()
+            PendingPermissionAction.RECORD -> if (notificationPermissionDenied()) {
+                confirmRecordWithoutNotificationPermission()
+            } else {
+                beginRecording()
+            }
         }
     }
 
@@ -306,6 +397,13 @@ class RecordFragment : Fragment() {
         savedInstanceState: Bundle?
     ): View {
         _binding = FragmentRecordBinding.inflate(inflater, container, false)
+        // Captured immediately, before any state transition can touch them -- see the fields'
+        // own doc.
+        defaultRecordButtonBackgroundTint = binding.recordButton.backgroundTintList
+            ?: ColorStateList.valueOf(
+                MaterialColors.getColor(binding.recordButton, com.google.android.material.R.attr.colorPrimary)
+            )
+        defaultRecordButtonTextColor = binding.recordButton.textColors
         return binding.root
     }
 
@@ -322,6 +420,18 @@ class RecordFragment : Fragment() {
                 else -> requestPermissionAndRecord()
             }
         }
+        binding.testMicButton.setOnClickListener {
+            if (micTestActive) {
+                stopMicTest()
+            } else {
+                pendingPermissionAction = PendingPermissionAction.MIC_TEST
+                if (hasMicrophonePermission()) {
+                    startMicTest()
+                } else {
+                    requestPermissionsLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                }
+            }
+        }
     }
 
     override fun onStart() {
@@ -334,6 +444,12 @@ class RecordFragment : Fragment() {
         audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
         refreshPreferredMicStatus()
 
+        // Unknown again for this fresh visibility window until a connection actually lands (see
+        // serviceStateKnown's own doc) -- must be reset before the bindService() call below, not
+        // after, so refreshTestButtonEnabled() at the end of this method never briefly reads a
+        // stale "known" state left over from a previous visit.
+        serviceStateKnown = false
+
         // Bind whenever visible so we always have a live channel for waveform/status updates
         // and can resync with a recording that's been running in the background (screen off,
         // another app in front) since we were last here. bindService() only reports whether the
@@ -345,12 +461,40 @@ class RecordFragment : Fragment() {
             serviceConnection,
             Context.BIND_AUTO_CREATE
         )
+        refreshTestButtonEnabled()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // MainActivity hosts this Fragment inside a 2-page ViewPager2/FragmentStateAdapter -- with
+        // only 2 pages, switching to the Library tab leaves this one in the STARTED state (still
+        // "kept alive" as the adjacent page), receiving only onPause(), never onStop(). Without
+        // this override, mic testing would keep running with its AudioRecord held open and its
+        // waveform meter updating while nobody can see it. Real recording is entirely unaffected --
+        // it deliberately keeps running via the foreground service regardless of tab visibility,
+        // and nothing here touches recordingService/beginRecording/etc. Mirrors onStop()'s
+        // identical stop+reset pair, so a later onStop() (should this screen actually be stopped
+        // too, e.g. the whole Activity backgrounding) finds micTestActive already false and safely
+        // no-ops rather than releasing/resetting a second time.
+        if (micTestActive) {
+            micTestSession.stop()
+            resetMicTestUi()
+        }
     }
 
     override fun onStop() {
         super.onStop()
         audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
         audioManager = null
+
+        // Belt-and-suspenders alongside onPause()'s identical guard above: onPause() always runs
+        // before onStop() in the normal Fragment lifecycle, so micTestActive is already false by
+        // the time this runs in practice -- kept regardless in case some future path reaches
+        // onStop() without onPause() having run first.
+        if (micTestActive) {
+            micTestSession.stop()
+            resetMicTestUi()
+        }
 
         // A start requested by this screen must not fire once it's no longer around to show the
         // result -- cancel it outright rather than let a delayed onServiceConnected (see
@@ -382,11 +526,20 @@ class RecordFragment : Fragment() {
     }
 
     private fun syncUiWithService() {
+        refreshTestButtonEnabled()
         val service = recordingService ?: return
+        // Captured, then unconditionally cleared, before branching: whichever branch below runs,
+        // a real connection has now landed, so this Fragment is no longer showing the honest
+        // "service state unknown" status -- see micTestServiceUnavailableShown's own doc. The
+        // captured value is what lets the idle (else) branch below tell a genuine, already-known
+        // idle reconnect apart from one recovering from that unavailable status, without needing
+        // the flag itself to still read true once we're past this point.
+        val wasShowingServiceUnavailable = micTestServiceUnavailableShown
+        micTestServiceUnavailableShown = false
         if (service.isRecording) {
             currentTarget = service.lastTarget
             currentPartNumber = service.lastPartNumber
-            binding.recordButton.text = getString(R.string.stop_recording)
+            setRecordButtonRecording(true)
             binding.recordButton.isEnabled = true
             binding.audioLevelSection.visibility = View.VISIBLE
             binding.statusDetailText.visibility = View.GONE
@@ -401,7 +554,16 @@ class RecordFragment : Fragment() {
         } else {
             // Catches this screen up on whatever happened while it wasn't around to see it live
             // (or wasn't bound yet) -- see RecordingService.consumePendingOutcome.
-            service.consumePendingOutcome()?.let { displayPendingOutcome(it) }
+            val outcome = service.consumePendingOutcome()
+            if (outcome != null) {
+                displayPendingOutcome(outcome)
+            } else if (wasShowingServiceUnavailable) {
+                // Genuinely idle now confirmed -- replace the "Reconnecting…" status left behind
+                // by resetMicTestUiForServiceUnavailable() with a real idle reset, rather than
+                // leaving it stuck (there's no pending outcome here to otherwise trigger any
+                // update at all).
+                resetToIdle()
+            }
         }
     }
 
@@ -427,6 +589,7 @@ class RecordFragment : Fragment() {
     }
 
     private fun requestPermissionAndRecord() {
+        pendingPermissionAction = PendingPermissionAction.RECORD
         val needed = mutableListOf<String>()
         if (!hasMicrophonePermission()) {
             needed += Manifest.permission.RECORD_AUDIO
@@ -485,6 +648,7 @@ class RecordFragment : Fragment() {
         } else {
             pendingStart = true
         }
+        refreshTestButtonEnabled()
     }
 
     /** Starts recording and then, only once [RecordingService.startRecording] has actually
@@ -525,6 +689,198 @@ class RecordFragment : Fragment() {
                 beginRecording(acceptPhoneMic = true)
             }
             .show()
+    }
+
+    /** Whether real recording currently occupies (or is about to occupy) this screen's
+     * attention -- pending a bound connection, or genuinely PREPARING/RECORDING/FINALIZING once
+     * one exists. Single source of truth for both directions of mutual exclusion with the
+     * microphone test: gates [startMicTest] from beginning, and (via [refreshTestButtonEnabled])
+     * keeps [binding.testMicButton] disabled for the same window. */
+    /** [serviceStateKnown] being false counts as busy, never as idle -- see that field's own doc:
+     * this is what keeps the microphone-test button disabled for the whole window between
+     * onStart()'s bindService() call and a connection (or a lost one) actually revealing the real
+     * state, instead of optimistically reading a still-null [recordingService] as "nothing to
+     * worry about". */
+    private fun recordingBusy(): Boolean =
+        !serviceStateKnown || pendingStart || recordingService?.let { it.state != ServiceState.IDLE } == true
+
+    /** Re-derives [binding.testMicButton]'s enabled state from live recording state -- called from
+     * every point that can change it. Deliberately not gated on [micTestActive] itself: the button
+     * must stay enabled (tappable, to stop) for the whole time a test is active, which is exactly
+     * when [recordingBusy] is guaranteed false (mutual exclusion), and disabled whenever recording
+     * genuinely is busy, which is exactly when a test can never be active in the first place.
+     *
+     * Also the single defensive backstop for the *other* direction of that same guarantee: if a
+     * test is (still, or unexpectedly) active at the exact moment recording becomes busy -- a
+     * delayed service connection revealing a pre-existing recording, or a notification/other
+     * component starting one directly while this screen is visible and showing a test -- this is
+     * where it gets shut down, since every call site above that can change recording's busy state
+     * already calls this. Deliberately checked here rather than duplicated at each individual call
+     * site.
+     *
+     * internal (not private) so a test can assert the mutual-exclusion gate directly against a
+     * synchronously-set field (e.g. [pendingStart]) without needing to drive a full async
+     * recording start just to observe it. */
+    internal fun refreshTestButtonEnabled() {
+        if (_binding == null) return
+        val busy = recordingBusy()
+        if (micTestActive && busy) {
+            stopMicTestForRecordingConflict()
+        }
+        binding.testMicButton.isEnabled = !busy
+    }
+
+    /** Defensive shutdown for when real recording is found to be (or becomes) busy while a
+     * microphone test is unexpectedly still active -- see [refreshTestButtonEnabled]'s doc for the
+     * scenarios this guards against. Releases the test's [AudioSource] exactly like [stopMicTest],
+     * but -- unlike [resetMicTestUi] -- never touches [binding.statusText]/
+     * [binding.audioLevelSection]/[binding.waveformView]/the mic status label: those are about to
+     * be driven by the real recording's own state by whichever caller (syncUiWithService,
+     * onSegmentStarted, ...) triggered this via [refreshTestButtonEnabled], and resetting them to
+     * the idle mic-test UI here would either flash it uselessly or clobber the real recording UI
+     * rendered right after this returns. */
+    private fun stopMicTestForRecordingConflict() {
+        micTestSession.stop()
+        micTestActive = false
+        if (_binding == null) return
+        binding.testMicButton.text = getString(R.string.test_microphone)
+    }
+
+    /** Starts a live microphone check -- never a file, a journal record, or the recording
+     * foreground service; see [MicTestSession]'s own doc. Disables real recording immediately
+     * (not only once the background loop actually starts), reuses the exact same post-route-
+     * verification status display ([updateMicDeviceLabel]) and level meter ([binding.waveformView])
+     * real recording itself uses, since the two are never active at the same time. */
+    private fun startMicTest() {
+        if (micTestActive || recordingBusy()) return
+        micTestActive = true
+        micTestSignalDetected = false
+        // Snapshotted now, exactly like beginRecording()'s identical expectedExternalMic --
+        // whatever AudioManager reports changing mid-test doesn't retroactively change what this
+        // one attempt promised the user.
+        expectedExternalMicForTest = latestPreferredMicStatus is PreferredMicStatus.ExternalConnected
+        pendingTestMicMismatch = false
+        binding.testMicButton.text = getString(R.string.stop_test)
+        binding.recordButton.isEnabled = false
+        binding.waveformView.clear()
+        binding.audioLevelSection.visibility = View.VISIBLE
+        binding.statusText.text = getString(R.string.mic_test_status_active)
+        binding.statusDetailText.text = getString(R.string.mic_test_status_waiting)
+        binding.statusDetailText.visibility = View.VISIBLE
+        micTestSession.start(
+            context = requireContext(),
+            onMicrophoneInfo = { info ->
+                if (_binding != null) updateMicDeviceLabel(info)
+                // Fires synchronously from inside start(), before its own start transition has
+                // finished (see pendingTestMicMismatch's doc) -- recorded here, not acted on until
+                // start() actually returns below.
+                if (expectedExternalMicForTest && !(info.verified && info.isExternal)) {
+                    pendingTestMicMismatch = true
+                }
+            },
+            onLevel = { level ->
+                if (_binding != null) {
+                    binding.waveformView.addAmplitude(level)
+                    updateMicTestSignalStatus(level)
+                }
+            },
+            onError = { e -> handleMicTestError(e) }
+        )
+        // Only safe to act on now that start() has fully returned -- see pendingTestMicMismatch's
+        // doc for why calling stop() from inside onMicrophoneInfo itself would race start()'s own
+        // still-in-flight generation/isActive/testThread setup.
+        if (pendingTestMicMismatch) {
+            pendingTestMicMismatch = false
+            handleMicTestMismatch()
+        }
+    }
+
+    private fun stopMicTest() {
+        micTestSession.stop()
+        resetMicTestUi()
+    }
+
+    /** [MicTestSession.start]'s onError contract requires the caller to call [MicTestSession.stop]
+     * itself to actually release the underlying [AudioSource] -- see that method's doc for why. */
+    private fun handleMicTestError(e: Exception) {
+        micTestSession.stop()
+        if (_binding == null) {
+            micTestActive = false
+            return
+        }
+        val message = when (e) {
+            is MicrophoneDisconnectedException -> getString(R.string.mic_test_disconnected_error)
+            is MicrophoneRouteChangedException -> getString(R.string.mic_test_route_changed_error)
+            else -> getString(R.string.mic_test_error, e.message)
+        }
+        Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
+        resetMicTestUi()
+    }
+
+    /** An external microphone was expected/preferred for this attempt, but the route
+     * [MicTestSession] actually verified once it started didn't back that up (built-in, or
+     * unverifiable) -- mirrors [showExternalMicMismatchDialog]'s real-recording equivalent, but as
+     * a plain, honest toast rather than a retry dialog: unlike real recording, nothing has been
+     * captured or saved either way, so there's nothing to decide -- the user just taps the test
+     * button again once the microphone is actually reachable. */
+    private fun handleMicTestMismatch() {
+        micTestSession.stop()
+        if (_binding == null) {
+            micTestActive = false
+            return
+        }
+        Toast.makeText(requireContext(), getString(R.string.mic_test_route_mismatch_error), Toast.LENGTH_LONG).show()
+        resetMicTestUi()
+    }
+
+    /** One-way per test session (see [micTestSignalDetected]): the first time a level crosses
+     * [MIC_TEST_SIGNAL_THRESHOLD], replaces the neutral "Waiting for signal…" sub-status with
+     * "Signal detected" and never writes again -- [onLevel] already only fires at a throttled rate
+     * (see [MicTestSession]'s own doc), and this adds a second layer of throttling on top so the
+     * status text itself is written at most once per test, never on every update. */
+    private fun updateMicTestSignalStatus(level: Float) {
+        if (_binding == null || micTestSignalDetected || level < MIC_TEST_SIGNAL_THRESHOLD) return
+        micTestSignalDetected = true
+        binding.statusDetailText.text = getString(R.string.mic_test_status_signal_detected)
+    }
+
+    private fun resetMicTestUi() {
+        micTestActive = false
+        if (_binding == null) return
+        binding.testMicButton.text = getString(R.string.test_microphone)
+        binding.recordButton.isEnabled = true
+        binding.audioLevelSection.visibility = View.GONE
+        binding.waveformView.clear()
+        binding.statusText.text = getString(R.string.status_idle)
+        binding.statusDetailText.visibility = View.GONE
+        updateIdleMicStatusLabel()
+        refreshTestButtonEnabled()
+    }
+
+    /** Mirrors [resetMicTestUi] exactly -- same button/level-section/waveform cleanup, same
+     * trailing [refreshTestButtonEnabled] call -- except the headline never claims the definite,
+     * known-idle "Ready to record" status: the service connection was just lost, not confirmed
+     * idle, and [recordingBusy] already treats that as busy (never idle) for exactly this reason --
+     * the status text must say the same honest thing rather than contradicting it. The record
+     * button is still re-enabled (mirroring the same "connecting" window at a fresh [onStart],
+     * where it's tappable by default and a tap simply queues [pendingStart] until a connection
+     * lands) -- what must not happen is the status text overclaiming a verified idle state, which
+     * is the actual "misleadingly available" risk here, not the button's own tappability.
+     * [micTestServiceUnavailableShown] records that this (not a genuine idle reset) is what's
+     * currently shown, so a later reconnection that turns out to be idle (see [syncUiWithService])
+     * knows to explicitly replace it rather than leaving it stuck. */
+    private fun resetMicTestUiForServiceUnavailable() {
+        micTestActive = false
+        micTestServiceUnavailableShown = true
+        if (_binding == null) return
+        binding.testMicButton.text = getString(R.string.test_microphone)
+        binding.recordButton.isEnabled = true
+        binding.audioLevelSection.visibility = View.GONE
+        binding.waveformView.clear()
+        binding.statusText.text = getString(R.string.status_reconnecting)
+        binding.statusDetailText.visibility = View.GONE
+        updateIdleMicStatusLabel()
+        refreshTestButtonEnabled()
     }
 
     private fun updateRecordingStatus() {
@@ -602,19 +958,72 @@ class RecordFragment : Fragment() {
         }
     }
 
+    /** Applies (or clears) the destructive/red styling that must be visible exactly when
+     * [binding.recordButton] represents "Stop recording" -- an actual, real recording, never the
+     * microphone-test button (a separate, independent button/style entirely). Colors always come
+     * from the theme's own `?attr/colorError`/`?attr/colorOnError` (resolved via
+     * [MaterialColors.getColor], the same helper this file already uses for
+     * [defaultRecordButtonBackgroundTint]'s own fallback), never a hardcoded literal.
+     *
+     * Built directly in Kotlin via [buildDisabledAwareColorStateList] rather than a `<selector>`
+     * XML resource referencing `?attr/...` items: that XML pattern is genuinely fragile --
+     * Robolectric's own resource inflater doesn't resolve a theme-attribute color reference nested
+     * inside a `<selector>`'s `<item>` reliably (confirmed directly: it silently produced Android's
+     * unresolved-resource placeholder color instead of the real theme color, in a setup where the
+     * exact same attribute resolves correctly via a direct [MaterialColors.getColor] call), and
+     * this sidesteps that class of resolution issue on any platform rather than only working around
+     * it for tests. */
+    private fun setRecordButtonRecording(isRecording: Boolean) {
+        binding.recordButton.text = getString(
+            if (isRecording) R.string.stop_recording else R.string.start_recording
+        )
+        if (isRecording) {
+            binding.recordButton.backgroundTintList = buildDisabledAwareColorStateList(
+                com.google.android.material.R.attr.colorError, disabledAlpha = 0.38f
+            )
+            binding.recordButton.setTextColor(
+                buildDisabledAwareColorStateList(com.google.android.material.R.attr.colorOnError, disabledAlpha = 0.6f)
+            )
+        } else {
+            binding.recordButton.backgroundTintList = defaultRecordButtonBackgroundTint
+            binding.recordButton.setTextColor(defaultRecordButtonTextColor)
+        }
+    }
+
+    /** A two-state [ColorStateList] for [colorAttr] (a theme color attribute, e.g.
+     * `?attr/colorError`): the theme's real color when enabled, and the same color at
+     * [disabledAlpha] when disabled -- mirroring the reduced-alpha treatment MaterialButton's own
+     * default (colorPrimary-driven) disabled state already uses elsewhere in this app, so the
+     * brief disabled window during "Finalizing…" (see [RecordFragment.Listener.onStopping]) looks
+     * consistent with every other disabled control rather than introducing a one-off treatment. */
+    private fun buildDisabledAwareColorStateList(@androidx.annotation.AttrRes colorAttr: Int, disabledAlpha: Float): ColorStateList {
+        val color = MaterialColors.getColor(binding.recordButton, colorAttr)
+        val disabledColor = MaterialColors.compositeARGBWithAlpha(color, (disabledAlpha * 255).toInt())
+        return ColorStateList(
+            arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
+            intArrayOf(disabledColor, color)
+        )
+    }
+
     private fun setMicStatusDotColor(@ColorRes colorRes: Int) {
         binding.micStatusDot.backgroundTintList =
             ColorStateList.valueOf(ContextCompat.getColor(requireContext(), colorRes))
     }
 
     private fun resetToIdle() {
-        binding.recordButton.text = getString(R.string.start_recording)
+        // Defensive: whatever the caller, a real idle reset means this Fragment is no longer
+        // showing the "service state unknown" status -- see micTestServiceUnavailableShown's own
+        // doc. syncUiWithService() already clears this itself before calling here, but this keeps
+        // the invariant true regardless of which of resetToIdle()'s several other callers runs.
+        micTestServiceUnavailableShown = false
+        setRecordButtonRecording(false)
         binding.recordButton.isEnabled = true
         binding.statusText.text = getString(R.string.status_idle)
         binding.statusDetailText.visibility = View.GONE
         binding.audioLevelSection.visibility = View.GONE
         updateIdleMicStatusLabel()
         binding.waveformView.clear()
+        refreshTestButtonEnabled()
     }
 
     private fun updateDestinationLabel() {
@@ -623,10 +1032,23 @@ class RecordFragment : Fragment() {
 
     override fun onDestroyView() {
         super.onDestroyView()
+        // Belt-and-suspenders alongside onStop()'s identical guard: onStop() should always run
+        // first in the normal Fragment lifecycle, but this ensures a live test's AudioRecord is
+        // never left open past this screen's own view existing, regardless of the exact teardown
+        // path taken.
+        if (micTestActive) {
+            micTestSession.stop()
+            micTestActive = false
+        }
         _binding = null
     }
 
     companion object {
+        // A modest floor above pure silence/room noise (see peakAmplitude's -45dBFS..0dBFS
+        // mapping onto 0f..1f) -- picked to reliably trigger on a normal speaking voice or a
+        // tap/clap without false-triggering on typical quiet-room background noise. Not a precise
+        // SNR measurement, just enough to tell the user their input is actually reaching the meter.
+        private const val MIC_TEST_SIGNAL_THRESHOLD = 0.15f
         private val SAVED_AT_FORMAT = SimpleDateFormat("MMM d, yyyy · h:mm a", Locale.getDefault())
         // Companion-scoped (not per-instance) so it survives this Fragment being recreated (e.g.
         // rotation) while RecordingService -- a longer-lived, separate component -- keeps its own

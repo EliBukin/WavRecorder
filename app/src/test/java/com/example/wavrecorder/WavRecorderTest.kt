@@ -25,12 +25,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** A fake [AudioSource] that hands back a scripted sequence of PCM buffers, then signals
  * exhaustion and ends the recording loop — standing in for a real microphone so segment
- * rollover and failure handling can be tested without touching AudioRecord. */
-private class FakeAudioSource(
+ * rollover and failure handling can be tested without touching AudioRecord. internal (not
+ * private): [MicTestSessionTest] reuses this exact fake for the same reason -- a second,
+ * independently-maintained fake AudioSource would risk drifting from what this one already
+ * faithfully models. The route-verification params (all optional, defaulting to
+ * [AudioSource]'s own "unverified/always connected" defaults) are what [MicTestSessionTest]
+ * additionally needs that [WavRecorderTest]'s own scenarios never exercised directly. */
+internal class FakeAudioSource(
     private val scriptedReads: List<ByteArray> = emptyList(),
     private val onExhausted: () -> Unit = {},
     private val startRecordingException: Exception? = null,
-    private val readException: Exception? = null
+    private val readException: Exception? = null,
+    private val micInfo: MicrophoneInfo = MicrophoneInfo.UNVERIFIED,
+    private val connected: () -> Boolean = { true },
+    private val routeUnchanged: () -> Boolean = { true },
+    // A no-progress (returns 0) read is distinct from exhaustion (returns -1); left false in every
+    // WavRecorderTest scenario (recordLoop already treats 0 as "just try again"), added purely so
+    // MicTestSessionTest's rate-limited level-posting test can drive many reads quickly without
+    // each one representing genuine new audio.
+    private val readReturnsZeroWhenExhausted: Boolean = false
 ) : AudioSource {
     var startCalled = false
         private set
@@ -49,7 +62,7 @@ private class FakeAudioSource(
         readException?.let { throw it }
         if (index >= scriptedReads.size) {
             onExhausted()
-            return -1
+            return if (readReturnsZeroWhenExhausted) 0 else -1
         }
         val chunk = scriptedReads[index++]
         System.arraycopy(chunk, 0, buffer, offset, chunk.size)
@@ -63,6 +76,10 @@ private class FakeAudioSource(
     override fun release() {
         releaseCalled = true
     }
+
+    override fun describeMicrophone(): MicrophoneInfo = micInfo
+    override fun isDeviceConnected(): Boolean = connected()
+    override fun isRouteUnchanged(): Boolean = routeUnchanged()
 }
 
 @RunWith(RobolectricTestRunner::class)
