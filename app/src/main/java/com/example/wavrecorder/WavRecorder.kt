@@ -257,9 +257,10 @@ private class FileChannelSegmentWriter(private val channel: FileChannel) : Segme
  * destination (ParcelFileDescriptor), both of which support seeking back to byte 0 to patch the
  * header.
  *
- * The microphone capture itself never stops or gaps: once a segment reaches
- * [segmentMaxSeconds] (60 minutes of audio by default), the current file is finalized and
- * a new one is opened via [NextTarget] for the next segment, transparently to the caller.
+ * The microphone capture itself never stops or gaps: once a segment reaches the session's
+ * segment length (passed to [start]; [segmentMaxSeconds] -- 60 minutes of audio -- when the caller
+ * doesn't specify one), the current file is finalized and a new one is opened via [NextTarget] for
+ * the next segment, transparently to the caller.
  */
 internal class WavRecorder(
     private val segmentMaxSeconds: Long = SEGMENT_MAX_SECONDS,
@@ -290,7 +291,9 @@ internal class WavRecorder(
         private const val BITS_PER_SAMPLE = 16
         private const val BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8
 
-        private const val SEGMENT_MAX_SECONDS = 60 * 60L // roll over to a new file every 60 minutes
+        // Fallback segment length for a start() call that doesn't pass its own; RecordingService
+        // always passes the user's chosen RecordingSplitDuration explicitly.
+        private val SEGMENT_MAX_SECONDS = RecordingSplitDuration.DEFAULT.seconds
 
         // Re-patch the header periodically so a mid-recording process kill (low memory, task
         // kill, crash) still leaves a valid, playable WAV file instead of one whose header
@@ -354,6 +357,12 @@ internal class WavRecorder(
 
     val isActive: Boolean get() = isRecording.get()
 
+    /**
+     * [segmentMaxSeconds] is how much audio each file of *this* session may hold before rolling
+     * over. It's converted to a byte limit exactly once, here, and handed to this session's own
+     * recording thread -- nothing can change it for the rest of the session. A non-positive value
+     * is ignored in favor of the constructor's default rather than producing a zero-length split.
+     */
     @SuppressLint("MissingPermission")
     fun start(
         context: Context,
@@ -361,7 +370,8 @@ internal class WavRecorder(
         onSegmentStarted: (OutputTarget) -> Unit,
         onAmplitude: (Float) -> Unit,
         onError: (Exception) -> Unit,
-        onMicrophoneInfo: (MicrophoneInfo) -> Unit = {}
+        onMicrophoneInfo: (MicrophoneInfo) -> Unit = {},
+        segmentMaxSeconds: Long = this.segmentMaxSeconds
     ) {
         if (isRecording.get()) return
 
@@ -390,7 +400,8 @@ internal class WavRecorder(
 
         val source = config.source
         val sampleRate = config.sampleRate
-        val segmentMaxBytes = sampleRate.toLong() * CHANNELS * BYTES_PER_SAMPLE * segmentMaxSeconds
+        val sessionSegmentSeconds = if (segmentMaxSeconds > 0) segmentMaxSeconds else this.segmentMaxSeconds
+        val segmentMaxBytes = sampleRate.toLong() * CHANNELS * BYTES_PER_SAMPLE * sessionSegmentSeconds
 
         audioSource = source
         try {

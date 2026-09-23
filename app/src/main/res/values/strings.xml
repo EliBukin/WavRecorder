@@ -42,13 +42,23 @@
     <string name="section_input_device">Input device</string>
     <string name="section_audio_level">Audio level</string>
     <string name="section_status">Status</string>
+    <string name="section_split_duration">Start a new file every</string>
+
+    <!-- Split-duration choices: long recordings continue seamlessly in a new part file. -->
+    <string name="split_duration_30">30 min</string>
+    <string name="split_duration_45">45 min</string>
+    <string name="split_duration_60">60 min</string>
+    <string name="split_duration_30_description">30 minutes</string>
+    <string name="split_duration_45_description">45 minutes</string>
+    <string name="split_duration_60_description">60 minutes</string>
+    <string name="split_duration_hint">Recording continues without a gap. A change takes effect from the next recording.</string>
 
     <!-- Pre-recording input-device status: only ever "connected"/"detected", never "verified" or
          "active"; the real route is only known once recording actually starts. -->
     <string name="mic_status_connected_title">%1$s connected</string>
     <string name="mic_status_connected_subtitle">Preferred input — verified after recording starts</string>
     <string name="mic_status_none_title">No external microphone detected</string>
-    <string name="mic_status_none_subtitle">The phone microphone may be used</string>
+    <string name="mic_status_none_subtitle">The phone microphone will be used</string>
 
     <!-- Post-start input-device status: AudioRecord.getRoutedDevice() has now verified what's
          actually being captured from. -->

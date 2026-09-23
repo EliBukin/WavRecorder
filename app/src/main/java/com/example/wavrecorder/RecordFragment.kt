@@ -36,6 +36,7 @@ class RecordFragment : Fragment() {
     private val binding get() = _binding!!
 
     private lateinit var destinationManager: DestinationManager
+    private lateinit var recordingSettings: RecordingSettings
     private var currentTarget: OutputTarget? = null
     private var currentPartNumber = 1
 
@@ -74,6 +75,11 @@ class RecordFragment : Fragment() {
     // message for an already-resolved attempt apart from a genuinely new retry. internal for
     // tests -- see RecordFragmentLifecycleTest.
     internal var pendingRequestId: Long = 0L
+    // The split duration captured for that same attempt at the moment Record was pressed (see
+    // beginRecording()) -- carried alongside pendingRequestId so a connection landing later still
+    // starts the session with the value the user had selected when they tapped, not whatever the
+    // setting happens to be by then.
+    internal var pendingSplitDuration: RecordingSplitDuration = RecordingSplitDuration.DEFAULT
 
     // Snapshotted at the moment a start attempt is actually made (see startAndCheckMicRoute()):
     // whether an external input was detected/preferred beforehand, and whether the user has
@@ -159,7 +165,7 @@ class RecordFragment : Fragment() {
             serviceStateKnown = true
             if (pendingStart) {
                 pendingStart = false
-                startAndCheckMicRoute(service, pendingRequestId)
+                startAndCheckMicRoute(service, pendingRequestId, pendingSplitDuration)
             }
             syncUiWithService()
             refreshTestButtonEnabled()
@@ -410,7 +416,9 @@ class RecordFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         destinationManager = DestinationManager(requireContext())
+        recordingSettings = RecordingSettings(requireContext())
         updateDestinationLabel()
+        bindSplitDurationToggle()
 
         binding.chooseFolderButton.setOnClickListener { folderPicker.launch(null) }
         binding.recordButton.setOnClickListener {
@@ -631,6 +639,10 @@ class RecordFragment : Fragment() {
         // to be told apart from a genuinely new request.
         val requestId = requestIdGenerator.incrementAndGet()
         pendingRequestId = requestId
+        // Captured exactly once per attempt, here: the session keeps this value for its whole
+        // lifetime even if the user changes the setting while it's recording.
+        val splitDuration = recordingSettings.splitDuration
+        pendingSplitDuration = splitDuration
 
         // Explicitly tagged ACTION_START (rather than a bare Intent) so RecordingService itself
         // has an authoritative record that it now owes either a real startForeground() call or a
@@ -644,7 +656,7 @@ class RecordFragment : Fragment() {
 
         val service = recordingService
         if (service != null) {
-            startAndCheckMicRoute(service, requestId)
+            startAndCheckMicRoute(service, requestId, splitDuration)
         } else {
             pendingStart = true
         }
@@ -659,9 +671,13 @@ class RecordFragment : Fragment() {
      * (stopRecording() bails out whenever the recorder doesn't consider itself active yet) and
      * let recording continue unnoticed on the wrong input. Deferring the check to right after
      * startRecording() returns avoids that race entirely. */
-    private fun startAndCheckMicRoute(service: RecordingService, requestId: Long) {
+    private fun startAndCheckMicRoute(
+        service: RecordingService,
+        requestId: Long,
+        splitDuration: RecordingSplitDuration
+    ) {
         pendingMicMismatch = false
-        service.startRecording(requestId)
+        service.startRecording(requestId, splitDuration.minutes)
         if (pendingMicMismatch) {
             pendingMicMismatch = false
             // The session just started (almost certainly before any audio was ever captured, per
@@ -1024,6 +1040,30 @@ class RecordFragment : Fragment() {
         updateIdleMicStatusLabel()
         binding.waveformView.clear()
         refreshTestButtonEnabled()
+    }
+
+    /** Reflects the persisted choice, then persists every change the user makes. Deliberately left
+     * enabled while recording: a change only ever applies to the next session (see
+     * [beginRecording]), which the hint under the toggle says. */
+    private fun bindSplitDurationToggle() {
+        binding.splitDurationToggle.check(splitButtonIdFor(recordingSettings.splitDuration))
+        binding.splitDurationToggle.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            splitDurationForButtonId(checkedId)?.let { recordingSettings.splitDuration = it }
+        }
+    }
+
+    private fun splitButtonIdFor(duration: RecordingSplitDuration): Int = when (duration) {
+        RecordingSplitDuration.MINUTES_30 -> R.id.split30Button
+        RecordingSplitDuration.MINUTES_45 -> R.id.split45Button
+        RecordingSplitDuration.MINUTES_60 -> R.id.split60Button
+    }
+
+    private fun splitDurationForButtonId(buttonId: Int): RecordingSplitDuration? = when (buttonId) {
+        R.id.split30Button -> RecordingSplitDuration.MINUTES_30
+        R.id.split45Button -> RecordingSplitDuration.MINUTES_45
+        R.id.split60Button -> RecordingSplitDuration.MINUTES_60
+        else -> null
     }
 
     private fun updateDestinationLabel() {

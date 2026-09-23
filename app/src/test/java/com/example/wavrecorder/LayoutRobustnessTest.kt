@@ -56,6 +56,12 @@ class LayoutRobustnessTest {
         assertEquals(TextUtils.TruncateAt.MIDDLE, binding.destinationLabel.ellipsize)
         assertEquals(1, binding.destinationLabel.maxLines)
 
+        // The three split-duration choices share the row evenly and all stay within it.
+        listOf(binding.split30Button, binding.split45Button, binding.split60Button).forEach {
+            assertTrue("each split-duration choice must fit on screen", it.right <= narrowWidthPx)
+            assertTrue("each split-duration choice must be tall enough to tap", it.measuredHeight >= it.minHeight)
+        }
+
         assertTrue("the root layout must not measure wider than the space it was given",
             binding.root.measuredWidth <= narrowWidthPx)
     }

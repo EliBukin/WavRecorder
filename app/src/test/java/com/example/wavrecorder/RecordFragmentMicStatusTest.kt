@@ -118,6 +118,32 @@ class RecordFragmentMicStatusTest {
     }
 
     @Test
+    fun `with no external microphone the Input device area says the phone microphone will be used, and only then`() {
+        bindRealService()
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        val audioManager = app().getSystemService(AudioManager::class.java)
+        val device = usbDevice()
+        val phoneMicWording = "The phone microphone will be used"
+
+        // The literal text, not just the resource: this wording is itself the requirement.
+        assertEquals(phoneMicWording, subtitleText(scenario))
+
+        // A USB mic plugged in: its reported name is shown, and the phone-mic wording is gone.
+        shadowOf(audioManager).addInputDevice(device, true)
+        assertEquals(
+            app().getString(R.string.mic_status_connected_title, GENERIC_USB_DEVICE_LABEL),
+            titleText(scenario)
+        )
+        assertTrue(titleText(scenario).contains(GENERIC_USB_DEVICE_LABEL))
+        assertFalse(titleText(scenario).contains(phoneMicWording))
+        assertFalse(subtitleText(scenario).contains(phoneMicWording))
+
+        // Unplugged again: back to the phone-mic wording.
+        shadowOf(audioManager).removeInputDevice(device, true)
+        assertEquals(phoneMicWording, subtitleText(scenario))
+    }
+
+    @Test
     fun `idle status shows the connected label and reported name when a generic external input is already attached at launch`() {
         bindRealService()
         val audioManager = app().getSystemService(AudioManager::class.java)

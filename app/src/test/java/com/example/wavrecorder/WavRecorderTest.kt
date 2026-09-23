@@ -145,6 +145,62 @@ class WavRecorderTest {
     }
 
     @Test
+    fun `the segment length passed to start() applies to that session only`() {
+        // The constructor keeps its production default (60 minutes). At sampleRate=1 that's 7200
+        // bytes, so two 4-byte chunks never roll over under it -- while a per-session
+        // segmentMaxSeconds=1 (a 2-byte limit) rolls over on every chunk.
+        val chunk = byteArrayOf(1, 2, 3, 4)
+        var sessionCount = 0
+        val recorder = WavRecorder(
+            openAudioSource = {
+                sessionCount++
+                WavRecorder.RecorderConfig(FakeAudioSource(listOf(chunk, chunk)), sampleRate = 1, bufferSize = chunk.size)
+            }
+        )
+
+        fun runSession(segmentMaxSeconds: Long?): List<File> {
+            val files = mutableListOf<File>()
+            val dir = tempFolder.newFolder()
+            val nextTarget = WavRecorder.NextTarget {
+                val file = File(dir, "segment${files.size + 1}.wav").apply { createNewFile() }
+                files += file
+                OutputTarget.FileTarget(file)
+            }
+            val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+            if (segmentMaxSeconds == null) {
+                recorder.start(context, nextTarget, onSegmentStarted = {}, onAmplitude = {}, onError = {})
+            } else {
+                recorder.start(
+                    context, nextTarget, onSegmentStarted = {}, onAmplitude = {}, onError = {},
+                    segmentMaxSeconds = segmentMaxSeconds
+                )
+            }
+            awaitTerminatedAndDeliverCallbacks(recorder)
+            // Joins the recording thread, so its trailing empty-segment cleanup has run too.
+            recorder.stop()
+            return files.filter { it.exists() }
+        }
+
+        val shortSplit = runSession(segmentMaxSeconds = 1)
+        assertEquals("a 1-second split must roll over after every chunk", 2, shortSplit.size)
+        shortSplit.forEach { assertEquals(chunk.size.toLong(), WavRiffParser.parse(it.inputStream())?.dataSize) }
+
+        // Same recorder instance, next session, no override: back to the constructor's default,
+        // unaffected by what the previous session used.
+        val defaultSplit = runSession(segmentMaxSeconds = null)
+        assertEquals(1, defaultSplit.size)
+        assertEquals(2L * chunk.size, WavRiffParser.parse(defaultSplit[0].inputStream())?.dataSize)
+
+        // A non-positive length is ignored in favor of the default rather than splitting on every
+        // single read.
+        val invalidSplit = runSession(segmentMaxSeconds = 0)
+        assertEquals(1, invalidSplit.size)
+        assertEquals(2L * chunk.size, WavRiffParser.parse(invalidSplit[0].inputStream())?.dataSize)
+
+        assertEquals(3, sessionCount)
+    }
+
+    @Test
     fun `stopping before any audio is ever read deletes the empty segment`() {
         val fake = FakeAudioSource() // no scripted reads: exhausted (returns -1) on the very first call
         val segmentFile = tempFolder.newFile("segment.wav")

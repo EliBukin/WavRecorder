@@ -122,6 +122,7 @@ class RecordingService : Service() {
     private var currentTarget: OutputTarget? = null
     private var currentPartNumber = 1
     private var microphoneInfo: MicrophoneInfo? = null
+    private var splitDuration: RecordingSplitDuration? = null
 
     // True from an accepted ACTION_START (a startForegroundService() call already made) until
     // it's *fulfilled* -- startRecording() actually running and replacing the temporary
@@ -222,6 +223,10 @@ class RecordingService : Service() {
      * [lastTarget] and [lastMicrophoneInfo] already do. Null once reset by a new [startRecording]
      * call, same lifecycle as the rest of this session's state. */
     val lastSessionStartedAtMillis: Long? get() = sessionStartedAtMillis
+    /** The already-validated split duration the current (or most recently started) session was
+     * started with -- fixed for that session's whole lifetime, regardless of any later change to
+     * the user's setting. Null until the first [startRecording] call. */
+    val sessionSplitDuration: RecordingSplitDuration? get() = splitDuration
 
     /** Returns and clears the most recent terminal outcome that no listener was attached to see
      * live, if any -- called once a Fragment (re)binds so it can catch up, exactly once. Reads
@@ -410,8 +415,13 @@ class RecordingService : Service() {
      * already resolved (including a synchronous failure inside [WavRecorder.start] below, which
      * calls back into `onError` and [finishRecording] before this method even returns) -- be
      * recognized by [handleActionStart] as already-handled and ignored, rather than mistakenly
-     * re-entering the foreground for an attempt that's already over. */
-    fun startRecording(requestId: Long) {
+     * re-entering the foreground for an attempt that's already over.
+     *
+     * [splitMinutes] is the per-file length this session will use for its whole lifetime (see
+     * [RecordingSplitDuration]); the caller captures it once, when Record is pressed. Deliberately
+     * a raw Int rather than the enum so this service stays the one place that decides what's
+     * acceptable: anything other than 30, 45 or 60 falls back to 60 minutes. */
+    fun startRecording(requestId: Long, splitMinutes: Int = RecordingSplitDuration.DEFAULT.minutes) {
         if (state == ServiceState.RECORDING) return
         // A previous session's finalization is still running in the background -- see
         // ServiceState's doc and handleActionStart()'s identical guard above. Rejecting here
@@ -438,6 +448,12 @@ class RecordingService : Service() {
         // report that old, already-finished file as if it were this session's newly saved result.
         currentTarget = null
         microphoneInfo = null
+        if (!RecordingSplitDuration.isValidMinutes(splitMinutes)) {
+            Log.w(TAG, "Unsupported split duration of $splitMinutes minutes requested; " +
+                "using ${RecordingSplitDuration.DEFAULT.minutes} minutes instead")
+        }
+        val sessionSplit = RecordingSplitDuration.fromMinutes(splitMinutes)
+        splitDuration = sessionSplit
         val now = System.currentTimeMillis()
         sessionStartedAtMillis = now
         sessionTimestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(now))
@@ -474,7 +490,8 @@ class RecordingService : Service() {
             onMicrophoneInfo = { info ->
                 microphoneInfo = info
                 listener?.onMicrophoneInfo(info)
-            }
+            },
+            segmentMaxSeconds = sessionSplit.seconds
         )
 
         // Deliberately no `if (!recorder.isActive) finishRecording()` here anymore: every path

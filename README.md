@@ -10,8 +10,11 @@ Insta360 Mic Air), with a library for browsing and playing back past recordings.
 - **Background-safe recording**: recording runs in a foreground service, so it
   keeps going with the screen off or the app switched away, with a persistent
   notification (with a Stop action) while it's active.
-- **Auto-split**: recordings longer than 60 minutes automatically roll over into
-  a new file, continuing seamlessly, named `recording_<timestamp>_partNN.wav`.
+- **Auto-split**: long recordings automatically roll over into a new file,
+  continuing seamlessly, named `recording_<timestamp>_partNN.wav`. The split
+  length is selectable on the Record screen (30, 45 or 60 minutes; 60 by
+  default), remembered across app restarts, and fixed for a session once it
+  starts: a change takes effect from the next recording.
 - **Best available capture quality**: prefers `AudioSource.UNPROCESSED` (raw mic
   signal, no platform AGC/noise suppression/echo cancellation) and 48kHz sampling,
   falling back gracefully on devices that don't support either.
@@ -53,6 +56,8 @@ app/src/main/java/com/example/wavrecorder/
   WavFileInfo.kt               Cheap header-only read for duration/size
   AudioStats.kt                Full-file scan for the stats dialog (peak/RMS/clipping)
   RecordingNameFormatter.kt    Turns a recording filename into a human-readable title
+  RecordingSplitDuration.kt    The supported split lengths (30/45/60 min) and their validation
+  RecordingSettings.kt         Persists the user's chosen split length
   WaveformView.kt              Custom View: smoothed live waveform during recording
 ```
 
@@ -79,4 +84,4 @@ from unknown sources" if prompted).
 muxer in the Android SDK, so `WavRecorder` writes the 44-byte RIFF/WAVE header
 itself, patches its size fields in as recording progresses (so a mid-recording
 crash or kill still leaves a playable file), and finalizes it on stop or on
-each 60-minute segment rollover.
+each segment rollover.

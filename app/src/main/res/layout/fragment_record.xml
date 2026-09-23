@@ -57,6 +57,64 @@
 
             </LinearLayout>
 
+            <!-- Split duration: how long each file of a continuous recording runs before it
+                 continues in a new part file. Persisted; applies from the next recording. -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:text="@string/section_split_duration"
+                android:textAppearance="?attr/textAppearanceCaption"
+                android:textColor="@color/text_secondary" />
+
+            <com.google.android.material.button.MaterialButtonToggleGroup
+                android:id="@+id/splitDurationToggle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                app:singleSelection="true"
+                app:selectionRequired="true">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/split30Button"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:minHeight="48dp"
+                    android:text="@string/split_duration_30"
+                    android:contentDescription="@string/split_duration_30_description" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/split45Button"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:minHeight="48dp"
+                    android:text="@string/split_duration_45"
+                    android:contentDescription="@string/split_duration_45_description" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/split60Button"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:minHeight="48dp"
+                    android:text="@string/split_duration_60"
+                    android:contentDescription="@string/split_duration_60_description" />
+
+            </com.google.android.material.button.MaterialButtonToggleGroup>
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/split_duration_hint"
+                android:textSize="12sp"
+                android:textColor="@color/text_secondary" />
+
             <!-- Input device -->
             <TextView
                 android:layout_width="wrap_content"
