@@ -1,0 +1,4 @@
+<resources>
+    <!-- Dark status/navigation bar icons on the light theme; values-night flips this. -->
+    <bool name="wr_light_system_bars">true</bool>
+</resources>

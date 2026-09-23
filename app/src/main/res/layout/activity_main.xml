@@ -7,28 +7,77 @@
     android:orientation="vertical"
     tools:context=".MainActivity">
 
-    <TextView
+    <!-- Compact app header. Read by TalkBack as a single heading ("bukin's wav recorder") rather
+         than as two fragments plus a decorative label - see MainActivity. -->
+    <LinearLayout
+        android:id="@+id/appHeader"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:background="@color/purple_500"
-        android:gravity="center"
-        android:padding="16dp"
-        android:text="@string/app_name"
-        android:textColor="@color/white"
-        android:textSize="20sp"
-        android:textStyle="bold" />
+        android:contentDescription="@string/app_name"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:importantForAccessibility="yes"
+        android:minHeight="@dimen/touch_target"
+        android:orientation="horizontal"
+        android:paddingStart="@dimen/space_xl"
+        android:paddingTop="@dimen/space_md"
+        android:paddingEnd="@dimen/space_xl"
+        android:paddingBottom="@dimen/space_sm">
 
-    <com.google.android.material.tabs.TabLayout
-        android:id="@+id/tabLayout"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        app:tabIndicatorColor="@color/purple_700"
-        app:tabSelectedTextColor="@color/purple_700" />
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:importantForAccessibility="noHideDescendants"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/appHeaderBrand"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_header_brand"
+                android:textAppearance="@style/TextAppearance.WavRecorder.Overline" />
+
+            <TextView
+                android:id="@+id/appHeaderTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_header_title"
+                android:textAppearance="?attr/textAppearanceTitleLarge"
+                android:textColor="?attr/colorOnSurface" />
+
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/appHeaderFormatLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="@dimen/space_md"
+            android:background="@drawable/bg_outline_label"
+            android:importantForAccessibility="no"
+            android:paddingStart="@dimen/space_sm"
+            android:paddingTop="2dp"
+            android:paddingEnd="@dimen/space_sm"
+            android:paddingBottom="2dp"
+            android:text="@string/app_header_format"
+            android:textAppearance="?attr/textAppearanceLabelSmall"
+            android:textColor="?attr/colorOnSurfaceVariant" />
+
+    </LinearLayout>
 
     <androidx.viewpager2.widget.ViewPager2
         android:id="@+id/viewPager"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1" />
+
+    <!-- Kept in sync with viewPager in both directions by MainActivity. Not drawn behind the
+         navigation bar (the window isn't edge-to-edge), so it always sits above it. -->
+    <com.google.android.material.bottomnavigation.BottomNavigationView
+        android:id="@+id/bottomNavigation"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:labelVisibilityMode="labeled"
+        app:menu="@menu/bottom_navigation" />
 
 </LinearLayout>

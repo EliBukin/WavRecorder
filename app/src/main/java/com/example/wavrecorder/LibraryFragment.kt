@@ -84,6 +84,9 @@ class LibraryFragment : Fragment() {
     // ---- Bulk selection/deletion ----
     internal var selectionMode = false
     internal val selectedUris = mutableSetOf<Uri>()
+    // How many recordings the list currently shows -- only to decide whether the header's Select
+    // action is offered at all (there's nothing to select in an empty library).
+    private var listedItemCount = 0
     // Guards against a second bulk-delete starting while one is already running -- deletion
     // always runs to completion on its own Thread regardless of the fragment's view lifecycle
     // (see performBulkDelete()'s doc, mirroring deleteRecording()'s existing rationale), so
@@ -210,6 +213,8 @@ class LibraryFragment : Fragment() {
 
         binding.selectionCancelButton.setOnClickListener { exitSelectionMode() }
         binding.selectionDeleteButton.setOnClickListener { confirmBulkDelete() }
+        binding.selectButton.setOnClickListener { enterSelectionMode() }
+        androidx.core.view.ViewCompat.setAccessibilityHeading(binding.libraryTitle, true)
 
         // Back/cancel exits selection mode without deleting anything, rather than navigating away
         // from this screen -- enabled only while actually selecting (see updateSelectionToolbar()).
@@ -284,7 +289,9 @@ class LibraryFragment : Fragment() {
             result.fold(
                 onSuccess = { items ->
                     adapter.submitList(items)
-                    binding.emptyText.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+                    listedItemCount = items.size
+                    binding.emptyState.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+                    updateSelectionToolbar()
                 },
                 onFailure = { e ->
                     // Deliberately leaves the previously-shown list (if any) in place rather
@@ -431,10 +438,18 @@ class LibraryFragment : Fragment() {
         }, "DeleteRecordingThread").start()
     }
 
-    internal fun enterSelectionMode(firstSelected: RecordingItem) {
+    internal fun enterSelectionMode(firstSelected: RecordingItem) = startSelection(firstSelected.uri)
+
+    /** The header's Select action: selection mode with nothing selected yet. Delete stays disabled
+     * until something is; deselecting the last selected row still exits the mode, as before. */
+    internal fun enterSelectionMode() {
+        if (!selectionMode) startSelection(null)
+    }
+
+    private fun startSelection(firstSelected: Uri?) {
         selectionMode = true
         selectedUris.clear()
-        selectedUris.add(firstSelected.uri)
+        firstSelected?.let { selectedUris.add(it) }
         updateSelectionToolbar()
         adapter.notifyDataSetChanged()
     }
@@ -460,14 +475,20 @@ class LibraryFragment : Fragment() {
         selectionBackCallback?.isEnabled = selectionMode
         if (_binding == null) return
         binding.selectionToolbar.visibility = if (selectionMode) View.VISIBLE else View.GONE
+        binding.libraryHeader.visibility = if (selectionMode) View.GONE else View.VISIBLE
+        binding.selectButton.visibility = if (listedItemCount > 0) View.VISIBLE else View.GONE
         if (selectionMode) {
-            binding.selectionCountText.text =
+            binding.selectionCountText.text = if (selectedUris.isEmpty()) {
+                getString(R.string.selection_none)
+            } else {
                 resources.getQuantityString(R.plurals.selection_count, selectedUris.size, selectedUris.size)
+            }
         }
         // Never disabled while merely a delete is pending confirmation -- only once the delete
         // itself has actually started, so the user can still cancel the whole selection right up
-        // until they confirm; see confirmBulkDelete()/performBulkDelete().
-        binding.selectionDeleteButton.isEnabled = !bulkDeleteInProgress
+        // until they confirm; see confirmBulkDelete()/performBulkDelete(). Also disabled while
+        // nothing is selected yet (selection entered from the header's Select action).
+        binding.selectionDeleteButton.isEnabled = !bulkDeleteInProgress && selectedUris.isNotEmpty()
         binding.selectionCancelButton.isEnabled = !bulkDeleteInProgress
     }
 

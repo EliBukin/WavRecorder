@@ -1,0 +1,27 @@
+<resources>
+    <!-- Spacing scale -->
+    <dimen name="space_xs">4dp</dimen>
+    <dimen name="space_sm">8dp</dimen>
+    <dimen name="space_md">12dp</dimen>
+    <dimen name="space_lg">16dp</dimen>
+    <dimen name="space_xl">20dp</dimen>
+    <dimen name="space_xxl">24dp</dimen>
+    <dimen name="screen_padding">16dp</dimen>
+
+    <!-- Shape: deliberately restrained radii -->
+    <dimen name="corner_card">12dp</dimen>
+    <dimen name="corner_button">12dp</dimen>
+    <dimen name="corner_badge">6dp</dimen>
+
+    <!-- Sizes -->
+    <dimen name="touch_target">48dp</dimen>
+    <dimen name="primary_action_height">56dp</dimen>
+    <dimen name="icon_container">40dp</dimen>
+    <dimen name="icon_small">20dp</dimen>
+    <dimen name="status_dot">8dp</dimen>
+    <dimen name="state_dot">10dp</dimen>
+    <dimen name="waveform_height">136dp</dimen>
+    <dimen name="empty_state_icon_container">72dp</dimen>
+    <dimen name="row_accent_width">4dp</dimen>
+    <dimen name="stroke_hairline">1dp</dimen>
+</resources>

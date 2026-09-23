@@ -100,7 +100,7 @@ class RecordFragmentStopButtonColorTest {
             buttonText = button.text.toString()
         }
 
-        assertEquals(app().getString(R.string.stop_recording), buttonText)
+        assertEquals(app().getString(R.string.record_action_stop), buttonText)
         assertEquals(
             "the record button must use the theme's own colorError once it represents Stop recording",
             errorColor, buttonColor
@@ -155,7 +155,7 @@ class RecordFragmentStopButtonColorTest {
             buttonText = button.text.toString()
         }
 
-        assertEquals(app().getString(R.string.start_recording), buttonText)
+        assertEquals(app().getString(R.string.record_action_start), buttonText)
         assertEquals(
             "the record button's background must be fully restored to its original (non-error) tint once idle again",
             idleColorBefore, buttonColorAfter

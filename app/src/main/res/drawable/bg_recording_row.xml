@@ -1,23 +1,23 @@
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Selected, while bulk-selection mode is active (see RecordingsAdapter/LibraryFragment) —
-         same accent color already used for the "currently active (playing)" left bar, at low
-         alpha, so selection reads as a clear but not overpowering highlight. -->
+    <!-- Selected, while bulk-selection mode is active (see RecordingsAdapter/LibraryFragment):
+         the accent container with an accent outline. The row's check box and its spoken
+         "Selected" state carry the same meaning without relying on this color. -->
     <item android:state_activated="true">
         <shape android:shape="rectangle">
-            <solid android:color="@color/library_selected_row_background" />
-            <corners android:radius="8dp" />
+            <solid android:color="?attr/colorPrimaryContainer" />
+            <corners android:radius="@dimen/corner_card" />
             <stroke
-                android:width="1dp"
-                android:color="@color/library_active_accent" />
+                android:width="@dimen/stroke_hairline"
+                android:color="?attr/colorPrimary" />
         </shape>
     </item>
     <item>
         <shape android:shape="rectangle">
             <solid android:color="?attr/colorSurface" />
-            <corners android:radius="8dp" />
+            <corners android:radius="@dimen/corner_card" />
             <stroke
-                android:width="1dp"
-                android:color="@color/library_row_stroke" />
+                android:width="@dimen/stroke_hairline"
+                android:color="?attr/colorOutlineVariant" />
         </shape>
     </item>
 </selector>

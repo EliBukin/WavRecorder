@@ -1,6 +1,9 @@
 <resources>
     <string name="app_name">bukin\'s wav recorder</string>
-    <string name="start_recording">Start Recording</string>
+    <!-- stop_recording, status_recording, status_recording_part, status_preparing and
+         status_finalizing are also the recording notification's own text/action label (see
+         RecordingService) - the Record screen's redesigned labels below are separate strings so
+         that notification stays exactly as it was. -->
     <string name="stop_recording">Stop Recording</string>
     <string name="status_idle">Ready to record</string>
     <string name="status_reconnecting">Reconnecting…</string>
@@ -37,12 +40,30 @@
     <string name="audio_focus_denied">Another app is using audio playback right now</string>
     <string name="more_options">More options</string>
 
+    <!-- App header -->
+    <string name="app_header_brand">Bukin\'s</string>
+    <string name="app_header_title">wav recorder</string>
+    <string name="app_header_format">WAV</string>
+
+    <!-- Record screen: the one primary action per state -->
+    <string name="record_action_start">Start recording</string>
+    <string name="record_action_stop">Stop &amp; save</string>
+
+    <!-- Record screen: recording details. Elapsed time itself is formatted in code (12:34, 1:02:03). -->
+    <string name="elapsed_time_description">Elapsed time %1$s</string>
+    <string name="session_details">Part\u00A0%1$d · new file every %2$d\u00A0min</string>
+    <string name="audio_format">%1$s · %2$d-bit · %3$s</string>
+    <string name="sample_rate_khz">%1$s kHz</string>
+    <string name="audio_channels_mono">Mono</string>
+    <string name="audio_channels_stereo">Stereo</string>
+
     <!-- Section captions on the Record screen -->
-    <string name="section_destination">Destination</string>
+    <string name="section_destination">Save to</string>
+    <string name="choose_folder_description">Change save folder</string>
     <string name="section_input_device">Input device</string>
     <string name="section_audio_level">Audio level</string>
-    <string name="section_status">Status</string>
-    <string name="section_split_duration">Start a new file every</string>
+    <string name="section_recording_settings">Recording settings</string>
+    <string name="section_split_duration">Split every</string>
 
     <!-- Split-duration choices: long recordings continue seamlessly in a new part file. -->
     <string name="split_duration_30">30 min</string>
@@ -65,7 +86,13 @@
     <string name="mic_status_verified_external_title">Verified active input</string>
     <string name="mic_status_verified_builtin_title">Using phone microphone</string>
     <string name="mic_status_unverified_title">Input in use (unverified)</string>
-    <string name="mic_status_active_subtitle">%1$s</string>
+
+    <!-- Input-device status badge: always shown next to the colored dot, so the state never
+         depends on color alone. -->
+    <string name="mic_badge_detected">Detected</string>
+    <string name="mic_badge_verified">Verified</string>
+    <string name="mic_badge_phone">Phone mic</string>
+    <string name="mic_badge_unverified">Not verified</string>
 
     <string name="no_external_mic_confirm_message">No external microphone was detected. Continue using the phone microphone?</string>
     <string name="no_external_mic_confirm_positive">Continue</string>
@@ -121,11 +148,26 @@
     <string name="mic_test_route_changed_error">Microphone input changed unexpectedly. Test stopped.</string>
     <string name="mic_test_route_mismatch_error">An external microphone was expected, but the test could not confirm it\'s the one being used. Test stopped.</string>
     <string name="mic_test_error">Microphone test error: %1$s</string>
-    <string name="mic_test_status_active">Testing microphone — speak or make a sound and watch the meter</string>
+    <string name="mic_test_status_active">Testing microphone</string>
+    <string name="mic_test_nothing_saved">Nothing is being saved. Speak or make a sound and watch the level.</string>
     <string name="mic_test_status_waiting">Waiting for signal…</string>
     <string name="mic_test_status_signal_detected">Signal detected</string>
 
+    <!-- Library screen -->
+    <string name="library_title">Recordings</string>
+    <string name="library_select">Select</string>
+    <string name="library_select_description">Select recordings</string>
+    <string name="empty_recordings_hint">Finished recordings will appear here.</string>
+    <string name="recording_meta">%1$s · %2$s</string>
+    <string name="date_group_today">Today</string>
+    <string name="date_group_yesterday">Yesterday</string>
+    <string name="date_group_other">Other recordings</string>
+    <string name="playback_state_playing">Playing</string>
+    <string name="playback_state_paused">Paused</string>
+    <string name="playback_state_preparing">Preparing</string>
+
     <!-- Bulk selection/deletion in the Library -->
+    <string name="selection_none">Tap recordings to select</string>
     <string name="selection_mode_cancel">Cancel selection</string>
     <string name="bulk_delete_action">Delete selected</string>
     <string name="selection_checkbox_description">Select recording</string>

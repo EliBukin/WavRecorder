@@ -1,61 +1,105 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
     tools:context=".LibraryFragment">
 
-    <!-- Bulk-selection toolbar: gone (zero height) outside selection mode, so it never overlaps
-         the list below it — see LibraryFragment.enterSelectionMode/exitSelectionMode. -->
-    <LinearLayout
-        android:id="@+id/selectionToolbar"
+    <!-- Header: the normal title row and the bulk-selection toolbar occupy the same slot, exactly
+         one of them visible at a time (see LibraryFragment.updateSelectionToolbar), so neither
+         ever overlaps the list below. -->
+    <FrameLayout
         android:layout_width="match_parent"
-        android:layout_height="56dp"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:background="?attr/colorSurface"
-        android:elevation="4dp"
-        android:visibility="gone"
-        tools:visibility="visible">
+        android:layout_height="wrap_content">
 
-        <ImageButton
-            android:id="@+id/selectionCancelButton"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_marginStart="4dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:padding="12dp"
-            android:scaleType="fitCenter"
-            android:src="@drawable/ic_close"
-            android:contentDescription="@string/selection_mode_cancel" />
-
-        <!-- accessibilityLiveRegion=polite: an accessibility service announces the updated count
-             on its own the moment a tap changes it, rather than only when the user happens to
-             manually move focus back to this TextView — see LibraryFragment.updateSelectionToolbar. -->
-        <TextView
-            android:id="@+id/selectionCountText"
-            android:layout_width="0dp"
+        <LinearLayout
+            android:id="@+id/libraryHeader"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:layout_marginStart="8dp"
-            android:textSize="16sp"
-            android:textStyle="bold"
-            android:accessibilityLiveRegion="polite"
-            tools:text="3 selected" />
+            android:gravity="center_vertical"
+            android:minHeight="56dp"
+            android:orientation="horizontal"
+            android:paddingStart="@dimen/space_xl"
+            android:paddingEnd="@dimen/space_sm">
 
-        <ImageButton
-            android:id="@+id/selectionDeleteButton"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_marginEnd="4dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:padding="12dp"
-            android:scaleType="fitCenter"
-            android:src="@drawable/ic_delete"
-            android:contentDescription="@string/bulk_delete_action" />
+            <TextView
+                android:id="@+id/libraryTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/library_title"
+                android:textAppearance="?attr/textAppearanceTitleLarge"
+                android:textColor="?attr/colorOnSurface" />
 
-    </LinearLayout>
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/selectButton"
+                style="@style/Widget.WavRecorder.Button.Text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="@string/library_select_description"
+                android:text="@string/library_select"
+                android:visibility="gone"
+                tools:visibility="visible" />
+
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/selectionToolbar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?attr/colorSecondaryContainer"
+            android:gravity="center_vertical"
+            android:minHeight="56dp"
+            android:orientation="horizontal"
+            android:paddingStart="@dimen/space_xs"
+            android:paddingEnd="@dimen/space_sm"
+            android:visibility="gone"
+            tools:visibility="visible">
+
+            <ImageButton
+                android:id="@+id/selectionCancelButton"
+                android:layout_width="@dimen/touch_target"
+                android:layout_height="@dimen/touch_target"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/selection_mode_cancel"
+                android:padding="12dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_close"
+                app:tint="?attr/colorOnSecondaryContainer" />
+
+            <!-- accessibilityLiveRegion=polite: an accessibility service announces the updated count
+                 on its own the moment a tap changes it, rather than only when the user happens to
+                 manually move focus back to this TextView — see LibraryFragment.updateSelectionToolbar. -->
+            <TextView
+                android:id="@+id/selectionCountText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/space_xs"
+                android:layout_weight="1"
+                android:accessibilityLiveRegion="polite"
+                android:ellipsize="end"
+                android:maxLines="2"
+                android:textAppearance="?attr/textAppearanceTitleMedium"
+                android:textColor="?attr/colorOnSecondaryContainer"
+                tools:text="3 selected" />
+
+            <!-- Labelled (not icon-only) and error-colored: destructive, but never by color alone. -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/selectionDeleteButton"
+                style="@style/Widget.WavRecorder.Button.Text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="@string/bulk_delete_action"
+                android:text="@string/delete_button"
+                android:textColor="?attr/colorError"
+                app:icon="@drawable/ic_delete"
+                app:iconTint="?attr/colorError" />
+
+        </LinearLayout>
+
+    </FrameLayout>
 
     <FrameLayout
         android:layout_width="match_parent"
@@ -67,16 +111,60 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent"
             android:clipToPadding="false"
-            android:padding="8dp" />
+            android:paddingStart="@dimen/screen_padding"
+            android:paddingEnd="@dimen/screen_padding"
+            android:paddingBottom="@dimen/space_lg" />
 
-        <TextView
-            android:id="@+id/emptyText"
-            android:layout_width="wrap_content"
+        <!-- Empty state: an icon, a title and one line of explanation - no fake data, no action. -->
+        <LinearLayout
+            android:id="@+id/emptyState"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_gravity="center"
-            android:text="@string/empty_recordings"
-            android:textSize="16sp"
-            android:visibility="gone" />
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            android:padding="@dimen/space_xxl"
+            android:visibility="gone"
+            tools:visibility="visible">
+
+            <FrameLayout
+                android:layout_width="@dimen/empty_state_icon_container"
+                android:layout_height="@dimen/empty_state_icon_container"
+                android:background="@drawable/bg_icon_circle"
+                android:importantForAccessibility="noHideDescendants">
+
+                <ImageView
+                    android:id="@+id/emptyIcon"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:layout_gravity="center"
+                    android:src="@drawable/ic_library"
+                    app:tint="?attr/colorOnSecondaryContainer"
+                    tools:ignore="ContentDescription" />
+
+            </FrameLayout>
+
+            <TextView
+                android:id="@+id/emptyText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/space_lg"
+                android:gravity="center"
+                android:text="@string/empty_recordings"
+                android:textAppearance="?attr/textAppearanceTitleMedium"
+                android:textColor="?attr/colorOnSurface" />
+
+            <TextView
+                android:id="@+id/emptyHint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="@dimen/space_xs"
+                android:gravity="center"
+                android:maxWidth="280dp"
+                android:text="@string/empty_recordings_hint"
+                android:textAppearance="@style/TextAppearance.WavRecorder.Secondary" />
+
+        </LinearLayout>
 
     </FrameLayout>
 

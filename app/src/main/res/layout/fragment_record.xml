@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Ordered around the user's questions, top to bottom: which microphone, what's happening now
+     (and is audio arriving), then the secondary setup (split length, destination), with the one
+     primary action pinned below. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
@@ -11,246 +14,409 @@
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:fillViewport="true"
-        android:clipToPadding="false">
+        android:clipToPadding="false"
+        android:fillViewport="true">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:padding="20dp">
+            android:paddingStart="@dimen/screen_padding"
+            android:paddingTop="@dimen/space_sm"
+            android:paddingEnd="@dimen/screen_padding"
+            android:paddingBottom="@dimen/space_lg">
 
-            <!-- Destination -->
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/section_destination"
-                android:textAppearance="?attr/textAppearanceCaption"
-                android:textColor="@color/text_secondary" />
-
-            <LinearLayout
+            <!-- 1. Input device. Focusable as one unit so TalkBack reads the caption, device,
+                 status line and badge together. -->
+            <com.google.android.material.card.MaterialCardView
+                android:id="@+id/micCard"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:orientation="horizontal"
-                android:gravity="center_vertical">
-
-                <TextView
-                    android:id="@+id/destinationLabel"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:layout_marginEnd="8dp"
-                    android:text="@string/destination_label"
-                    android:textSize="16sp"
-                    android:maxLines="1"
-                    android:ellipsize="middle" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/chooseFolderButton"
-                    style="@style/Widget.MaterialComponents.Button.TextButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:minWidth="48dp"
-                    android:minHeight="48dp"
-                    android:text="@string/choose_folder" />
-
-            </LinearLayout>
-
-            <!-- Split duration: how long each file of a continuous recording runs before it
-                 continues in a new part file. Persisted; applies from the next recording. -->
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
-                android:text="@string/section_split_duration"
-                android:textAppearance="?attr/textAppearanceCaption"
-                android:textColor="@color/text_secondary" />
-
-            <com.google.android.material.button.MaterialButtonToggleGroup
-                android:id="@+id/splitDurationToggle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                app:singleSelection="true"
-                app:selectionRequired="true">
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/split30Button"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:minHeight="48dp"
-                    android:text="@string/split_duration_30"
-                    android:contentDescription="@string/split_duration_30_description" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/split45Button"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:minHeight="48dp"
-                    android:text="@string/split_duration_45"
-                    android:contentDescription="@string/split_duration_45_description" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/split60Button"
-                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:minHeight="48dp"
-                    android:text="@string/split_duration_60"
-                    android:contentDescription="@string/split_duration_60_description" />
-
-            </com.google.android.material.button.MaterialButtonToggleGroup>
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="@string/split_duration_hint"
-                android:textSize="12sp"
-                android:textColor="@color/text_secondary" />
-
-            <!-- Input device -->
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
-                android:text="@string/section_input_device"
-                android:textAppearance="?attr/textAppearanceCaption"
-                android:textColor="@color/text_secondary" />
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:orientation="horizontal">
-
-                <View
-                    android:id="@+id/micStatusDot"
-                    android:layout_width="10dp"
-                    android:layout_height="10dp"
-                    android:layout_marginTop="5dp"
-                    android:layout_marginEnd="10dp"
-                    android:background="@drawable/shape_status_dot"
-                    android:importantForAccessibility="no" />
+                android:focusable="true">
 
                 <LinearLayout
-                    android:layout_width="0dp"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:orientation="vertical">
+                    android:baselineAligned="false"
+                    android:orientation="horizontal"
+                    android:padding="@dimen/space_lg">
 
-                    <TextView
-                        android:id="@+id/micStatusTitle"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:textSize="15sp"
-                        android:textStyle="bold"
-                        android:maxLines="2"
-                        android:ellipsize="end" />
+                    <FrameLayout
+                        android:layout_width="@dimen/icon_container"
+                        android:layout_height="@dimen/icon_container"
+                        android:background="@drawable/bg_icon_circle"
+                        android:importantForAccessibility="noHideDescendants">
 
-                    <TextView
-                        android:id="@+id/micStatusSubtitle"
-                        android:layout_width="match_parent"
+                        <ImageView
+                            android:layout_width="@dimen/icon_small"
+                            android:layout_height="@dimen/icon_small"
+                            android:layout_gravity="center"
+                            android:src="@drawable/ic_mic"
+                            app:tint="?attr/colorOnSecondaryContainer"
+                            tools:ignore="ContentDescription" />
+
+                    </FrameLayout>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:layout_marginTop="2dp"
-                        android:textSize="12sp"
-                        android:textColor="@color/text_secondary"
-                        android:maxLines="2"
-                        android:ellipsize="end" />
+                        android:layout_marginStart="@dimen/space_md"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/section_input_device"
+                            android:textAppearance="@style/TextAppearance.WavRecorder.Overline" />
+
+                        <TextView
+                            android:id="@+id/micStatusTitle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:accessibilityLiveRegion="polite"
+                            android:ellipsize="end"
+                            android:maxLines="2"
+                            android:textAppearance="?attr/textAppearanceTitleMedium"
+                            android:textColor="?attr/colorOnSurface"
+                            tools:text="Insta360 Mic Air connected" />
+
+                        <TextView
+                            android:id="@+id/micStatusSubtitle"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:ellipsize="end"
+                            android:maxLines="3"
+                            android:textAppearance="@style/TextAppearance.WavRecorder.Secondary"
+                            tools:text="Preferred input — verified after recording starts" />
+
+                        <!-- Status badge: a colored dot plus a word, so the state never depends on
+                             color alone. -->
+                        <LinearLayout
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="@dimen/space_sm"
+                            android:background="@drawable/bg_status_badge"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal"
+                            android:paddingStart="@dimen/space_sm"
+                            android:paddingTop="2dp"
+                            android:paddingEnd="@dimen/space_sm"
+                            android:paddingBottom="2dp">
+
+                            <View
+                                android:id="@+id/micStatusDot"
+                                android:layout_width="@dimen/status_dot"
+                                android:layout_height="@dimen/status_dot"
+                                android:background="@drawable/shape_status_dot"
+                                android:importantForAccessibility="no" />
+
+                            <TextView
+                                android:id="@+id/micStatusBadge"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="6dp"
+                                android:maxLines="1"
+                                android:textAppearance="?attr/textAppearanceLabelMedium"
+                                android:textColor="?attr/colorOnSurface"
+                                tools:text="Detected" />
+
+                        </LinearLayout>
+
+                    </LinearLayout>
 
                 </LinearLayout>
 
-            </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
 
-            <!-- Live microphone test: verifies the selected input is receiving sound without
-                 saving anything — shares the Audio level section below with real recording's
-                 own amplitude display, since the two are mutually exclusive (see RecordFragment). -->
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/testMicButton"
-                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            <!-- 2 + 3. The central recording area: current state, and (while testing or
+                 recording) whether audio is arriving. -->
+            <com.google.android.material.card.MaterialCardView
+                android:id="@+id/recordingPanel"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                android:minHeight="48dp"
-                android:text="@string/test_microphone"
-                app:icon="@drawable/ic_mic"
-                app:iconGravity="textStart"
-                app:iconPadding="8dp"
-                app:cornerRadius="16dp" />
+                android:layout_marginTop="@dimen/space_md">
 
-            <!-- Audio level: hidden entirely while idle, since a flat idle waveform carries no
-                 information and would just be empty space (see RecordFragment). -->
-            <LinearLayout
-                android:id="@+id/audioLevelSection"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
-                android:orientation="vertical"
-                android:visibility="gone"
-                tools:visibility="visible">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/section_audio_level"
-                    android:textAppearance="?attr/textAppearanceCaption"
-                    android:textColor="@color/text_secondary" />
-
-                <com.example.wavrecorder.WaveformView
-                    android:id="@+id/waveformView"
+                <LinearLayout
                     android:layout_width="match_parent"
-                    android:layout_height="120dp"
-                    android:layout_marginTop="8dp" />
+                    android:layout_height="wrap_content"
+                    android:animateLayoutChanges="true"
+                    android:orientation="vertical"
+                    android:padding="@dimen/space_xl">
 
-            </LinearLayout>
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
 
-            <!-- Status / last recording -->
+                        <!-- Decorative: statusText right beside it always says the same thing. -->
+                        <View
+                            android:id="@+id/recordingStateDot"
+                            android:layout_width="@dimen/state_dot"
+                            android:layout_height="@dimen/state_dot"
+                            android:background="@drawable/shape_status_dot"
+                            android:importantForAccessibility="no" />
+
+                        <TextView
+                            android:id="@+id/statusText"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="@dimen/space_sm"
+                            android:layout_weight="1"
+                            android:accessibilityLiveRegion="polite"
+                            android:text="@string/status_idle"
+                            android:textAppearance="?attr/textAppearanceTitleLarge"
+                            android:textColor="?attr/colorOnSurface" />
+
+                    </LinearLayout>
+
+                    <TextView
+                        android:id="@+id/statusDetailText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_xs"
+                        android:textAppearance="@style/TextAppearance.WavRecorder.Secondary"
+                        android:visibility="gone"
+                        tools:text="Jul 27, 2026 · 1:31 AM · 13 seconds"
+                        tools:visibility="visible" />
+
+                    <!-- Recording only: elapsed time, part/split, and the capture format. -->
+                    <TextView
+                        android:id="@+id/elapsedText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_md"
+                        android:textAppearance="@style/TextAppearance.WavRecorder.Elapsed"
+                        android:visibility="gone"
+                        tools:text="12:34"
+                        tools:visibility="visible" />
+
+                    <TextView
+                        android:id="@+id/sessionDetailsText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_xs"
+                        android:textAppearance="?attr/textAppearanceBodyLarge"
+                        android:textColor="?attr/colorOnSurface"
+                        android:visibility="gone"
+                        tools:text="Part 1 · new file every 60 min"
+                        tools:visibility="visible" />
+
+                    <TextView
+                        android:id="@+id/audioFormatText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:textAppearance="@style/TextAppearance.WavRecorder.Secondary"
+                        android:visibility="gone"
+                        tools:text="48 kHz · 16-bit · Mono"
+                        tools:visibility="visible" />
+
+                    <!-- Audio level: hidden entirely while idle, since a flat idle waveform carries
+                         no information. Shared by real recording and the microphone test, which
+                         are mutually exclusive (see RecordFragment). -->
+                    <LinearLayout
+                        android:id="@+id/audioLevelSection"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_lg"
+                        android:orientation="vertical"
+                        android:visibility="gone"
+                        tools:visibility="visible">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="@string/section_audio_level"
+                            android:textAppearance="@style/TextAppearance.WavRecorder.Overline" />
+
+                        <com.example.wavrecorder.WaveformView
+                            android:id="@+id/waveformView"
+                            android:layout_width="match_parent"
+                            android:layout_height="@dimen/waveform_height"
+                            android:layout_marginTop="@dimen/space_sm"
+                            android:background="@drawable/bg_waveform"
+                            android:importantForAccessibility="no" />
+
+                    </LinearLayout>
+
+                    <!-- Microphone test only: nothing is captured or saved. -->
+                    <TextView
+                        android:id="@+id/micTestNoticeText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_md"
+                        android:drawablePadding="@dimen/space_sm"
+                        android:gravity="center_vertical"
+                        android:text="@string/mic_test_nothing_saved"
+                        android:textAppearance="?attr/textAppearanceBodyMedium"
+                        android:textColor="?attr/colorOnSurface"
+                        android:visibility="gone"
+                        app:drawableStartCompat="@drawable/ic_info"
+                        app:drawableTint="?attr/colorOnSurfaceVariant"
+                        tools:visibility="visible" />
+
+                    <!-- Secondary action; hidden while recording or finalizing, when it can't be
+                         used anyway. -->
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/testMicButton"
+                        style="@style/Widget.WavRecorder.Button.Secondary"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_lg"
+                        android:text="@string/test_microphone"
+                        app:icon="@drawable/ic_mic" />
+
+                </LinearLayout>
+
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- 4 + 5. Secondary setup: when a new part file begins, and where files go. -->
             <TextView
+                android:id="@+id/settingsHeading"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
-                android:text="@string/section_status"
-                android:textAppearance="?attr/textAppearanceCaption"
-                android:textColor="@color/text_secondary" />
+                android:layout_marginStart="@dimen/space_xs"
+                android:layout_marginTop="@dimen/space_xxl"
+                android:text="@string/section_recording_settings"
+                android:textAppearance="@style/TextAppearance.WavRecorder.Overline" />
 
-            <TextView
-                android:id="@+id/statusText"
+            <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:text="@string/status_idle"
-                android:textSize="17sp" />
+                android:layout_marginTop="@dimen/space_sm">
 
-            <TextView
-                android:id="@+id/statusDetailText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:textSize="13sp"
-                android:textColor="@color/text_secondary"
-                android:visibility="gone"
-                tools:visibility="visible"
-                tools:text="Jul 27, 2026 · 1:31 AM · 13 seconds" />
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="@dimen/space_lg">
+
+                    <!-- Split duration: persisted; a change applies from the next recording only. -->
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/section_split_duration"
+                        android:textAppearance="?attr/textAppearanceTitleSmall"
+                        android:textColor="?attr/colorOnSurface" />
+
+                    <com.google.android.material.button.MaterialButtonToggleGroup
+                        android:id="@+id/splitDurationToggle"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_sm"
+                        app:selectionRequired="true"
+                        app:singleSelection="true">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/split30Button"
+                            style="@style/Widget.WavRecorder.Button.Segment"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:contentDescription="@string/split_duration_30_description"
+                            android:text="@string/split_duration_30" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/split45Button"
+                            style="@style/Widget.WavRecorder.Button.Segment"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:contentDescription="@string/split_duration_45_description"
+                            android:text="@string/split_duration_45" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/split60Button"
+                            style="@style/Widget.WavRecorder.Button.Segment"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:contentDescription="@string/split_duration_60_description"
+                            android:text="@string/split_duration_60" />
+
+                    </com.google.android.material.button.MaterialButtonToggleGroup>
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_sm"
+                        android:text="@string/split_duration_hint"
+                        android:textAppearance="?attr/textAppearanceBodySmall"
+                        android:textColor="?attr/colorOnSurfaceVariant" />
+
+                    <com.google.android.material.divider.MaterialDivider
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="@dimen/space_lg"
+                        android:layout_marginBottom="@dimen/space_md" />
+
+                    <!-- Destination (unchanged SAF folder picker behind "Change"). -->
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/section_destination"
+                        android:textAppearance="?attr/textAppearanceTitleSmall"
+                        android:textColor="?attr/colorOnSurface" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+
+                        <ImageView
+                            android:layout_width="@dimen/icon_small"
+                            android:layout_height="@dimen/icon_small"
+                            android:importantForAccessibility="no"
+                            android:src="@drawable/ic_folder"
+                            app:tint="?attr/colorOnSurfaceVariant" />
+
+                        <TextView
+                            android:id="@+id/destinationLabel"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="@dimen/space_sm"
+                            android:layout_marginEnd="@dimen/space_sm"
+                            android:layout_weight="1"
+                            android:ellipsize="middle"
+                            android:maxLines="1"
+                            android:text="@string/destination_label"
+                            android:textAppearance="?attr/textAppearanceBodyLarge"
+                            android:textColor="?attr/colorOnSurface" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/chooseFolderButton"
+                            style="@style/Widget.WavRecorder.Button.Text"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:contentDescription="@string/choose_folder_description"
+                            android:text="@string/choose_folder" />
+
+                    </LinearLayout>
+
+                </LinearLayout>
+
+            </com.google.android.material.card.MaterialCardView>
 
         </LinearLayout>
 
     </ScrollView>
 
+    <!-- 6. The one primary action for the current state: Start recording / Stop & save. -->
     <com.google.android.material.button.MaterialButton
         android:id="@+id/recordButton"
+        style="@style/Widget.WavRecorder.Button.Primary"
         android:layout_width="match_parent"
-        android:layout_height="56dp"
-        android:layout_margin="16dp"
-        android:text="@string/start_recording"
-        app:icon="@drawable/ic_mic"
-        app:iconGravity="textStart"
-        app:iconPadding="8dp"
-        app:cornerRadius="16dp" />
+        android:layout_height="wrap_content"
+        android:layout_marginStart="@dimen/screen_padding"
+        android:layout_marginTop="@dimen/space_sm"
+        android:layout_marginEnd="@dimen/screen_padding"
+        android:layout_marginBottom="@dimen/space_md"
+        android:text="@string/record_action_start"
+        app:icon="@drawable/ic_mic" />
 
 </LinearLayout>

@@ -1,6 +1,7 @@
 package com.example.wavrecorder
 
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 /**
@@ -27,5 +28,17 @@ object RecordingNameFormatter {
         val display = DISPLAY_FORMAT.format(date)
         val part = partPart.toIntOrNull() ?: 1
         return if (part > 1) "$display (Part $part)" else display
+    }
+
+    /** When the recording [fileName] belongs to was started, from the timestamp the app writes
+     * into every name; null for anything that doesn't follow that pattern. */
+    fun startedAt(fileName: String): Date? {
+        val match = NAME_PATTERN.matchEntire(fileName) ?: return null
+        val (datePart, timePart) = match.destructured
+        return try {
+            PARSE_FORMAT.parse("$datePart $timePart")
+        } catch (e: Exception) {
+            null
+        }
     }
 }

@@ -107,6 +107,14 @@ class RecordFragmentMicStatusTest {
         return text!!
     }
 
+    private fun badgeText(scenario: androidx.fragment.app.testing.FragmentScenario<RecordFragment>): String {
+        var text: String? = null
+        scenario.onFragment { fragment ->
+            text = fragment.view!!.findViewById<TextView>(R.id.micStatusBadge).text.toString()
+        }
+        return text!!
+    }
+
     @Test
     fun `idle status shows 'no external microphone detected' when nothing is attached`() {
         bindRealService()
@@ -115,6 +123,8 @@ class RecordFragmentMicStatusTest {
         assertEquals(app().getString(R.string.mic_status_none_title), titleText(scenario))
         assertEquals(app().getString(R.string.mic_status_none_subtitle), subtitleText(scenario))
         assertEquals(ContextColor.of(app(), R.color.status_warning_orange), dotColor(scenario))
+        assertEquals("the warning state must be named, not conveyed by the orange dot alone",
+            app().getString(R.string.mic_badge_phone), badgeText(scenario))
     }
 
     @Test
@@ -156,7 +166,7 @@ class RecordFragmentMicStatusTest {
             titleText(scenario)
         )
         assertEquals(app().getString(R.string.mic_status_connected_subtitle), subtitleText(scenario))
-        assertEquals(ContextColor.of(app(), R.color.status_preferred_purple), dotColor(scenario))
+        assertEquals(ContextColor.of(app(), R.color.status_detected_blue), dotColor(scenario))
     }
 
     @Test
@@ -274,28 +284,31 @@ class RecordFragmentMicStatusTest {
 
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
 
-        // Before recording: a "connected/preferred" claim only, purple dot.
+        // Before recording: a "connected/preferred" claim only, blue dot, "Detected" badge.
         assertEquals(app().getString(R.string.mic_status_connected_title, GENERIC_USB_DEVICE_LABEL), titleText(scenario))
-        assertEquals(ContextColor.of(app(), R.color.status_preferred_purple), dotColor(scenario))
+        assertEquals(ContextColor.of(app(), R.color.status_detected_blue), dotColor(scenario))
+        assertEquals(app().getString(R.string.mic_badge_detected), badgeText(scenario))
 
         scenario.onFragment { fragment ->
             fragment.view!!.findViewById<View>(R.id.recordButton).performClick()
         }
         val deadline = System.currentTimeMillis() + 2000
-        while (titleText(scenario) != app().getString(R.string.mic_status_verified_external_title) &&
+        while (subtitleText(scenario) != app().getString(R.string.mic_status_verified_external_title) &&
             System.currentTimeMillis() < deadline
         ) {
             Thread.sleep(5)
             shadowOf(Looper.getMainLooper()).idle()
         }
 
-        // After recording starts: a confirmed claim from AudioRecord.getRoutedDevice() itself,
-        // green dot, distinct wording ("verified active", never "connected/preferred").
-        assertEquals("expected the verified-active title once recording actually starts",
-            app().getString(R.string.mic_status_verified_external_title), titleText(scenario))
-        assertEquals(app().getString(R.string.mic_status_active_subtitle, "Insta360 Mic Air"),
-            subtitleText(scenario))
+        // After recording starts: a confirmed claim from AudioRecord.getRoutedDevice() itself --
+        // the verified device's own name as the title, distinct wording ("verified active", never
+        // "connected/preferred") as the status line, green dot and a "Verified" badge.
+        assertEquals("expected the verified device's name once recording actually starts",
+            "Insta360 Mic Air", titleText(scenario))
+        assertEquals("expected the verified-active status line once recording actually starts",
+            app().getString(R.string.mic_status_verified_external_title), subtitleText(scenario))
         assertEquals(ContextColor.of(app(), R.color.status_verified_green), dotColor(scenario))
+        assertEquals(app().getString(R.string.mic_badge_verified), badgeText(scenario))
 
         blockForever.countDown() // release the blocked background thread so it doesn't linger past the test
     }
@@ -397,7 +410,9 @@ class RecordFragmentMicStatusTest {
 
         assertTrue("expected recording to continue on the phone mic once the user explicitly " +
             "accepted it", service.isRecording)
-        assertEquals(app().getString(R.string.mic_status_verified_builtin_title), titleText(scenario))
+        assertEquals("Phone microphone", titleText(scenario))
+        assertEquals(app().getString(R.string.mic_status_verified_builtin_title), subtitleText(scenario))
+        assertEquals(app().getString(R.string.mic_badge_phone), badgeText(scenario))
 
         latestBlockLatch[0]?.countDown()
     }

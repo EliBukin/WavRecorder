@@ -1,27 +1,42 @@
 <resources>
-    <color name="purple_500">#FF6200EE</color>
-    <color name="purple_700">#FF3700B3</color>
-    <color name="teal_200">#FF03DAC5</color>
-    <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
+    <!-- "Clean" palette: a calm steel-blue accent on soft, cool neutrals. Every color here is
+         redefined for the dark theme in values-night/colors.xml, and layouts/code reach them
+         through theme attributes (Theme.WavRecorder) wherever one exists, so nothing visible is
+         tied to a light-only value. Semantic colors are reserved for their meaning: green only
+         for a verified/healthy state, orange only for warnings, red only for recording, stop,
+         error and destructive actions. All text pairings meet WCAG AA (4.5:1) in both themes;
+         see ThemeResourcesTest. -->
+    <color name="wr_background">#FFF3F5F8</color>
+    <color name="wr_surface">#FFFFFFFF</color>
+    <color name="wr_surface_container">#FFEAEEF3</color>
+    <color name="wr_surface_container_high">#FFE1E6ED</color>
+    <color name="wr_on_surface">#FF1A2530</color>
+    <color name="wr_on_surface_variant">#FF526070</color>
+    <color name="wr_outline">#FF8593A3</color>
+    <color name="wr_outline_variant">#FFD6DDE5</color>
 
-    <!-- Input-status indicator dot: green once AudioRecord.getRoutedDevice() has actually
-         verified an external input during recording; purple for "connected/preferred" before
-         recording starts (a claim about AudioManager's device list only); orange when no
-         external input is detected at all, whether idle or actually verified as the phone mic. -->
-    <color name="status_verified_green">#2E7D32</color>
-    <color name="status_preferred_purple">#7C4DFF</color>
-    <color name="status_warning_orange">#EF6C00</color>
+    <color name="wr_primary">#FF2D65A0</color>
+    <color name="wr_on_primary">#FFFFFFFF</color>
+    <color name="wr_primary_container">#FFDCE7F5</color>
+    <color name="wr_on_primary_container">#FF0E3157</color>
+    <color name="wr_secondary">#FF4F6275</color>
+    <color name="wr_on_secondary">#FFFFFFFF</color>
+    <color name="wr_secondary_container">#FFE0E7EF</color>
+    <color name="wr_on_secondary_container">#FF1B2A38</color>
 
-    <color name="text_secondary">#8A000000</color>
+    <color name="wr_record">#FFC62828</color>
+    <color name="wr_on_record">#FFFFFFFF</color>
+    <color name="wr_record_container">#FFFBE4E1</color>
+    <color name="wr_on_record_container">#FF7A1212</color>
 
-    <!-- Library row: subtle left accent marking the currently active (playing/paused/preparing)
-         recording, reusing the same purple used for "preferred" elsewhere for visual consistency. -->
-    <color name="library_active_accent">#7C4DFF</color>
-    <color name="library_row_stroke">#1F000000</color>
-
-    <!-- Bulk-selection: a row's background while selected, at low alpha over the same
-         library_active_accent purple used for the "currently playing" accent bar and selection
-         border, for visual consistency between the two "this row is special" states. -->
-    <color name="library_selected_row_background">#1F7C4DFF</color>
+    <!-- Input-status indicator: green once AudioRecord.getRoutedDevice() has actually verified an
+         external input during recording; blue for "detected/preferred" before recording starts
+         (a claim about AudioManager's device list only); orange when no external input is
+         detected at all, whether idle or actually verified as the phone mic. Always paired with a
+         text badge (see MicStatusPresenter) so the state never relies on color alone. -->
+    <color name="status_verified_green">#FF2E7D32</color>
+    <color name="status_detected_blue">@color/wr_primary</color>
+    <color name="status_warning_orange">#FFB25000</color>
+    <color name="status_recording_red">@color/wr_record</color>
+    <color name="status_idle_gray">@color/wr_outline</color>
 </resources>

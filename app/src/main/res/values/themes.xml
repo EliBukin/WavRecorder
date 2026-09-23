@@ -1,7 +1,50 @@
-<resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.WavRecorder" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="colorPrimary">@color/purple_500</item>
-        <item name="colorPrimaryDark">@color/purple_700</item>
-        <item name="colorAccent">@color/teal_200</item>
+<resources>
+    <!-- Material 3 (already part of the existing com.google.android.material dependency) with the
+         app's own "Clean" palette - no dynamic color, so the app looks the same on every device.
+         DayNight: values-night/colors.xml supplies the dark values for every role below. -->
+    <style name="Base.Theme.WavRecorder" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/wr_primary</item>
+        <item name="colorOnPrimary">@color/wr_on_primary</item>
+        <item name="colorPrimaryContainer">@color/wr_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/wr_on_primary_container</item>
+        <item name="colorSecondary">@color/wr_secondary</item>
+        <item name="colorOnSecondary">@color/wr_on_secondary</item>
+        <item name="colorSecondaryContainer">@color/wr_secondary_container</item>
+        <item name="colorOnSecondaryContainer">@color/wr_on_secondary_container</item>
+        <item name="colorTertiary">@color/wr_secondary</item>
+        <item name="colorOnTertiary">@color/wr_on_secondary</item>
+        <item name="colorError">@color/wr_record</item>
+        <item name="colorOnError">@color/wr_on_record</item>
+        <item name="colorErrorContainer">@color/wr_record_container</item>
+        <item name="colorOnErrorContainer">@color/wr_on_record_container</item>
+
+        <item name="android:colorBackground">@color/wr_background</item>
+        <item name="colorOnBackground">@color/wr_on_surface</item>
+        <item name="colorSurface">@color/wr_surface</item>
+        <item name="colorOnSurface">@color/wr_on_surface</item>
+        <item name="colorSurfaceVariant">@color/wr_surface_container_high</item>
+        <item name="colorOnSurfaceVariant">@color/wr_on_surface_variant</item>
+        <item name="colorSurfaceContainerLowest">@color/wr_surface</item>
+        <item name="colorSurfaceContainerLow">@color/wr_surface</item>
+        <item name="colorSurfaceContainer">@color/wr_surface_container</item>
+        <item name="colorSurfaceContainerHigh">@color/wr_surface_container_high</item>
+        <item name="colorSurfaceContainerHighest">@color/wr_surface_container_high</item>
+        <item name="colorOutline">@color/wr_outline</item>
+        <item name="colorOutlineVariant">@color/wr_outline_variant</item>
+        <item name="android:textColorPrimary">@color/wr_on_surface</item>
+        <item name="android:textColorSecondary">@color/wr_on_surface_variant</item>
+
+        <!-- System bars match the theme: the status bar blends into the app header, the
+             navigation bar into the bottom navigation. Icons flip between dark and light with
+             the theme (wr_light_system_bars; the navigation-bar half lives in values-v27). The
+             window is not drawn edge-to-edge, so the content is always laid out between the bars
+             and nothing can end up hidden behind them. -->
+        <item name="android:statusBarColor">@color/wr_background</item>
+        <item name="android:navigationBarColor">@color/wr_surface_container</item>
+        <item name="android:windowLightStatusBar">@bool/wr_light_system_bars</item>
+
+        <item name="materialCardViewStyle">@style/Widget.WavRecorder.Card</item>
     </style>
+
+    <style name="Theme.WavRecorder" parent="Base.Theme.WavRecorder" />
 </resources>

@@ -325,4 +325,84 @@ class RecordingsAdapterTest {
         assertTrue(holder.binding.overflowButton.layoutParams.width >= minPx)
         assertTrue(holder.binding.overflowButton.layoutParams.height >= minPx)
     }
+
+    // ---- Redesign: date groups, row actions, spoken playback state, compact metadata ----
+
+    private fun adapterAt(nowMillis: Long, active: Boolean = false, playing: Boolean = false,
+                          preparing: Boolean = false, selectionMode: Boolean = false) = RecordingsAdapter(
+        onPlayPause = {}, onSeekTo = { _, _ -> }, onSpeedToggle = {}, onShowStats = {}, onDelete = {},
+        isActive = { active }, isPlaying = { active && playing }, isPreparing = { active && preparing },
+        playbackPositionMs = { 0 }, playbackDurationMs = { 1000 }, playbackSpeedLabel = { "1.0x" },
+        isSelectionModeActive = { selectionMode }, nowMillis = { nowMillis }
+    )
+
+    private val sep24 = java.text.SimpleDateFormat("yyyyMMdd HHmmss", java.util.Locale.US).parse("20260924 120000")!!.time
+
+    @Test
+    fun `the first row of each day carries a date header, following rows of that day do not`() {
+        val adapter = adapterAt(sep24)
+        adapter.submitList(listOf(
+            item.copy(name = "recording_20260924_110000_part01.wav"),
+            item.copy(name = "recording_20260924_100000_part01.wav"),
+            item.copy(name = "recording_20260923_100000_part01.wav")
+        ))
+        val context = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val headers = (0..2).map { position ->
+            val holder = newHolder(adapter)
+            adapter.onBindViewHolder(holder, position)
+            if (holder.binding.dateHeader.visibility == View.VISIBLE) holder.binding.dateHeader.text.toString() else null
+        }
+        assertEquals(listOf(context.getString(R.string.date_group_today), null,
+            context.getString(R.string.date_group_yesterday)), headers)
+    }
+
+    @Test
+    fun `a date header is announced as a heading`() {
+        val adapter = adapterAt(sep24)
+        adapter.submitList(listOf(item.copy(name = "recording_20260924_110000_part01.wav")))
+        val holder = newHolder(adapter)
+        adapter.onBindViewHolder(holder, 0)
+        assertTrue(androidx.core.view.ViewCompat.isAccessibilityHeading(holder.binding.dateHeader))
+    }
+
+    @Test
+    fun `selection mode collapses the row actions so the title gets the full width`() {
+        val adapter = adapterAt(sep24, selectionMode = true)
+        adapter.submitList(listOf(item))
+        val holder = newHolder(adapter)
+        adapter.onBindViewHolder(holder, 0)
+        assertEquals(View.GONE, holder.binding.rowActions.visibility)
+
+        val normal = adapterAt(sep24)
+        normal.submitList(listOf(item))
+        val normalHolder = newHolder(normal)
+        normal.onBindViewHolder(normalHolder, 0)
+        assertEquals(View.VISIBLE, normalHolder.binding.rowActions.visibility)
+    }
+
+    @Test
+    fun `the active row speaks its playback state, other rows speak none`() {
+        val context = ApplicationProvider.getApplicationContext<android.app.Application>()
+        fun stateFor(adapter: RecordingsAdapter): String? {
+            adapter.submitList(listOf(item))
+            val holder = newHolder(adapter)
+            adapter.onBindViewHolder(holder, 0)
+            return androidx.core.view.ViewCompat.getStateDescription(holder.binding.root)?.toString()
+        }
+        assertEquals(context.getString(R.string.playback_state_playing), stateFor(adapterAt(sep24, active = true, playing = true)))
+        assertEquals(context.getString(R.string.playback_state_paused), stateFor(adapterAt(sep24, active = true)))
+        assertEquals(context.getString(R.string.playback_state_preparing), stateFor(adapterAt(sep24, active = true, preparing = true)))
+        assertEquals(null, stateFor(adapterAt(sep24)))
+    }
+
+    @Test
+    fun `row metadata reads as a clock duration and a size`() {
+        val adapter = adapterAt(sep24)
+        adapter.submitList(listOf(item, item.copy(durationSeconds = 3725.0, sizeBytes = 357_600_000)))
+        val holder = newHolder(adapter)
+        adapter.onBindViewHolder(holder, 0)
+        assertEquals("0:13 · 244 KB", holder.binding.fileMeta.text.toString())
+        adapter.onBindViewHolder(holder, 1)
+        assertEquals("1:02:05 · 341.0 MB", holder.binding.fileMeta.text.toString())
+    }
 }

@@ -29,7 +29,10 @@ class RecordingsAdapter(
     private val isSelectionModeActive: () -> Boolean = { false },
     private val isSelected: (Uri) -> Boolean = { false },
     private val onToggleSelect: (RecordingItem) -> Unit = {},
-    private val onLongPress: (RecordingItem) -> Unit = {}
+    private val onLongPress: (RecordingItem) -> Unit = {},
+    // "Now" for the presentation-only date group headers (Today/Yesterday/...) -- see
+    // RecordingDateGroups. A seam only so tests can pin the date.
+    private val nowMillis: () -> Long = System::currentTimeMillis
 ) : RecyclerView.Adapter<RecordingsAdapter.ViewHolder>() {
 
     private var items: List<RecordingItem> = emptyList()
@@ -74,6 +77,11 @@ class RecordingsAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val item = items[position]
         holder.binding.fileName.text = RecordingNameFormatter.friendlyTitle(item.name)
+        val context = holder.binding.root.context
+        val header = RecordingDateGroups.headerFor(context, items, position, nowMillis())
+        holder.binding.dateHeader.text = header
+        holder.binding.dateHeader.visibility = if (header != null) View.VISIBLE else View.GONE
+        ViewCompat.setAccessibilityHeading(holder.binding.dateHeader, header != null)
 
         val selectionMode = isSelectionModeActive()
         val selected = selectionMode && isSelected(item.uri)
@@ -106,6 +114,7 @@ class RecordingsAdapter(
             // for a row currently mid-selection would be confusing (and, for the overflow menu's
             // own delete action, redundant with the bulk one).
             holder.binding.activeAccent.visibility = View.INVISIBLE
+            holder.binding.rowActions.visibility = View.GONE
             holder.binding.preparingIndicator.visibility = View.GONE
             holder.binding.playButton.visibility = View.INVISIBLE
             holder.binding.playButton.setOnClickListener(null)
@@ -114,14 +123,13 @@ class RecordingsAdapter(
             holder.binding.fileMeta.visibility = View.VISIBLE
             holder.binding.seekRow.visibility = View.GONE
             holder.binding.seekBar.setOnSeekBarChangeListener(null)
-            holder.binding.fileMeta.text = String.format(
-                Locale.US, "%.1fs • %s", item.durationSeconds, formatSize(item.sizeBytes)
-            )
+            holder.binding.fileMeta.text = formatMeta(holder, item)
             return
         }
 
         val active = isActive(item.uri)
         holder.binding.activeAccent.visibility = if (active) View.VISIBLE else View.INVISIBLE
+        holder.binding.rowActions.visibility = View.VISIBLE
         holder.binding.playButton.visibility = View.VISIBLE
         holder.binding.overflowButton.visibility = View.VISIBLE
         bindPlaybackButton(holder, item)
@@ -166,19 +174,31 @@ class RecordingsAdapter(
             holder.binding.fileMeta.visibility = View.VISIBLE
             holder.binding.seekRow.visibility = View.GONE
             holder.binding.seekBar.setOnSeekBarChangeListener(null)
-            holder.binding.fileMeta.text = String.format(
-                Locale.US, "%.1fs • %s", item.durationSeconds, formatSize(item.sizeBytes)
-            )
+            holder.binding.fileMeta.text = formatMeta(holder, item)
         }
     }
 
     /** Shows exactly one of three states at a time: a spinner while [MediaPlayer] is still
      * preparing (can't accept start()/pause() yet), otherwise a play or pause icon reflecting
-     * whether this specific row is the one actually playing right now. */
+     * whether this specific row is the one actually playing right now. Outside selection mode the
+     * row itself also carries the spoken playback state (Playing/Paused/Preparing) for the active
+     * row, and none for every other row. */
     private fun bindPlaybackButton(holder: ViewHolder, item: RecordingItem) {
         val active = isActive(item.uri)
         val preparing = active && isPreparing(item.uri)
         val playing = active && isPlaying(item.uri)
+        if (!isSelectionModeActive()) {
+            ViewCompat.setStateDescription(
+                holder.binding.root,
+                if (!active) null else holder.binding.root.context.getString(
+                    when {
+                        preparing -> R.string.playback_state_preparing
+                        playing -> R.string.playback_state_playing
+                        else -> R.string.playback_state_paused
+                    }
+                )
+            )
+        }
         holder.binding.preparingIndicator.visibility = if (preparing) View.VISIBLE else View.GONE
         holder.binding.preparingIndicator.contentDescription = holder.binding.root.context.getString(
             R.string.preparing_button_description
@@ -207,9 +227,19 @@ class RecordingsAdapter(
 
     private fun formatTime(ms: Int): String {
         val totalSeconds = ms / 1000
-        val minutes = totalSeconds / 60
+        val hours = totalSeconds / 3600
+        val minutes = (totalSeconds % 3600) / 60
         val seconds = totalSeconds % 60
-        return String.format(Locale.US, "%d:%02d", minutes, seconds)
+        return if (hours > 0) {
+            String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
+        } else {
+            String.format(Locale.US, "%d:%02d", minutes, seconds)
+        }
+    }
+
+    private fun formatMeta(holder: ViewHolder, item: RecordingItem): String {
+        val durationText = formatTime((item.durationSeconds * 1000).toLong().coerceIn(0, Int.MAX_VALUE.toLong()).toInt())
+        return holder.binding.root.context.getString(R.string.recording_meta, durationText, formatSize(item.sizeBytes))
     }
 
     private fun formatSize(bytes: Long): String {

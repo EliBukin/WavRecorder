@@ -1,0 +1,28 @@
+<resources>
+    <!-- Dark counterparts of values/colors.xml: same roles, tuned for a dark surface. -->
+    <color name="wr_background">#FF0F1419</color>
+    <color name="wr_surface">#FF171F27</color>
+    <color name="wr_surface_container">#FF1D262F</color>
+    <color name="wr_surface_container_high">#FF26303B</color>
+    <color name="wr_on_surface">#FFE2E8EF</color>
+    <color name="wr_on_surface_variant">#FFA6B3C1</color>
+    <color name="wr_outline">#FF6E7C8B</color>
+    <color name="wr_outline_variant">#FF333F4B</color>
+
+    <color name="wr_primary">#FF9DC3F0</color>
+    <color name="wr_on_primary">#FF0A2A4A</color>
+    <color name="wr_primary_container">#FF1E3D60</color>
+    <color name="wr_on_primary_container">#FFD6E5F8</color>
+    <color name="wr_secondary">#FFB4C3D2</color>
+    <color name="wr_on_secondary">#FF1F2F3E</color>
+    <color name="wr_secondary_container">#FF2C3A48</color>
+    <color name="wr_on_secondary_container">#FFD8E2EC</color>
+
+    <color name="wr_record">#FFF28B82</color>
+    <color name="wr_on_record">#FF4A0A06</color>
+    <color name="wr_record_container">#FF5C1A17</color>
+    <color name="wr_on_record_container">#FFFFDAD5</color>
+
+    <color name="status_verified_green">#FF81C784</color>
+    <color name="status_warning_orange">#FFF5A35A</color>
+</resources>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Order matches MainActivity's ViewPager2 pages (0 = Record, 1 = Library). -->
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:id="@+id/nav_record"
+        android:icon="@drawable/ic_mic"
+        android:title="@string/tab_record" />
+    <item
+        android:id="@+id/nav_library"
+        android:icon="@drawable/ic_library"
+        android:title="@string/tab_library" />
+</menu>

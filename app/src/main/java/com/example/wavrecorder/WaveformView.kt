@@ -2,13 +2,17 @@ package com.example.wavrecorder
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.util.AttributeSet
 import android.view.View
+import androidx.annotation.ColorInt
+import androidx.core.graphics.ColorUtils
+import com.google.android.material.color.MaterialColors
 
-/** Rolling, smoothed waveform trace driven by amplitude samples pushed in during recording. */
+/** Rolling, smoothed waveform trace driven by amplitude samples pushed in during recording.
+ * Colors come from the theme (so it works in light and dark), with the trace's accent set by the
+ * Record screen per state -- see [setAccentColor]. */
 class WaveformView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
@@ -22,22 +26,38 @@ class WaveformView @JvmOverloads constructor(
     private var smoothedAmplitude = 0f
     private val easing = 0.3f
 
+    private val density = resources.displayMetrics.density
+
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#4D6200EE")
         style = Paint.Style.FILL
     }
 
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#FF6200EE")
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 2f * density
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
 
     private val baselinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#22000000")
-        strokeWidth = 2f
+        color = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOutlineVariant, FALLBACK_BASELINE)
+        strokeWidth = 1f * density
+    }
+
+    /** The trace's current color (the fill is the same color, translucent). */
+    @ColorInt
+    var accentColor: Int = MaterialColors.getColor(context, com.google.android.material.R.attr.colorPrimary, FALLBACK_ACCENT)
+        private set
+
+    init {
+        setAccentColor(accentColor)
+    }
+
+    fun setAccentColor(@ColorInt color: Int) {
+        accentColor = color
+        strokePaint.color = color
+        fillPaint.color = ColorUtils.setAlphaComponent(color, FILL_ALPHA)
+        invalidate()
     }
 
     fun addAmplitude(amplitude: Float) {
@@ -68,7 +88,7 @@ class WaveformView @JvmOverloads constructor(
 
         val topPoints = amplitudes.mapIndexed { i, amp ->
             val x = (startIndex + i) * slot + slot / 2f
-            val halfBar = (amp * midY * 0.85f).coerceAtLeast(2f)
+            val halfBar = (amp * midY * 0.85f).coerceAtLeast(density)
             x to (midY - halfBar)
         }
         val bottomPoints = topPoints.map { (x, y) -> x to (2 * midY - y) }
@@ -111,5 +131,11 @@ class WaveformView @JvmOverloads constructor(
         }
         val last = points.last()
         path.lineTo(last.first, last.second)
+    }
+
+    private companion object {
+        const val FILL_ALPHA = 0x40
+        const val FALLBACK_ACCENT = 0xFF2D65A0.toInt()
+        const val FALLBACK_BASELINE = 0x33000000
     }
 }

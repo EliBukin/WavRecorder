@@ -7,12 +7,15 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Typeface
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -23,6 +26,7 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.Lifecycle
 import com.example.wavrecorder.databinding.FragmentRecordBinding
+import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.text.SimpleDateFormat
@@ -47,6 +51,7 @@ class RecordFragment : Fragment() {
     // guaranteed to reproduce the original style-driven state precisely.
     private lateinit var defaultRecordButtonBackgroundTint: ColorStateList
     private lateinit var defaultRecordButtonTextColor: ColorStateList
+    private var defaultRecordButtonIconTint: ColorStateList? = null
 
     private var recordingService: RecordingService? = null
     // False from the moment onStart() requests a bind until a connection actually delivers the
@@ -125,6 +130,35 @@ class RecordFragment : Fragment() {
     // stuck (syncUiWithService's own else-branch otherwise only acts when there's an actual
     // pending outcome to display).
     private var micTestServiceUnavailableShown = false
+
+    /** What the central recording panel is currently presenting -- purely a view of the state the
+     * callbacks below already track, never a source of truth for recording itself. */
+    internal enum class PanelState { IDLE, TESTING, RECORDING, FINALIZING }
+    internal var panelState = PanelState.IDLE
+        private set
+
+    // Elapsed-time display while recording. Presentation only: it reads the session's real start
+    // time from RecordingService (so it survives rotation/rebinding instead of restarting from
+    // zero), never owns or controls the recording, runs only while this screen is resumed, and is
+    // removed from the main-thread Handler on pause and on view destruction -- see
+    // startElapsedTicker()/stopElapsedTicker(). [clock] is internal only so tests can pin "now".
+    internal var clock: () -> Long = System::currentTimeMillis
+    private val elapsedHandler = Handler(Looper.getMainLooper())
+    internal var isElapsedTickerRunning = false
+        private set
+    private val elapsedTick = object : Runnable {
+        override fun run() {
+            if (!isElapsedTickerRunning) return
+            val elapsed = updateElapsedText()
+            if (elapsed == null) {
+                // No live session start to show (not bound, or no session): stop rather than spin.
+                isElapsedTickerRunning = false
+                return
+            }
+            // Re-aligned to the next whole second, so the display never lags a changing second.
+            elapsedHandler.postDelayed(this, ELAPSED_TICK_MS - elapsed % ELAPSED_TICK_MS)
+        }
+    }
 
     private enum class PendingPermissionAction { RECORD, MIC_TEST }
     // Which flow a just-launched permission request belongs to, consulted only from within
@@ -205,6 +239,7 @@ class RecordFragment : Fragment() {
                 setRecordButtonRecording(true)
                 binding.audioLevelSection.visibility = View.VISIBLE
                 updateRecordingStatus()
+                renderPanel(PanelState.RECORDING)
                 refreshTestButtonEnabled()
             }
         }
@@ -228,6 +263,7 @@ class RecordFragment : Fragment() {
             if (_binding != null) {
                 binding.statusText.text = getString(R.string.status_finalizing)
                 binding.recordButton.isEnabled = false
+                renderPanel(PanelState.FINALIZING)
             }
             refreshTestButtonEnabled()
         }
@@ -290,6 +326,7 @@ class RecordFragment : Fragment() {
         resetToIdle()
         if (lastTarget != null) {
             showSavedSummary(startedAt)
+            setStateDotColor(R.color.status_verified_green)
         } else {
             binding.statusText.text = getString(R.string.status_idle)
         }
@@ -303,6 +340,7 @@ class RecordFragment : Fragment() {
         binding.statusText.text = target?.let {
             getString(R.string.recording_needs_recovery, it.displayPath, cause.message ?: "")
         } ?: getString(R.string.recording_error, cause.message)
+        setStateDotColor(R.color.status_recording_red)
     }
 
     private fun handleFinalizationUnknown(target: OutputTarget?) {
@@ -314,6 +352,7 @@ class RecordFragment : Fragment() {
         binding.statusText.text = target?.let {
             getString(R.string.recording_needs_verification, it.displayPath)
         } ?: getString(R.string.recording_needs_verification_unknown_location)
+        setStateDotColor(R.color.status_warning_orange)
     }
 
     /** Catches this screen up on a terminal outcome it wasn't around to see live -- e.g. the app
@@ -410,6 +449,7 @@ class RecordFragment : Fragment() {
                 MaterialColors.getColor(binding.recordButton, com.google.android.material.R.attr.colorPrimary)
             )
         defaultRecordButtonTextColor = binding.recordButton.textColors
+        defaultRecordButtonIconTint = binding.recordButton.iconTint
         return binding.root
     }
 
@@ -419,6 +459,9 @@ class RecordFragment : Fragment() {
         recordingSettings = RecordingSettings(requireContext())
         updateDestinationLabel()
         bindSplitDurationToggle()
+        // A fresh view always starts from the calm idle presentation; a live or finalizing session
+        // re-renders it as soon as the service connection lands (see syncUiWithService()).
+        renderPanel(PanelState.IDLE)
 
         binding.chooseFolderButton.setOnClickListener { folderPicker.launch(null) }
         binding.recordButton.setOnClickListener {
@@ -472,8 +515,14 @@ class RecordFragment : Fragment() {
         refreshTestButtonEnabled()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (panelState == PanelState.RECORDING) startElapsedTicker()
+    }
+
     override fun onPause() {
         super.onPause()
+        stopElapsedTicker()
         // MainActivity hosts this Fragment inside a 2-page ViewPager2/FragmentStateAdapter -- with
         // only 2 pages, switching to the Library tab leaves this one in the STARTED state (still
         // "kept alive" as the adjacent page), receiving only onPause(), never onStop(). Without
@@ -552,6 +601,7 @@ class RecordFragment : Fragment() {
             binding.audioLevelSection.visibility = View.VISIBLE
             binding.statusDetailText.visibility = View.GONE
             updateRecordingStatus()
+            renderPanel(PanelState.RECORDING)
             service.lastMicrophoneInfo?.let { updateMicDeviceLabel(it) }
         } else if (service.isFinalizing) {
             // Reconnecting (e.g. after rotation) while a previous session's background join is
@@ -559,6 +609,7 @@ class RecordFragment : Fragment() {
             // same "Finalizing…"/disabled state it would have if it had never been torn down.
             binding.statusText.text = getString(R.string.status_finalizing)
             binding.recordButton.isEnabled = false
+            renderPanel(PanelState.FINALIZING)
         } else {
             // Catches this screen up on whatever happened while it wasn't around to see it live
             // (or wasn't bound yet) -- see RecordingService.consumePendingOutcome.
@@ -760,6 +811,8 @@ class RecordFragment : Fragment() {
         micTestActive = false
         if (_binding == null) return
         binding.testMicButton.text = getString(R.string.test_microphone)
+        binding.testMicButton.setIconResource(R.drawable.ic_mic)
+        binding.micTestNoticeText.visibility = View.GONE
     }
 
     /** Starts a live microphone check -- never a file, a journal record, or the recording
@@ -777,12 +830,14 @@ class RecordFragment : Fragment() {
         expectedExternalMicForTest = latestPreferredMicStatus is PreferredMicStatus.ExternalConnected
         pendingTestMicMismatch = false
         binding.testMicButton.text = getString(R.string.stop_test)
+        binding.testMicButton.setIconResource(R.drawable.ic_stop)
         binding.recordButton.isEnabled = false
         binding.waveformView.clear()
         binding.audioLevelSection.visibility = View.VISIBLE
         binding.statusText.text = getString(R.string.mic_test_status_active)
         binding.statusDetailText.text = getString(R.string.mic_test_status_waiting)
         binding.statusDetailText.visibility = View.VISIBLE
+        renderPanel(PanelState.TESTING)
         micTestSession.start(
             context = requireContext(),
             onMicrophoneInfo = { info ->
@@ -864,11 +919,13 @@ class RecordFragment : Fragment() {
         micTestActive = false
         if (_binding == null) return
         binding.testMicButton.text = getString(R.string.test_microphone)
+        binding.testMicButton.setIconResource(R.drawable.ic_mic)
         binding.recordButton.isEnabled = true
         binding.audioLevelSection.visibility = View.GONE
         binding.waveformView.clear()
         binding.statusText.text = getString(R.string.status_idle)
         binding.statusDetailText.visibility = View.GONE
+        renderPanel(PanelState.IDLE)
         updateIdleMicStatusLabel()
         refreshTestButtonEnabled()
     }
@@ -890,21 +947,100 @@ class RecordFragment : Fragment() {
         micTestServiceUnavailableShown = true
         if (_binding == null) return
         binding.testMicButton.text = getString(R.string.test_microphone)
+        binding.testMicButton.setIconResource(R.drawable.ic_mic)
         binding.recordButton.isEnabled = true
         binding.audioLevelSection.visibility = View.GONE
         binding.waveformView.clear()
         binding.statusText.text = getString(R.string.status_reconnecting)
         binding.statusDetailText.visibility = View.GONE
+        renderPanel(PanelState.IDLE)
         updateIdleMicStatusLabel()
         refreshTestButtonEnabled()
     }
 
+    /** The recording-state headline plus the session's details: part number, the split duration
+     * this session was pinned to when it started (never the current setting, which may since have
+     * changed -- see RecordingService.sessionSplitDuration), and the actual capture format. */
     private fun updateRecordingStatus() {
-        binding.statusText.text = if (currentPartNumber > 1) {
-            getString(R.string.status_recording_part, currentPartNumber)
+        binding.statusText.text = getString(R.string.status_recording)
+        val split = recordingService?.sessionSplitDuration ?: RecordingSplitDuration.DEFAULT
+        binding.sessionDetailsText.text = getString(R.string.session_details, currentPartNumber, split.minutes)
+        val format = recordingService?.sessionAudioFormat
+        binding.audioFormatText.text = format?.let { formatAudioFormat(it) }
+        binding.audioFormatText.visibility = if (format != null && panelState == PanelState.RECORDING) View.VISIBLE else View.GONE
+    }
+
+    private fun formatAudioFormat(format: SessionAudioFormat): String {
+        val khz = format.sampleRate / 1000.0
+        val rateText = if (khz % 1.0 == 0.0) khz.toInt().toString() else String.format(Locale.getDefault(), "%.1f", khz)
+        val channels = getString(if (format.channels == 1) R.string.audio_channels_mono else R.string.audio_channels_stereo)
+        return getString(R.string.audio_format, getString(R.string.sample_rate_khz, rateText), format.bitsPerSample, channels)
+    }
+
+    /** Shows/hides the central panel's per-state elements. The headline (statusText) and the
+     * shared audio-level section keep being driven by the existing state callbacks; this only
+     * owns what's new: the state dot, the recording details, the "nothing is being saved" notice,
+     * whether the secondary test action is offered at all, the waveform accent, and the timer. */
+    private fun renderPanel(state: PanelState) {
+        panelState = state
+        if (_binding == null) return
+        val recording = state == PanelState.RECORDING
+        binding.elapsedText.visibility = if (recording) View.VISIBLE else View.GONE
+        binding.sessionDetailsText.visibility = if (recording) View.VISIBLE else View.GONE
+        binding.audioFormatText.visibility =
+            if (recording && recordingService?.sessionAudioFormat != null) View.VISIBLE else View.GONE
+        binding.micTestNoticeText.visibility = if (state == PanelState.TESTING) View.VISIBLE else View.GONE
+        binding.testMicButton.visibility =
+            if (recording || state == PanelState.FINALIZING) View.GONE else View.VISIBLE
+        setStateDotColor(
+            when (state) {
+                PanelState.IDLE -> R.color.status_idle_gray
+                PanelState.TESTING -> R.color.status_detected_blue
+                PanelState.RECORDING -> R.color.status_recording_red
+                PanelState.FINALIZING -> R.color.status_warning_orange
+            }
+        )
+        binding.waveformView.setAccentColor(
+            MaterialColors.getColor(
+                binding.waveformView,
+                if (recording) com.google.android.material.R.attr.colorError
+                else com.google.android.material.R.attr.colorPrimary
+            )
+        )
+        if (recording) {
+            updateElapsedText()
+            if (isResumed) startElapsedTicker()
         } else {
-            getString(R.string.status_recording)
+            stopElapsedTicker()
         }
+    }
+
+    private fun startElapsedTicker() {
+        if (isElapsedTickerRunning) return
+        isElapsedTickerRunning = true
+        elapsedTick.run()
+    }
+
+    private fun stopElapsedTicker() {
+        isElapsedTickerRunning = false
+        elapsedHandler.removeCallbacks(elapsedTick)
+    }
+
+    /** Returns the elapsed milliseconds shown, or null if there's no live session start to show. */
+    private fun updateElapsedText(): Long? {
+        if (_binding == null) return null
+        val startedAt = recordingService?.lastSessionStartedAtMillis ?: return null
+        val elapsed = (clock() - startedAt).coerceAtLeast(0)
+        binding.elapsedText.text = ElapsedTimeFormatter.format(elapsed)
+        binding.elapsedText.contentDescription = getString(
+            R.string.elapsed_time_description, DurationFormatter.format(requireContext(), elapsed / 1000)
+        )
+        return elapsed
+    }
+
+    private fun setStateDotColor(@ColorRes colorRes: Int) {
+        binding.recordingStateDot.backgroundTintList =
+            ColorStateList.valueOf(ContextCompat.getColor(requireContext(), colorRes))
     }
 
     /** Friendly "Recording saved" summary shown once a session actually finalizes -- deliberately
@@ -928,20 +1064,7 @@ class RecordFragment : Fragment() {
      * [updateIdleMicStatusLabel] guessed beforehand. */
     private fun updateMicDeviceLabel(info: MicrophoneInfo) {
         if (_binding == null) return
-        val titleRes = when {
-            !info.verified -> R.string.mic_status_unverified_title
-            info.isExternal -> R.string.mic_status_verified_external_title
-            else -> R.string.mic_status_verified_builtin_title
-        }
-        binding.micStatusTitle.text = getString(titleRes)
-        binding.micStatusSubtitle.text = getString(R.string.mic_status_active_subtitle, info.label)
-        setMicStatusDotColor(
-            when {
-                !info.verified -> R.color.status_preferred_purple
-                info.isExternal -> R.color.status_verified_green
-                else -> R.color.status_warning_orange
-            }
-        )
+        applyMicStatus(MicStatusPresenter.active(requireContext(), info))
     }
 
     /** Re-queries [AudioManager] for the currently preferred input device and, unless a recording
@@ -960,18 +1083,14 @@ class RecordFragment : Fragment() {
      * would end up routed to; see [PreferredMicStatus]. */
     private fun updateIdleMicStatusLabel() {
         if (_binding == null) return
-        when (val status = latestPreferredMicStatus) {
-            is PreferredMicStatus.ExternalConnected -> {
-                binding.micStatusTitle.text = getString(R.string.mic_status_connected_title, status.label)
-                binding.micStatusSubtitle.text = getString(R.string.mic_status_connected_subtitle)
-                setMicStatusDotColor(R.color.status_preferred_purple)
-            }
-            PreferredMicStatus.NoneDetected -> {
-                binding.micStatusTitle.text = getString(R.string.mic_status_none_title)
-                binding.micStatusSubtitle.text = getString(R.string.mic_status_none_subtitle)
-                setMicStatusDotColor(R.color.status_warning_orange)
-            }
-        }
+        applyMicStatus(MicStatusPresenter.idle(requireContext(), latestPreferredMicStatus))
+    }
+
+    private fun applyMicStatus(ui: MicStatusUi) {
+        binding.micStatusTitle.text = ui.title
+        binding.micStatusSubtitle.text = ui.subtitle
+        binding.micStatusBadge.text = getString(ui.badgeRes)
+        setMicStatusDotColor(ui.colorRes)
     }
 
     /** Applies (or clears) the destructive/red styling that must be visible exactly when
@@ -991,18 +1110,20 @@ class RecordFragment : Fragment() {
      * it for tests. */
     private fun setRecordButtonRecording(isRecording: Boolean) {
         binding.recordButton.text = getString(
-            if (isRecording) R.string.stop_recording else R.string.start_recording
+            if (isRecording) R.string.record_action_stop else R.string.record_action_start
         )
+        binding.recordButton.setIconResource(if (isRecording) R.drawable.ic_stop else R.drawable.ic_mic)
         if (isRecording) {
             binding.recordButton.backgroundTintList = buildDisabledAwareColorStateList(
                 com.google.android.material.R.attr.colorError, disabledAlpha = 0.38f
             )
-            binding.recordButton.setTextColor(
-                buildDisabledAwareColorStateList(com.google.android.material.R.attr.colorOnError, disabledAlpha = 0.6f)
-            )
+            val onError = buildDisabledAwareColorStateList(com.google.android.material.R.attr.colorOnError, disabledAlpha = 0.6f)
+            binding.recordButton.setTextColor(onError)
+            binding.recordButton.iconTint = onError
         } else {
             binding.recordButton.backgroundTintList = defaultRecordButtonBackgroundTint
             binding.recordButton.setTextColor(defaultRecordButtonTextColor)
+            binding.recordButton.iconTint = defaultRecordButtonIconTint
         }
     }
 
@@ -1037,6 +1158,7 @@ class RecordFragment : Fragment() {
         binding.statusText.text = getString(R.string.status_idle)
         binding.statusDetailText.visibility = View.GONE
         binding.audioLevelSection.visibility = View.GONE
+        renderPanel(PanelState.IDLE)
         updateIdleMicStatusLabel()
         binding.waveformView.clear()
         refreshTestButtonEnabled()
@@ -1046,11 +1168,15 @@ class RecordFragment : Fragment() {
      * enabled while recording: a change only ever applies to the next session (see
      * [beginRecording]), which the hint under the toggle says. */
     private fun bindSplitDurationToggle() {
-        binding.splitDurationToggle.check(splitButtonIdFor(recordingSettings.splitDuration))
         binding.splitDurationToggle.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            // The selected choice is set in bold as well as filled, so it doesn't rely on color.
+            binding.splitDurationToggle.findViewById<MaterialButton>(checkedId)?.setTypeface(
+                null, if (isChecked) Typeface.BOLD else Typeface.NORMAL
+            )
             if (!isChecked) return@addOnButtonCheckedListener
             splitDurationForButtonId(checkedId)?.let { recordingSettings.splitDuration = it }
         }
+        binding.splitDurationToggle.check(splitButtonIdFor(recordingSettings.splitDuration))
     }
 
     private fun splitButtonIdFor(duration: RecordingSplitDuration): Int = when (duration) {
@@ -1072,6 +1198,7 @@ class RecordFragment : Fragment() {
 
     override fun onDestroyView() {
         super.onDestroyView()
+        stopElapsedTicker()
         // Belt-and-suspenders alongside onStop()'s identical guard: onStop() should always run
         // first in the normal Fragment lifecycle, but this ensures a live test's AudioRecord is
         // never left open past this screen's own view existing, regardless of the exact teardown
@@ -1089,6 +1216,7 @@ class RecordFragment : Fragment() {
         // tap/clap without false-triggering on typical quiet-room background noise. Not a precise
         // SNR measurement, just enough to tell the user their input is actually reaching the meter.
         private const val MIC_TEST_SIGNAL_THRESHOLD = 0.15f
+        private const val ELAPSED_TICK_MS = 1000L
         private val SAVED_AT_FORMAT = SimpleDateFormat("MMM d, yyyy · h:mm a", Locale.getDefault())
         // Companion-scoped (not per-instance) so it survives this Fragment being recreated (e.g.
         // rotation) while RecordingService -- a longer-lived, separate component -- keeps its own

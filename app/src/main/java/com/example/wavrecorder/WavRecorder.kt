@@ -39,6 +39,10 @@ data class MicrophoneInfo(
     }
 }
 
+/** The PCM format a recording session is actually capturing in -- published by [WavRecorder] for
+ * display only (the Record screen's "48 kHz · 16-bit · Mono" line); it doesn't influence capture. */
+data class SessionAudioFormat(val sampleRate: Int, val bitsPerSample: Int, val channels: Int)
+
 /** Thrown when the input device an already-running recording verified itself to be using
  * disconnects mid-recording. Deliberately distinct from a generic I/O failure so the UI can show a
  * message specific to "unplug the mic" rather than a generic recording error. */
@@ -357,6 +361,11 @@ internal class WavRecorder(
 
     val isActive: Boolean get() = isRecording.get()
 
+    /** The format of the current (or most recently started) session, known once its audio source
+     * has opened; null before that, or if the most recent start attempt failed to open one. */
+    @Volatile var sessionAudioFormat: SessionAudioFormat? = null
+        private set
+
     /**
      * [segmentMaxSeconds] is how much audio each file of *this* session may hold before rolling
      * over. It's converted to a byte limit exactly once, here, and handed to this session's own
@@ -386,6 +395,7 @@ internal class WavRecorder(
         // from under a later, unrelated failure.
         val mySession = sessionCounter.incrementAndGet()
         lastFinalizeResult = FinalizeResult.Ok
+        sessionAudioFormat = null
 
         // AudioRecord setup can fail on real devices (mic in use by another app or a call,
         // hardware quirks) and throws rather than returning an error code, so this must not
@@ -400,6 +410,7 @@ internal class WavRecorder(
 
         val source = config.source
         val sampleRate = config.sampleRate
+        sessionAudioFormat = SessionAudioFormat(sampleRate, BITS_PER_SAMPLE, CHANNELS)
         val sessionSegmentSeconds = if (segmentMaxSeconds > 0) segmentMaxSeconds else this.segmentMaxSeconds
         val segmentMaxBytes = sampleRate.toLong() * CHANNELS * BYTES_PER_SAMPLE * sessionSegmentSeconds
 

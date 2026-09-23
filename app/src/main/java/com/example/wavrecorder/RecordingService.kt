@@ -227,6 +227,8 @@ class RecordingService : Service() {
      * started with -- fixed for that session's whole lifetime, regardless of any later change to
      * the user's setting. Null until the first [startRecording] call. */
     val sessionSplitDuration: RecordingSplitDuration? get() = splitDuration
+    /** The capture format of the current (or most recently started) session, for display. */
+    val sessionAudioFormat: SessionAudioFormat? get() = recorder.sessionAudioFormat
 
     /** Returns and clears the most recent terminal outcome that no listener was attached to see
      * live, if any -- called once a Fragment (re)binds so it can catch up, exactly once. Reads

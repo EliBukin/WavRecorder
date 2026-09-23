@@ -1,0 +1,7 @@
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <stroke
+        android:width="@dimen/stroke_hairline"
+        android:color="?attr/colorOutline" />
+    <corners android:radius="@dimen/corner_badge" />
+</shape>
