@@ -50,7 +50,7 @@ class RecordFragmentRedesignTest {
             listOf(AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_USB_DEVICE).build())
         )
         service = Robolectric.buildService(RecordingService::class.java).create().get()
-        service.recorder = WavRecorder(openAudioSource = {
+        service.recorder = WavRecorder(startup = ImmediateStartup, openAudioSource = {
             val stopped = CountDownLatch(1).also { releaseSources += it }
             val source = object : AudioSource {
                 override fun startRecording() {}
@@ -129,7 +129,9 @@ class RecordFragmentRedesignTest {
 
         assertEquals(View.VISIBLE, scenario.view<View>(R.id.elapsedText).visibility)
         assertEquals(app().getString(R.string.session_details, 1, 45), scenario.text(R.id.sessionDetailsText))
-        assertEquals("48 kHz · 16-bit · Mono", scenario.text(R.id.audioFormatText))
+        // The verified device and the format actually being written.
+        assertEquals("USB Mic • 48\u00A0kHz • 16-bit • Mono", scenario.text(R.id.audioFormatText))
+        assertEquals("a native capture needs no note", View.GONE, scenario.view<View>(R.id.formatNoteText).visibility)
         assertEquals(View.VISIBLE, scenario.view<View>(R.id.audioLevelSection).visibility)
         assertEquals(app().getString(R.string.record_action_stop), scenario.text(R.id.recordButton))
         assertEquals("the test action isn't offered while recording", View.GONE,
@@ -220,7 +222,7 @@ class RecordFragmentRedesignTest {
     fun `testing says nothing is saved, offers Stop test, and keeps recording unavailable`() {
         val scenario = launch()
         scenario.onFragment { fragment ->
-            fragment.micTestSession = MicTestSession(openAudioSource = {
+            fragment.micTestSession = MicTestSession(startup = ImmediateStartup, openAudioSource = {
                 val stopped = CountDownLatch(1).also { releaseSources += it }
                 WavRecorder.RecorderConfig(object : AudioSource {
                     override fun startRecording() {}

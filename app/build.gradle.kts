@@ -67,9 +67,13 @@ dependencies {
     testImplementation("org.robolectric:robolectric:4.13")
     testImplementation("androidx.test:core:1.6.1")
     testImplementation("androidx.test.ext:junit:1.2.1")
-    // fragment-testing's EmptyFragmentActivity must be merged into the manifest Robolectric
-    // loads for local (JVM) unit tests, which is the debug app manifest, not a test-only one —
-    // hence debugImplementation rather than testImplementation. This is the setup Google's own
-    // FragmentScenario + Robolectric docs call for.
-    debugImplementation("androidx.fragment:fragment-testing:1.8.2")
+    // Fragment UI tests (FragmentScenario) live in the debug unit-test source set, src/testDebug:
+    // FragmentScenario hosts every fragment in EmptyFragmentActivity, an exported test activity
+    // that Robolectric only resolves from the tested variant's merged app manifest -- and whose
+    // theme resource and R class exist only where that manifest artifact is an app dependency. A
+    // release build must never ship it, so it is merged into debug builds only (Google's
+    // documented setup), and FragmentScenario itself is on the debug unit-test classpath only.
+    // Every other test lives in src/test and runs for both debug and release.
+    testDebugImplementation("androidx.fragment:fragment-testing:1.8.2")
+    debugImplementation("androidx.fragment:fragment-testing-manifest:1.8.2")
 }

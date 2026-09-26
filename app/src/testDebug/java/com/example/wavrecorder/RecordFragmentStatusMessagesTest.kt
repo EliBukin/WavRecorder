@@ -124,7 +124,7 @@ class RecordFragmentStatusMessagesTest {
         service.destinationManager = object : DestinationManager(app()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> FailingHeaderPatchWriter(channel) }
         )
@@ -166,7 +166,7 @@ class RecordFragmentStatusMessagesTest {
         service.destinationManager = object : DestinationManager(app()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 50,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -215,7 +215,7 @@ class RecordFragmentStatusMessagesTest {
         service.destinationManager = object : DestinationManager(app()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 5000,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -279,7 +279,7 @@ class RecordFragmentStatusMessagesTest {
         service.destinationManager = object : DestinationManager(app()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
 
@@ -315,6 +315,57 @@ class RecordFragmentStatusMessagesTest {
     }
 
     @Test
+    fun `a recording saved while Android is still releasing the microphone shows both, and the release line clears when it finishes`() {
+        val service = bindRealService()
+        var reads = 0
+        val source = object : AudioSource {
+            override fun startRecording() {}
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int = if (++reads <= 3) length else 0
+            override fun stop() {}
+            override fun release() {}
+        }
+        val segmentFile = tempFolder.newFile("segment.wav")
+        service.destinationManager = object : DestinationManager(app()) {
+            override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
+        }
+        // The audio worker only runs when the test says: the stop's release stays pending.
+        val worker = ManualExecutor()
+        service.recorder = WavRecorder(
+            threadJoinTimeoutMs = 300,
+            startup = AudioStartup(worker, java.util.concurrent.Executor { it.run() }),
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4096) }
+        )
+
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        awaitListenerAttached(scenario, service)
+        service.startRecording(1L)
+        worker.runAll()
+        val deadline = System.currentTimeMillis() + 2000
+        while (service.lastTarget == null && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        service.stopRecording()
+        awaitFinalizationAndIdle(service)
+
+        fun detail(): String {
+            var text = ""
+            scenario.onFragment { text = it.view!!.findViewById<TextView>(R.id.statusDetailText).text.toString() }
+            return text
+        }
+        val pendingLine = app().getString(R.string.mic_release_pending)
+        assertEquals("the file's own outcome stands", app().getString(R.string.status_saved_title), statusText(scenario))
+        assertTrue(detail(), detail().endsWith("\n$pendingLine"))
+        assertTrue("the saved summary is kept above it", detail().contains("second"))
+
+        worker.runAll()                                 // the release finishes
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(app().getString(R.string.status_saved_title), statusText(scenario))
+        assertFalse(detail(), detail().contains(pendingLine))
+        assertTrue(detailVisible(scenario))
+    }
+
+    @Test
     fun `an outcome persisted while unattended is still consumed and shown once the app is reopened`() {
         // No fragment/listener bound at all yet -- simulates a recording finishing while the app
         // is fully backgrounded, exactly like RecordingServiceTest's identical "no listener
@@ -340,7 +391,7 @@ class RecordFragmentStatusMessagesTest {
         service.destinationManager = object : DestinationManager(app()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
 

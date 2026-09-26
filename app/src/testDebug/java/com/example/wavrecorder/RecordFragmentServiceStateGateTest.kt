@@ -52,7 +52,7 @@ class RecordFragmentServiceStateGateTest {
      * reached under Robolectric without a real microphone. */
     private fun blockingRecorder(): WavRecorder {
         val blockForever = CountDownLatch(1)
-        return WavRecorder(
+        return WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val source = object : AudioSource {
                     override fun startRecording() {}
@@ -125,7 +125,7 @@ class RecordFragmentServiceStateGateTest {
      * genuinely in progress. */
     private fun neverFinalizingRecorder(readGate: CountDownLatch): WavRecorder {
         val neverReleased = CountDownLatch(1)
-        return WavRecorder(
+        return WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 10_000L,
             openAudioSource = {
                 val source = object : AudioSource {
@@ -175,7 +175,7 @@ class RecordFragmentServiceStateGateTest {
         registerService(service)
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
 
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(FakeAudioSource(scriptedReads = List(50) { byteArrayOf(1, 2, 3, 4) }), 48000, 4) }
         )
         scenario.onFragment { fragment ->
@@ -213,7 +213,7 @@ class RecordFragmentServiceStateGateTest {
             override fun stop() {}
             override fun release() { releaseCount++ }
         }
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -258,7 +258,7 @@ class RecordFragmentServiceStateGateTest {
             override fun stop() {}
             override fun release() {}
         }
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()

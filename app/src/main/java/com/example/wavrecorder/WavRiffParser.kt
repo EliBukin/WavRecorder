@@ -20,16 +20,48 @@ object WavRiffParser {
     data class Format(
         val channels: Int,
         val sampleRate: Int,
+        /** The container size of each sample (the fmt chunk's wBitsPerSample). */
         val bitsPerSample: Int,
         val byteRate: Int,
         val dataSize: Long,
         /** Absolute byte offset from the start of the file where the "data" chunk's audio
          * payload begins. Lets a caller verify the file is complete (`fileSize >= dataOffset +
          * dataSize`) using only a cheaply-known file size, without reading the audio itself. */
-        val dataOffset: Long
-    )
+        val dataOffset: Long,
+        /** True for IEEE-float samples (WAVE_FORMAT_IEEE_FLOAT, or the extensible float subformat). */
+        val isFloat: Boolean = false,
+        /** Bits of real precision per sample: WAVEFORMATEXTENSIBLE's wValidBitsPerSample, or
+         * [bitsPerSample] for the basic layouts. */
+        val validBitsPerSample: Int = bitsPerSample,
+        /** WAVEFORMATEXTENSIBLE's dwChannelMask; 0 for the basic layouts. */
+        val channelMask: Int = 0,
+        /** Bytes per frame, as the header declares it (nBlockAlign). */
+        val blockAlign: Int = channels * bitsPerSample / 8
+    ) {
+        /** The sample encoding, if it's one this app can decode (16/24/32-bit integer or 32-bit
+         * float, with no unused low-order bits); null for anything else (8-bit, 64-bit float, ...). */
+        val encoding: PcmEncoding?
+            get() = when {
+                validBitsPerSample != bitsPerSample -> null
+                blockAlign != channels * bitsPerSample / 8 -> null
+                isFloat -> if (bitsPerSample == 32) PcmEncoding.PCM_FLOAT else null
+                bitsPerSample == 16 -> PcmEncoding.PCM_16
+                bitsPerSample == 24 -> PcmEncoding.PCM_24_PACKED
+                bitsPerSample == 32 -> PcmEncoding.PCM_32
+                else -> null
+            }
+
+        /** The full sample format, when [encoding] is known. */
+        val pcmFormat: PcmFormat?
+            get() {
+                val e = encoding ?: return null
+                if (channels !in 1..PcmFormat.MAX_CHANNELS || sampleRate <= 0) return null
+                return PcmFormat.of(sampleRate, e, channels)
+            }
+    }
 
     private const val PCM = 1
+    private const val IEEE_FLOAT = 3
     private const val WAVE_FORMAT_EXTENSIBLE = 0xFFFE
     private const val MAX_FMT_CHUNK_SIZE = 4096L // real "fmt " chunks are 16-40 bytes; a larger
     // declared size is either malformed or hostile input, so bail out rather than allocate it.
@@ -38,16 +70,9 @@ object WavRiffParser {
     // validBitsPerSample/reserved, a 4-byte channel mask, then a 16-byte subformat GUID — 40
     // bytes total. Anything shorter is missing the GUID that actually says what the data is.
     private const val MIN_EXTENSIBLE_FMT_CHUNK_SIZE = 40
+    private const val EXTENSIBLE_VALID_BITS_OFFSET = 18
+    private const val EXTENSIBLE_CHANNEL_MASK_OFFSET = 20
     private const val EXTENSIBLE_SUBFORMAT_OFFSET = 24
-
-    // KSDATAFORMAT_SUBTYPE_PCM ({00000001-0000-0010-8000-00AA00389B71}) as it's laid out on disk:
-    // the first three GUID fields little-endian, the trailing 8-byte data4 as literal bytes.
-    private val PCM_SUBFORMAT_GUID = byteArrayOf(
-        0x01, 0x00, 0x00, 0x00,
-        0x00, 0x00,
-        0x10, 0x00,
-        0x80.toByte(), 0x00, 0x00, 0xAA.toByte(), 0x00, 0x38, 0x9B.toByte(), 0x71
-    )
 
     fun parse(input: InputStream): Format? {
         val riffHeader = ByteArray(12)
@@ -61,6 +86,10 @@ object WavRiffParser {
         var sampleRate: Int? = null
         var bitsPerSample: Int? = null
         var byteRate: Int? = null
+        var blockAlign = 0
+        var isFloat = false
+        var validBits: Int? = null
+        var channelMask = 0
 
         val chunkHeader = ByteArray(8)
         while (true) {
@@ -77,25 +106,36 @@ object WavRiffParser {
                     if (!readFully(input, body)) return null
                     val fmt = ByteBuffer.wrap(body).order(ByteOrder.LITTLE_ENDIAN)
                     val audioFormat = fmt.getShort(0).toInt() and 0xFFFF
+                    isFloat = false
+                    validBits = null
+                    channelMask = 0
                     when (audioFormat) {
                         PCM -> Unit
+                        IEEE_FLOAT -> isFloat = true
                         WAVE_FORMAT_EXTENSIBLE -> {
                             // The format code alone doesn't say what's actually in the data chunk
                             // for an extensible fmt -- that's in the subformat GUID. Accepting
-                            // 0xFFFE without checking it would scan e.g. extensible IEEE-float
-                            // data as if it were PCM.
+                            // 0xFFFE without checking it would scan e.g. A-law data as if it were
+                            // PCM.
                             if (chunkSize < MIN_EXTENSIBLE_FMT_CHUNK_SIZE) return null
                             val subFormat = body.copyOfRange(
                                 EXTENSIBLE_SUBFORMAT_OFFSET,
-                                EXTENSIBLE_SUBFORMAT_OFFSET + PCM_SUBFORMAT_GUID.size
+                                EXTENSIBLE_SUBFORMAT_OFFSET + WavHeaderWriter.SUBFORMAT_PCM.size
                             )
-                            if (!subFormat.contentEquals(PCM_SUBFORMAT_GUID)) return null
+                            isFloat = when {
+                                subFormat.contentEquals(WavHeaderWriter.SUBFORMAT_PCM) -> false
+                                subFormat.contentEquals(WavHeaderWriter.SUBFORMAT_IEEE_FLOAT) -> true
+                                else -> return null
+                            }
+                            validBits = fmt.getShort(EXTENSIBLE_VALID_BITS_OFFSET).toInt() and 0xFFFF
+                            channelMask = fmt.getInt(EXTENSIBLE_CHANNEL_MASK_OFFSET)
                         }
-                        else -> return null // e.g. IEEE float, A-law/mu-law, ADPCM: not supported
+                        else -> return null // e.g. A-law/mu-law, ADPCM: not supported
                     }
                     channels = fmt.getShort(2).toInt() and 0xFFFF
                     sampleRate = fmt.getInt(4)
                     byteRate = fmt.getInt(8)
+                    blockAlign = fmt.getShort(12).toInt() and 0xFFFF
                     bitsPerSample = fmt.getShort(14).toInt() and 0xFFFF
                     bytesConsumed += chunkSize
                     if (chunkSize % 2L == 1L) {
@@ -109,7 +149,15 @@ object WavRiffParser {
                     val bps = bitsPerSample ?: return null
                     val br = byteRate ?: return null
                     if (c <= 0 || sr <= 0 || bps <= 0) return null
-                    return Format(c, sr, bps, br, dataSize = chunkSize, dataOffset = bytesConsumed)
+                    // IEEE float samples are 32 or 64 bits; any other size is a malformed header.
+                    if (isFloat && bps != 32 && bps != 64) return null
+                    // A validBits of 0 is WAVE_FORMAT_EXTENSIBLE's "same as the container".
+                    val valid = validBits?.takeIf { it > 0 } ?: bps
+                    return Format(
+                        c, sr, bps, br, dataSize = chunkSize, dataOffset = bytesConsumed,
+                        isFloat = isFloat, validBitsPerSample = valid, channelMask = channelMask,
+                        blockAlign = blockAlign
+                    )
                 }
                 else -> {
                     if (!skipFully(input, chunkSize)) return null

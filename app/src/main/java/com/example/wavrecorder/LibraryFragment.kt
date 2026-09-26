@@ -376,7 +376,7 @@ class LibraryFragment : Fragment() {
         val channelLabel = when (s.channels) {
             1 -> "Mono (1)"
             2 -> "Stereo (2)"
-            else -> "${s.channels} ch"
+            else -> "${s.channels} channels"
         }
         val peak = s.peakDbfs?.let { String.format(Locale.US, "%.1f dBFS", it) } ?: "silence"
         val rms = s.rmsDbfs?.let { String.format(Locale.US, "%.1f dBFS", it) } ?: "silence"
@@ -385,7 +385,7 @@ class LibraryFragment : Fragment() {
         return buildString {
             appendLine("Sample rate:  ${s.sampleRate} Hz")
             appendLine("Channels:     $channelLabel")
-            appendLine("Bit depth:    ${s.bitsPerSample}-bit PCM")
+            appendLine("Bit depth:    ${s.bitsPerSample}-bit ${if (s.isFloat) "float" else "PCM"}")
             appendLine("Bitrate:      ${String.format(Locale.US, "%.1f", s.bitrateKbps)} kbps")
             appendLine("Duration:     ${String.format(Locale.US, "%.2f s", s.durationSeconds)}")
             appendLine("File size:    ${formatBytes(s.sizeBytes)}")

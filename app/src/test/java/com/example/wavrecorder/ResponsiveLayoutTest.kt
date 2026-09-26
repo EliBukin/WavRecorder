@@ -50,7 +50,7 @@ class ResponsiveLayoutTest {
             listOf(AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_USB_DEVICE).build())
         )
         service = Robolectric.buildService(RecordingService::class.java).create().get()
-        service.recorder = WavRecorder(openAudioSource = {
+        service.recorder = WavRecorder(startup = ImmediateStartup, openAudioSource = {
             WavRecorder.RecorderConfig(object : AudioSource {
                 override fun startRecording() {}
                 override fun read(buffer: ByteArray, offset: Int, length: Int): Int {

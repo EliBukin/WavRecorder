@@ -84,7 +84,7 @@ class RecordingServiceTest {
         }
 
         var startCount = 0
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 500,
             openAudioSource = {
                 startCount++
@@ -160,7 +160,7 @@ class RecordingServiceTest {
                 throw SecurityException("Permission to the selected folder has been revoked")
             }
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val silentSource = object : AudioSource {
                     override fun startRecording() {}
@@ -216,7 +216,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> AlwaysFailingHeaderWriter(channel) }
         )
@@ -267,7 +267,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 50, // fast, deterministic timeout so stop() gives up quickly
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -374,7 +374,7 @@ class RecordingServiceTest {
             // genuinely wedged driver
             override fun release() {}
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 2000, // the real production default -- what stopRecording() must not block on
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
         )
@@ -424,7 +424,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
         var onStoppedCount = 0
@@ -477,7 +477,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
         var deliveryCount = 0
@@ -531,7 +531,7 @@ class RecordingServiceTest {
             override fun createOutputFile(fileName: String): OutputTarget =
                 OutputTarget.FileTarget(tempFolder.newFile("session1.wav"))
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 300, // short and deterministic: the join gives up quickly, yielding Unknown
             openAudioSource = {
                 openAudioSourceCallCount++
@@ -606,7 +606,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 5000, // comfortably longer than this test's own explicit release timing
             openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> AlwaysFailingHeaderWriter(channel) }
@@ -659,7 +659,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 200,
             openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -715,7 +715,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(tempFolder.newFile("s1.wav"))
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 200,
             openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -771,7 +771,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(tempFolder.newFile("s1.wav"))
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 200,
             openAudioSource = {
                 openAudioSourceCallCount++
@@ -819,7 +819,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
         var onStoppedCalled = false
@@ -877,7 +877,7 @@ class RecordingServiceTest {
         }
         val controller = Robolectric.buildService(RecordingService::class.java)
         val service = controller.create().get()
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 2000, // the real production default
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
         )
@@ -927,7 +927,7 @@ class RecordingServiceTest {
                 override fun createOutputFile(fileName: String): OutputTarget =
                     OutputTarget.FileTarget(tempFolder.newFile("failed.wav"))
             }
-            service.recorder = WavRecorder(
+            service.recorder = WavRecorder(startup = ImmediateStartup,
                 openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
                 wrapChannel = { channel -> AlwaysFailingHeaderWriter(channel) }
             )
@@ -976,7 +976,7 @@ class RecordingServiceTest {
                 override fun createOutputFile(fileName: String): OutputTarget =
                     OutputTarget.FileTarget(tempFolder.newFile("unknown.wav"))
             }
-            service.recorder = WavRecorder(
+            service.recorder = WavRecorder(startup = ImmediateStartup,
                 threadJoinTimeoutMs = 50,
                 openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
             )
@@ -1061,7 +1061,7 @@ class RecordingServiceTest {
             override fun stop() {}
             override fun release() {}
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
         )
 
@@ -1105,7 +1105,7 @@ class RecordingServiceTest {
             override fun stop() {}
             override fun release() {}
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
         // Deliberately no listener attached -- simulates the app backgrounded/screen off.
@@ -1148,7 +1148,7 @@ class RecordingServiceTest {
             override fun stop() {}
             override fun release() {}
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
         service.listener = StubListener()
@@ -1196,7 +1196,7 @@ class RecordingServiceTest {
             override fun stop() {}
             override fun release() {}
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
         var stoppedTarget: OutputTarget? = null
@@ -1247,7 +1247,7 @@ class RecordingServiceTest {
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             headerFlushIntervalMs = 10, // fast disconnect-check cadence
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> AlwaysFailingHeaderWriter(channel) }
@@ -1311,7 +1311,7 @@ class RecordingServiceTest {
         service1.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
-        service1.recorder = WavRecorder(
+        service1.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
         // Deliberately no listener attached -- simulates the app fully backgrounded/killed.
@@ -1346,7 +1346,7 @@ class RecordingServiceTest {
      * recording rather than a merely pending one. */
     private fun blockingRecorder(): WavRecorder {
         val blockForever = CountDownLatch(1)
-        return WavRecorder(
+        return WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val source = object : AudioSource {
                     override fun startRecording() {}
@@ -1459,7 +1459,7 @@ class RecordingServiceTest {
      * failure path that resolves entirely inside the direct startRecording() call itself, before
      * an ACTION_START Intent for the same attempt (sent moments earlier, in the real
      * beginRecording() flow) has necessarily even been dispatched to onStartCommand() yet. */
-    private fun alwaysFailsSynchronously(): WavRecorder = WavRecorder(
+    private fun alwaysFailsSynchronously(): WavRecorder = WavRecorder(startup = ImmediateStartup,
         openAudioSource = { throw IllegalStateException("simulated: microphone busy") }
     )
 

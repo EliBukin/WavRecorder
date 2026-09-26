@@ -14,6 +14,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
+import org.junit.After
 import org.junit.Before
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
@@ -37,6 +38,16 @@ class RecordFragmentPermissionTest {
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
+    // The service a test's taps start recording on -- through its real, asynchronous startup -- so
+    // tearDown() can stop it: a start still pending when the test ends must not be delivered (and
+    // start recording) during a later test.
+    private var boundService: RecordingService? = null
+
+    @After
+    fun stopRecordingStartedByTheTest() {
+        boundService?.recorder?.requestStop()
+    }
+
     @Before
     fun setUpRecordingServiceBinding() {
         // RecordFragment binds to RecordingService as soon as it starts (onStart), so a plain
@@ -45,6 +56,7 @@ class RecordFragmentPermissionTest {
         // Creating a real instance and registering its binder makes that later bindService()
         // call actually connect.
         val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        boundService = service
         val binder = service.LocalBinder()
         shadowOf(app()).setComponentNameAndServiceForBindService(
             ComponentName(app(), RecordingService::class.java),

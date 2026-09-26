@@ -99,6 +99,13 @@ class RecordingService : Service() {
          * rather than silently doing nothing; default no-op so existing implementations aren't
          * forced to handle it. */
         fun onStartRejected() {}
+        /** The session's file outcome has been reported, but Android is still releasing the
+         * microphone (a stop or release on the audio worker hasn't returned yet). The file's status
+         * stands as reported; a new start is refused, with [MicrophoneBusyException], while the
+         * release is stalled. Followed by [onMicrophoneReleased] once it finishes. */
+        fun onMicrophoneReleasePending() {}
+        /** The release reported by [onMicrophoneReleasePending] has finished. */
+        fun onMicrophoneReleased() {}
     }
 
     inner class LocalBinder : Binder() {
@@ -194,6 +201,7 @@ class RecordingService : Service() {
         get() = when {
             isFinalizing -> ServiceState.FINALIZING
             recorder.isActive -> ServiceState.RECORDING
+            recorder.isStarting -> ServiceState.STARTING
             startRequestPending -> ServiceState.PREPARING
             else -> ServiceState.IDLE
         }
@@ -207,7 +215,17 @@ class RecordingService : Service() {
 
     var listener: Listener? = null
 
+    // The release of the most recently stopped session's microphone, on the audio worker.
+    private var lastRelease: AudioStartup.Completion? = null
+
+    /** True while the most recently stopped session's microphone is still being released by
+     * Android -- independent of whether its file was saved (see [Listener.onMicrophoneReleasePending]). */
+    val microphoneReleasePending: Boolean get() = lastRelease?.isDone == false
+
     val isRecording: Boolean get() = recorder.isActive
+    /** True while a [startRecording] is still negotiating its microphone, off the main thread (see
+     * [ServiceState.STARTING]); [stopRecording] cancels it. */
+    val isStarting: Boolean get() = recorder.isStarting
     val lastTarget: OutputTarget? get() = currentTarget
     val lastPartNumber: Int get() = currentPartNumber
     /** The input device the current (or most recently started) session verified itself to be
@@ -227,8 +245,14 @@ class RecordingService : Service() {
      * started with -- fixed for that session's whole lifetime, regardless of any later change to
      * the user's setting. Null until the first [startRecording] call. */
     val sessionSplitDuration: RecordingSplitDuration? get() = splitDuration
-    /** The capture format of the current (or most recently started) session, for display. */
-    val sessionAudioFormat: SessionAudioFormat? get() = recorder.sessionAudioFormat
+    /** The format the current (or most recently started) session writes -- see [WavRecorder.sessionFormat]. */
+    val sessionFormat: PcmFormat? get() = recorder.sessionFormat
+    /** How [sessionFormat] was negotiated, when known. */
+    val sessionNegotiation: NegotiatedAudio? get() = recorder.sessionNegotiation
+    /** Where the current session splits files -- see [SegmentSplitPlan]. */
+    val sessionSplitPlan: SegmentSplitPlan? get() = recorder.sessionSplitPlan
+    /** The device-side capture format, when Android reports it -- see [DeviceSideFormat]. */
+    val sessionDeviceFormat: DeviceSideFormat? get() = recorder.sessionDeviceFormat
 
     /** Returns and clears the most recent terminal outcome that no listener was attached to see
      * live, if any -- called once a Fragment (re)binds so it can catch up, exactly once. Reads
@@ -356,10 +380,11 @@ class RecordingService : Service() {
         // directly through its live binder reference -- Android dispatches a
         // startForegroundService() Intent to onStartCommand() on a separate path from a direct
         // Binder method call, with no guaranteed ordering between the two. Recording is already
-        // the real, fulfilled state by then, so this must be a no-op: it must never downgrade an
-        // active recording's notification back to "preparing", and must never arm a timeout that
-        // could stop it later.
-        if (state == ServiceState.RECORDING) return
+        // the real, fulfilled state by then (or starting it: STARTING), so this must be a no-op:
+        // it must never downgrade an active recording's notification back to "preparing", must
+        // never arm a timeout that could stop it later, and must never replace the starting
+        // session's request id.
+        if (state == ServiceState.RECORDING || state == ServiceState.STARTING) return
         // A previous session is still finalizing in the background -- this must be rejected, not
         // silently ignored *or* accepted: accepting it would overwrite currentRequestId, which the
         // still-in-flight beginAsyncFinalize() background thread rechecks to decide whether its
@@ -422,9 +447,23 @@ class RecordingService : Service() {
      * [splitMinutes] is the per-file length this session will use for its whole lifetime (see
      * [RecordingSplitDuration]); the caller captures it once, when Record is pressed. Deliberately
      * a raw Int rather than the enum so this service stays the one place that decides what's
-     * acceptable: anything other than 30, 45 or 60 falls back to 60 minutes. */
-    fun startRecording(requestId: Long, splitMinutes: Int = RecordingSplitDuration.DEFAULT.minutes) {
-        if (state == ServiceState.RECORDING) return
+     * acceptable: anything other than 30, 45 or 60 falls back to 60 minutes.
+     *
+     * Returns at once: the service is foreground immediately (Android's timing requirement), and
+     * the session is STARTING while the recorder negotiates the microphone off the main thread.
+     * [requireExternalMic] (an external microphone was detected when Record was pressed, and the
+     * user hasn't chosen the phone microphone instead): a session whose verified microphone turns
+     * out not to be an external one is then never started -- no file -- and ends with
+     * [ExternalMicrophoneNotInUseException], so the Record screen can offer to retry or to use the
+     * phone microphone. Enforced here, where the session lives, so it holds even if the screen is
+     * gone by the time the microphone is known. */
+    fun startRecording(
+        requestId: Long,
+        splitMinutes: Int = RecordingSplitDuration.DEFAULT.minutes,
+        requireExternalMic: Boolean = false
+    ) {
+        // One session at a time: a start while one is recording or still starting is ignored.
+        if (state == ServiceState.RECORDING || state == ServiceState.STARTING) return
         // A previous session's finalization is still running in the background -- see
         // ServiceState's doc and handleActionStart()'s identical guard above. Rejecting here
         // (rather than proceeding, as before) is what actually prevents a second, competing
@@ -493,34 +532,43 @@ class RecordingService : Service() {
                 microphoneInfo = info
                 listener?.onMicrophoneInfo(info)
             },
-            segmentMaxSeconds = sessionSplit.seconds
+            segmentMaxSeconds = sessionSplit.seconds,
+            acceptMicrophone = { info ->
+                if (requireExternalMic && !(info.verified && info.isExternal)) {
+                    ExternalMicrophoneNotInUseException(
+                        "The external microphone could not be confirmed in use (recording would have used ${info.label})"
+                    )
+                } else {
+                    null
+                }
+            }
         )
 
-        // Deliberately no `if (!recorder.isActive) finishRecording()` here anymore: every path
-        // that can leave recorder.isActive false at this point (AudioRecord setup failing
-        // synchronously inside recorder.start() above) already called `onError` -- synchronously,
-        // before recorder.start() returned -- which triggers beginAsyncFinalize() and, through
-        // it, exactly one eventual finishRecording() call once the (here, trivially fast, since
-        // there's no thread to join) async completion runs. A second, synchronous call here used
-        // to race that: it tore down the foreground notification and called stopSelf() *before*
-        // the outcome was even computed, then beginAsyncFinalize's own completion did it again.
+        // Deliberately no `if (!recorder.isActive) finishRecording()` here: recorder.start() only
+        // begins the session (STARTING). Every way it can end without recording -- negotiation
+        // failing, or the microphone being refused above -- reports `onError`, which triggers
+        // beginAsyncFinalize() and, through it, exactly one eventual finishRecording() call. A
+        // second, direct call here used to race that: it tore down the foreground notification
+        // and called stopSelf() *before* the outcome was even computed.
     }
 
+    /** Stops the session: finalizes a recording, or cancels one still STARTING (nothing was
+     * recorded; it then ends like a stop with no file). */
     fun stopRecording() {
-        if (!recorder.isActive) return
+        if (!recorder.isActive && !recorder.isStarting) return
         beginAsyncFinalize(genericError = null)
     }
 
     /**
      * Shared stop/finalization path for both a user-initiated Stop ([stopRecording]) and a fatal
      * mid-recording error (the `onError` callback wired up in [startRecording]). Returns promptly
-     * without waiting for the recording thread to actually finish: [WavRecorder.requestStop] (the
-     * fast, non-blocking part -- flip isRecording false, release the mic) runs synchronously
-     * right here, but the up-to-[WavRecorder]-join-timeout wait for the recording thread itself
+     * without waiting for anything: [WavRecorder.requestStop] (the non-blocking part -- flip
+     * isRecording false, hand the mic to the audio worker to be stopped and released) runs
+     * synchronously right here, but the bounded wait for the recording thread and that release
      * ([WavRecorder.awaitFinalization]) runs on a background thread instead, so neither caller
      * (typically the main thread, e.g. a button tap or the recording thread's own posted error)
-     * is ever blocked for that long -- a blocked driver or SAF write must not be able to stall
-     * the app's main thread just because the user tapped Stop.
+     * is ever blocked -- a stalled driver, audio HAL or SAF write must not be able to stall the
+     * app's main thread just because the user tapped Stop.
      *
      * [finalizingRequestId] guards only against a true duplicate call for the *same* session (e.g.
      * a rapid double Stop tap landing before [WavRecorder.requestStop] below has flipped
@@ -548,10 +596,11 @@ class RecordingService : Service() {
         val target = currentTarget
         val startedAt = sessionStartedAtMillis
         listener?.onStopping()
-        val pendingThread = recorder.requestStop()
+        val pendingStop = recorder.requestStop()
+        pendingStop.sourceReleased?.let { lastRelease = it }
         showFinalizingNotification()
         Thread({
-            val result = recorder.awaitFinalization(pendingThread)
+            val result = recorder.awaitFinalization(pendingStop)
             mainHandler.post {
                 if (finalizingRequestId == stoppedRequestId) finalizingRequestId = null
                 if (currentRequestId != stoppedRequestId) {
@@ -578,9 +627,22 @@ class RecordingService : Service() {
                     }
                 }
                 reportOutcome(outcome)
+                // The file's outcome above describes the file alone. Whether Android has finished
+                // releasing the microphone is separate, and reported separately.
+                pendingStop.sourceReleased?.takeIf { !it.isDone }?.let(::reportReleasePending)
                 finishRecording()
             }
         }, "RecordingFinalizeThread").start()
+    }
+
+    /** Tells a live listener the microphone is still being released, and again once it has been. */
+    private fun reportReleasePending(release: AudioStartup.Completion) {
+        Log.w(TAG, "The recording is finalized, but Android is still releasing the microphone")
+        listener?.onMicrophoneReleasePending()
+        release.whenDone({ mainHandler.post(it) }) {
+            Log.i(TAG, "Android has finished releasing the microphone")
+            listener?.onMicrophoneReleased()
+        }
     }
 
     /** Delivers [outcome] live if a Fragment is actually attached right now, exactly like before;
@@ -647,9 +709,9 @@ class RecordingService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // App swiped away from Recents while recording: save what we have rather than leaving
-        // a foreground service running with no UI left able to stop it.
-        if (recorder.isActive) stopRecording()
+        // App swiped away from Recents while recording (or starting): save what we have rather
+        // than leaving a foreground service running with no UI left able to stop it.
+        if (recorder.isActive || recorder.isStarting) stopRecording()
         super.onTaskRemoved(rootIntent)
     }
 
@@ -673,7 +735,11 @@ class RecordingService : Service() {
         // thread finishes, the journal record survives and WavRecoveryManager repairs the file on
         // next launch, exactly like any other abrupt-death case. Nothing here ever claims the file
         // was verified/"saved" -- this path never calls reportOutcome() at all, live or durable.
-        if (recorder.isActive) recorder.requestStop()
+        //
+        // A session still STARTING is cancelled the same way: its pending startup can then never
+        // become active on a destroyed service -- its result is declined and whatever it opened is
+        // released on the startup worker.
+        if (recorder.isActive || recorder.isStarting) recorder.requestStop()
         super.onDestroy()
     }
 
@@ -710,6 +776,10 @@ class RecordingService : Service() {
     private fun errorMessageFor(e: Exception): String = when (e) {
         is MicrophoneDisconnectedException -> getString(R.string.mic_disconnected_error)
         is MicrophoneRouteChangedException -> getString(R.string.mic_route_changed_error)
+        is ExternalMicrophoneNotInUseException -> getString(R.string.mic_mismatch_message)
+        is MicrophoneBusyException -> getString(R.string.mic_busy_error)
+        is MicrophoneStartTimeoutException ->
+            getString(if (e.waitedForRelease) R.string.mic_busy_error else R.string.mic_start_timeout_error)
         else -> getString(R.string.recording_error, e.message)
     }
 
@@ -811,7 +881,15 @@ internal enum class ForegroundStartMode { TWO_ARG, MICROPHONE_TYPE }
  * currentRequestId/currentTarget/journal ownership, or cause its terminal outcome to be discarded
  * as "stale" once the newer session's own id has replaced it.
  */
-internal enum class ServiceState { IDLE, PREPARING, RECORDING, FINALIZING }
+internal enum class ServiceState {
+    IDLE,
+    /** ACTION_START accepted (foreground, "preparing") but [RecordingService.startRecording] not yet called. */
+    PREPARING,
+    /** [RecordingService.startRecording] called: foreground, negotiating the microphone off the main thread. */
+    STARTING,
+    RECORDING,
+    FINALIZING
+}
 
 /** [ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE] was only added in API 30 (R) -- passing it to
  * `startForeground()` on API 29, where the 3-arg overload already exists but that specific type

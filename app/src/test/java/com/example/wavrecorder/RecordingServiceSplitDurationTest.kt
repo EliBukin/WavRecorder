@@ -71,7 +71,7 @@ class RecordingServiceSplitDurationTest {
         // Its own folder per session: sessions started within the same second share a timestamp,
         // and so would otherwise share file names.
         val dir = tempFolder.newFolder()
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 1, bufferSize = chunkSize) }
         )
         service.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
@@ -186,7 +186,7 @@ class RecordingServiceSplitDurationTest {
                 override fun release() {}
             }
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(blockUntilStopped(CountDownLatch(1)), 1, 4) }
         )
 

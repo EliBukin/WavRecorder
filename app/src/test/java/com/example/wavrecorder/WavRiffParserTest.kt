@@ -139,7 +139,8 @@ class WavRiffParserTest {
 
     @Test
     fun `rejects a non-PCM format code`() {
-        val bytes = riffWave(chunk("fmt ", fmtBody(audioFormat = 3)), chunk("data", ByteArray(4)))
+        // 6 = WAVE_FORMAT_ALAW. (IEEE float, code 3, is supported now -- see the float tests.)
+        val bytes = riffWave(chunk("fmt ", fmtBody(audioFormat = 6)), chunk("data", ByteArray(4)))
 
         assertNull(parse(bytes))
     }
@@ -202,10 +203,33 @@ class WavRiffParserTest {
     }
 
     @Test
-    fun `rejects WAVE_FORMAT_EXTENSIBLE with a non-PCM subformat GUID (IEEE float)`() {
+    fun `rejects WAVE_FORMAT_EXTENSIBLE with an unsupported subformat GUID (A-law)`() {
+        val alawSubformatGuid = ieeeFloatSubformatGuid.copyOf().also { it[0] = 0x06 }
         val bytes = riffWave(
-            chunk("fmt ", extensibleFmtBody(subFormatGuid = ieeeFloatSubformatGuid)),
+            chunk("fmt ", extensibleFmtBody(subFormatGuid = alawSubformatGuid)),
             chunk("data", ByteArray(4))
+        )
+
+        assertNull(parse(bytes))
+    }
+
+    @Test
+    fun `accepts WAVE_FORMAT_EXTENSIBLE with the IEEE float subformat at 32 bits`() {
+        val bytes = riffWave(
+            chunk("fmt ", extensibleFmtBody(bitsPerSample = 32, subFormatGuid = ieeeFloatSubformatGuid)),
+            chunk("data", ByteArray(8))
+        )
+
+        val format = parse(bytes)
+        assertEquals(true, format?.isFloat)
+        assertEquals(PcmEncoding.PCM_FLOAT, format?.encoding)
+    }
+
+    @Test
+    fun `rejects an IEEE float header with an impossible sample size`() {
+        val bytes = riffWave(
+            chunk("fmt ", extensibleFmtBody(bitsPerSample = 24, subFormatGuid = ieeeFloatSubformatGuid)),
+            chunk("data", ByteArray(6))
         )
 
         assertNull(parse(bytes))

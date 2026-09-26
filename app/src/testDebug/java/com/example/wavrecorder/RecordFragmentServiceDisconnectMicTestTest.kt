@@ -69,7 +69,7 @@ class RecordFragmentServiceDisconnectMicTestTest {
      * real RECORDING state be reached under Robolectric without a real microphone. */
     private fun blockingRecorder(): WavRecorder {
         val blockForever = CountDownLatch(1)
-        return WavRecorder(
+        return WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val source = object : AudioSource {
                     override fun startRecording() {}
@@ -102,7 +102,7 @@ class RecordFragmentServiceDisconnectMicTestTest {
             override fun describeMicrophone(): MicrophoneInfo =
                 MicrophoneInfo(label = "USB Mic", isExternal = true, verified = true)
         }
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -141,7 +141,7 @@ class RecordFragmentServiceDisconnectMicTestTest {
     @Test
     fun `a subsequent idle reconnection restores the idle UI and enables mic testing`() {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(blockingFake(), 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(blockingFake(), 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -172,7 +172,7 @@ class RecordFragmentServiceDisconnectMicTestTest {
     @Test
     fun `a subsequent busy reconnection displays the real recording UI, not a stale mic-test reset`() {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(blockingFake(), 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(blockingFake(), 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -225,7 +225,7 @@ class RecordFragmentServiceDisconnectMicTestTest {
             override fun describeMicrophone(): MicrophoneInfo =
                 MicrophoneInfo(label = "USB Mic", isExternal = true, verified = true)
         }
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) },
             levelUpdateIntervalMs = 0
         )

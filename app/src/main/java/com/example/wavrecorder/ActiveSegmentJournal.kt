@@ -121,7 +121,9 @@ internal open class ActiveSegmentJournal(
         private val ACTIVE_KEYS = KeySet(
             token = "active_token", type = "active_target_type", path = "active_target_path",
             uri = "active_target_uri", name = "active_target_name",
-            sampleRate = "active_sample_rate", channels = "active_channels", bits = "active_bits_per_sample"
+            sampleRate = "active_sample_rate", channels = "active_channels", bits = "active_bits_per_sample",
+            encoding = "active_encoding", channelMask = "active_channel_mask",
+            channelIndexMask = "active_channel_index_mask", dataOffset = "active_data_offset"
         )
         private const val ACTIVE_OWNER_KEY = "active_owner_process_id"
         private const val RECOVERY_COUNT_KEY = "recovery_count"
@@ -130,25 +132,63 @@ internal open class ActiveSegmentJournal(
             token = "recovery_${index}_token", type = "recovery_${index}_target_type",
             path = "recovery_${index}_target_path", uri = "recovery_${index}_target_uri",
             name = "recovery_${index}_target_name", sampleRate = "recovery_${index}_sample_rate",
-            channels = "recovery_${index}_channels", bits = "recovery_${index}_bits_per_sample"
+            channels = "recovery_${index}_channels", bits = "recovery_${index}_bits_per_sample",
+            encoding = "recovery_${index}_encoding", channelMask = "recovery_${index}_channel_mask",
+            channelIndexMask = "recovery_${index}_channel_index_mask", dataOffset = "recovery_${index}_data_offset"
         )
 
         private const val TARGET_FILE = "FILE"
         private const val TARGET_SAF = "SAF"
     }
 
+    /** The SharedPreferences keys of one record. [encoding], [channelMask], [channelIndexMask] and
+     * [dataOffset] were added with format negotiation; a record written by an earlier app version
+     * has none of them (see [Record.encoding]). */
     private class KeySet(
         val token: String, val type: String, val path: String, val uri: String, val name: String,
-        val sampleRate: String, val channels: String, val bits: String
+        val sampleRate: String, val channels: String, val bits: String,
+        val encoding: String, val channelMask: String, val channelIndexMask: String, val dataOffset: String
     )
 
+    /**
+     * One journaled segment. [sampleRate], [channels] and [bitsPerSample] (the container size) are
+     * all an earlier app version stored; [encoding] is null for such a legacy record, which always
+     * describes the classic 16-bit integer PCM, 44-byte-header layout. Records written now carry
+     * the full format and where its audio starts ([dataOffset]).
+     */
     data class Record(
         val token: String,
         val target: OutputTarget,
         val sampleRate: Int,
         val channels: Int,
-        val bitsPerSample: Int
-    )
+        val bitsPerSample: Int,
+        val encoding: PcmEncoding? = null,
+        val channelMask: Int = 0,
+        val channelIndexMask: Int = 0,
+        val dataOffset: Long = WavHeaderWriter.HEADER_SIZE.toLong()
+    ) {
+        val isLegacy: Boolean get() = encoding == null
+
+        /** The segment's full sample format, or null if the stored values don't describe one. */
+        val format: PcmFormat?
+            get() = if (encoding == null) {
+                PcmFormat.fromLegacy(sampleRate, channels, bitsPerSample)
+            } else {
+                try {
+                    PcmFormat(sampleRate, encoding, channels, channelMask, channelIndexMask)
+                } catch (_: IllegalArgumentException) {
+                    null
+                }
+            }
+
+        companion object {
+            fun of(token: String, target: OutputTarget, format: PcmFormat) = Record(
+                token, target, format.sampleRate, format.channelCount, format.containerBitsPerSample,
+                format.encoding, format.channelMask, format.channelIndexMask,
+                WavHeaderWriter.headerSize(format).toLong()
+            )
+        }
+    }
 
     /** Outcome of [claimActiveAsRecoveryCandidate]. */
     sealed class ClaimResult {
@@ -188,13 +228,25 @@ internal open class ActiveSegmentJournal(
      * never be silently ignored either way.
      */
     open fun persistActive(
+        token: String, expectedPreviousToken: String?, target: OutputTarget, format: PcmFormat
+    ): Boolean = persistRecord(Record.of(token, target, format), expectedPreviousToken)
+
+    /** Persists a record in the legacy form every earlier app version wrote (integer PCM described
+     * only by rate, channels and bit depth, with the classic 44-byte header) -- same contract as
+     * the [PcmFormat] overload, which is what recording itself uses. */
+    open fun persistActive(
         token: String, expectedPreviousToken: String?, target: OutputTarget,
         sampleRate: Int, channels: Int, bitsPerSample: Int
-    ): Boolean = synchronized(LOCK) {
+    ): Boolean {
+        if (PcmFormat.fromLegacy(sampleRate, channels, bitsPerSample) == null) return false
+        return persistRecord(Record(token, target, sampleRate, channels, bitsPerSample), expectedPreviousToken)
+    }
+
+    private fun persistRecord(record: Record, expectedPreviousToken: String?): Boolean = synchronized(LOCK) {
         val before = snapshotActive()
         if (before.record != null && before.record.token != expectedPreviousToken) return@synchronized false
         val editor = prefs.edit()
-        writeKeys(editor, ACTIVE_KEYS, token, target, sampleRate, channels, bitsPerSample)
+        writeKeys(editor, ACTIVE_KEYS, record)
         editor.putString(ACTIVE_OWNER_KEY, ProcessInstanceId.value)
         if (commitEditor(editor)) return@synchronized true
         // The edit above already applied to the in-memory SharedPreferences map (see class doc) --
@@ -239,12 +291,29 @@ internal open class ActiveSegmentJournal(
      * -- [persistActive] always tags with this process's own id. */
     internal fun persistActiveWithOwnerForTest(
         token: String, ownerProcessId: String?, target: OutputTarget, sampleRate: Int, channels: Int, bitsPerSample: Int
-    ): Boolean = synchronized(LOCK) {
-        val editor = prefs.edit()
-        writeKeys(editor, ACTIVE_KEYS, token, target, sampleRate, channels, bitsPerSample)
-        if (ownerProcessId != null) editor.putString(ACTIVE_OWNER_KEY, ownerProcessId) else editor.remove(ACTIVE_OWNER_KEY)
-        editor.commit()
-    }
+    ): Boolean = persistRecordWithOwnerForTest(
+        Record(token, target, sampleRate, channels, bitsPerSample), ownerProcessId, legacyKeysOnly = true
+    )
+
+    /** Test-only: like the overload above, for a segment of any [format] (written with the full,
+     * current key set rather than the legacy one). */
+    internal fun persistActiveWithOwnerForTest(
+        token: String, ownerProcessId: String?, target: OutputTarget, format: PcmFormat
+    ): Boolean = persistRecordWithOwnerForTest(Record.of(token, target, format), ownerProcessId, legacyKeysOnly = false)
+
+    /** [legacyKeysOnly] writes exactly the keys an earlier app version wrote (no format keys), so
+     * a test can exercise reading and recovering such a record. */
+    private fun persistRecordWithOwnerForTest(record: Record, ownerProcessId: String?, legacyKeysOnly: Boolean): Boolean =
+        synchronized(LOCK) {
+            val editor = prefs.edit()
+            writeKeys(editor, ACTIVE_KEYS, record)
+            if (legacyKeysOnly) {
+                editor.remove(ACTIVE_KEYS.encoding).remove(ACTIVE_KEYS.channelMask)
+                    .remove(ACTIVE_KEYS.channelIndexMask).remove(ACTIVE_KEYS.dataOffset)
+            }
+            if (ownerProcessId != null) editor.putString(ACTIVE_OWNER_KEY, ownerProcessId) else editor.remove(ACTIVE_OWNER_KEY)
+            editor.commit()
+        }
 
     /** Test-only: unconditionally clears the ACTIVE slot regardless of its current token or
      * owner -- lets a test reset journal state between independent scenarios that intentionally
@@ -313,9 +382,7 @@ internal open class ActiveSegmentJournal(
         val remaining = entries.toMutableList().also { it.removeAt(index) }
         val editor = prefs.edit()
         for (i in entries.indices) clearKeys(editor, recoveryKeysFor(i))
-        remaining.forEachIndexed { i, record ->
-            writeKeys(editor, recoveryKeysFor(i), record.token, record.target, record.sampleRate, record.channels, record.bitsPerSample)
-        }
+        remaining.forEachIndexed { i, record -> writeKeys(editor, recoveryKeysFor(i), record) }
         editor.putInt(RECOVERY_COUNT_KEY, remaining.size)
         if (commitEditor(editor)) return@synchronized true
         // The reindex-without-the-removed-entry edit above already applied in memory -- restore
@@ -327,7 +394,7 @@ internal open class ActiveSegmentJournal(
 
     private fun appendRecoveryEntry(editor: SharedPreferences.Editor, record: Record) {
         val count = prefs.getInt(RECOVERY_COUNT_KEY, 0)
-        writeKeys(editor, recoveryKeysFor(count), record.token, record.target, record.sampleRate, record.channels, record.bitsPerSample)
+        writeKeys(editor, recoveryKeysFor(count), record)
         editor.putInt(RECOVERY_COUNT_KEY, count + 1)
     }
 
@@ -350,7 +417,7 @@ internal open class ActiveSegmentJournal(
         if (record == null) {
             clearKeys(editor, ACTIVE_KEYS)
         } else {
-            writeKeys(editor, ACTIVE_KEYS, record.token, record.target, record.sampleRate, record.channels, record.bitsPerSample)
+            writeKeys(editor, ACTIVE_KEYS, record)
         }
         if (before.owner == null) editor.remove(ACTIVE_OWNER_KEY) else editor.putString(ACTIVE_OWNER_KEY, before.owner)
     }
@@ -363,9 +430,7 @@ internal open class ActiveSegmentJournal(
     private fun applyRecoveryQueueRestore(editor: SharedPreferences.Editor, before: List<Record>) {
         val currentCount = prefs.getInt(RECOVERY_COUNT_KEY, 0)
         for (i in 0 until maxOf(currentCount, before.size)) clearKeys(editor, recoveryKeysFor(i))
-        before.forEachIndexed { i, record ->
-            writeKeys(editor, recoveryKeysFor(i), record.token, record.target, record.sampleRate, record.channels, record.bitsPerSample)
-        }
+        before.forEachIndexed { i, record -> writeKeys(editor, recoveryKeysFor(i), record) }
         editor.putInt(RECOVERY_COUNT_KEY, before.size)
     }
 
@@ -413,14 +478,22 @@ internal open class ActiveSegmentJournal(
         commitEditor(editor)
     }
 
-    private fun writeKeys(
-        editor: SharedPreferences.Editor, keys: KeySet,
-        token: String, target: OutputTarget, sampleRate: Int, channels: Int, bitsPerSample: Int
-    ) {
-        editor.putString(keys.token, token)
-            .putInt(keys.sampleRate, sampleRate)
-            .putInt(keys.channels, channels)
-            .putInt(keys.bits, bitsPerSample)
+    /** Writes [record] under [keys]. A legacy record (no [Record.encoding]) is written exactly as
+     * an earlier version would have -- without the format keys -- so it round-trips unchanged. */
+    private fun writeKeys(editor: SharedPreferences.Editor, keys: KeySet, record: Record) {
+        val target = record.target
+        editor.putString(keys.token, record.token)
+            .putInt(keys.sampleRate, record.sampleRate)
+            .putInt(keys.channels, record.channels)
+            .putInt(keys.bits, record.bitsPerSample)
+        if (record.encoding != null) {
+            editor.putString(keys.encoding, record.encoding.name)
+                .putInt(keys.channelMask, record.channelMask)
+                .putInt(keys.channelIndexMask, record.channelIndexMask)
+                .putLong(keys.dataOffset, record.dataOffset)
+        } else {
+            editor.remove(keys.encoding).remove(keys.channelMask).remove(keys.channelIndexMask).remove(keys.dataOffset)
+        }
         when (target) {
             is OutputTarget.FileTarget -> editor
                 .putString(keys.type, TARGET_FILE)
@@ -439,6 +512,7 @@ internal open class ActiveSegmentJournal(
         editor.remove(keys.token).remove(keys.type).remove(keys.path)
             .remove(keys.uri).remove(keys.name)
             .remove(keys.sampleRate).remove(keys.channels).remove(keys.bits)
+            .remove(keys.encoding).remove(keys.channelMask).remove(keys.channelIndexMask).remove(keys.dataOffset)
     }
 
     private fun readRecord(keys: KeySet): Record? {
@@ -449,7 +523,18 @@ internal open class ActiveSegmentJournal(
         val bitsPerSample = prefs.getInt(keys.bits, 0)
         val target = readTarget(keys) ?: return null
         if (sampleRate <= 0 || channels <= 0 || bitsPerSample <= 0) return null
-        return Record(token, target, sampleRate, channels, bitsPerSample)
+        // No encoding key: written by an earlier app version -- a legacy 16-bit/44-byte record.
+        val encodingName = prefs.getString(keys.encoding, null)
+            ?: return Record(token, target, sampleRate, channels, bitsPerSample)
+        val encoding = PcmEncoding.entries.firstOrNull { it.name == encodingName } ?: return null
+        val dataOffset = prefs.getLong(keys.dataOffset, 0L)
+        if (dataOffset <= 0L) return null
+        return Record(
+            token, target, sampleRate, channels, bitsPerSample, encoding,
+            channelMask = prefs.getInt(keys.channelMask, 0),
+            channelIndexMask = prefs.getInt(keys.channelIndexMask, 0),
+            dataOffset = dataOffset
+        )
     }
 
     private fun readTarget(keys: KeySet): OutputTarget? = when (prefs.getString(keys.type, null)) {

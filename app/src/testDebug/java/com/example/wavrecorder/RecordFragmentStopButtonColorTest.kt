@@ -82,7 +82,7 @@ class RecordFragmentStopButtonColorTest {
 
     @Test
     fun `the record button turns the destructive color once a real recording actually starts`() {
-        boundService.recorder = WavRecorder(openAudioSource = { WavRecorder.RecorderConfig(blockingAudioSource(), 48000, 4) })
+        boundService.recorder = WavRecorder(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(blockingAudioSource(), 48000, 4) })
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         boundService.startRecording(1L)
 
@@ -124,7 +124,7 @@ class RecordFragmentStopButtonColorTest {
                 ?.getColorForState(intArrayOf(android.R.attr.state_enabled), -1) ?: -1
         }
 
-        boundService.recorder = WavRecorder(openAudioSource = { WavRecorder.RecorderConfig(blockingAudioSource(), 48000, 4) })
+        boundService.recorder = WavRecorder(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(blockingAudioSource(), 48000, 4) })
         boundService.startRecording(1L)
         val startDeadline = System.currentTimeMillis() + 2000
         while (!boundService.isRecording && System.currentTimeMillis() < startDeadline) Thread.sleep(5)
@@ -165,7 +165,7 @@ class RecordFragmentStopButtonColorTest {
     @Test
     fun `the microphone-test button never uses the destructive stop-recording color`() {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(blockingAudioSource(), 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(blockingAudioSource(), 48000, 4) })
 
         var testButtonColor: android.content.res.ColorStateList? = null
         var errorColor = 0

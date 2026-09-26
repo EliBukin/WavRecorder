@@ -107,7 +107,7 @@ class RecordFragmentLifecycleTest {
      * already-covered fix) would immediately stop this recording right back out again. */
     private fun blockingRecorder(): WavRecorder {
         val blockForever = java.util.concurrent.CountDownLatch(1)
-        return WavRecorder(
+        return WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val source = object : AudioSource {
                     override fun startRecording() {}

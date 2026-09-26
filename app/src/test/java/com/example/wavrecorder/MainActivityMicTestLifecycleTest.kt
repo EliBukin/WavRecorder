@@ -73,7 +73,7 @@ class MainActivityMicTestLifecycleTest {
             override fun stop() {}
             override fun release() { releaseCount++ }
         }
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
 
         scenario.onActivity { activity ->
             val fragment = recordFragmentOf(activity)
@@ -120,7 +120,7 @@ class MainActivityMicTestLifecycleTest {
     fun `switching tabs away from an active mic test does not stop a real foreground recording`() {
         val boundService = Robolectric.buildService(RecordingService::class.java).create().get()
         val blockForever = CountDownLatch(1)
-        boundService.recorder = WavRecorder(
+        boundService.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val source = object : AudioSource {
                     override fun startRecording() {}

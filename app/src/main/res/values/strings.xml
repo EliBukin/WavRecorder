@@ -52,10 +52,26 @@
     <!-- Record screen: recording details. Elapsed time itself is formatted in code (12:34, 1:02:03). -->
     <string name="elapsed_time_description">Elapsed time %1$s</string>
     <string name="session_details">Part\u00A0%1$d · new file every %2$d\u00A0min</string>
-    <string name="audio_format">%1$s · %2$d-bit · %3$s</string>
-    <string name="sample_rate_khz">%1$s kHz</string>
+    <!-- Shown instead when the WAV size limit, not the chosen split duration, decides the split. -->
+    <string name="session_details_wav_limit">Part\u00A0%1$d · new file every %2$d\u00A0min (WAV size limit)</string>
+
+    <!-- The format actually being saved (or metered, during a microphone test), e.g.
+         "Insta360 Mic Air • 48 kHz • 24-bit • Stereo". -->
+    <string name="format_separator">" • "</string>
+    <string name="format_rate_khz">%1$s\u00A0kHz</string>
+    <string name="format_bits">%1$d-bit</string>
+    <string name="format_bits_float">%1$d-bit float</string>
     <string name="audio_channels_mono">Mono</string>
     <string name="audio_channels_stereo">Stereo</string>
+    <plurals name="audio_channels_count">
+        <item quantity="one">%d channel</item>
+        <item quantity="other">%d channels</item>
+    </plurals>
+    <string name="format_note_converted">Android converts this from %1$s</string>
+    <string name="format_note_unreported">Android doesn\'t report whether it converts this format</string>
+    <string name="format_note_fallback">Standard format: the microphone\'s higher-quality formats couldn\'t be opened</string>
+    <string name="format_note_search_incomplete">The search for a higher-quality format stopped early</string>
+    <string name="format_note_best_not_reopened">A higher-quality format was found but couldn\'t be reopened</string>
 
     <!-- Section captions on the Record screen -->
     <string name="section_destination">Save to</string>
@@ -99,6 +115,11 @@
     <string name="no_external_mic_confirm_cancel">Cancel</string>
     <string name="mic_disconnected_error">External microphone disconnected. Recording was stopped and saved up to that point.</string>
     <string name="mic_route_changed_error">Recording input changed unexpectedly (no longer using the external microphone). Recording was stopped and saved up to that point.</string>
+    <!-- The microphone's previous owner hasn't been released yet (a stalled stop/release in the
+         audio system), or a start didn't finish within the startup watchdog's limit. -->
+    <string name="mic_busy_error">Android is still releasing the microphone. Try again in a moment.</string>
+    <string name="mic_start_timeout_error">The microphone didn\'t start in time. Try again.</string>
+    <string name="mic_release_pending">Android is still releasing the microphone.</string>
     <string name="recording_needs_recovery">Recording stopped, but the file may need recovery: %1$s\n(%2$s)</string>
     <string name="recording_needs_verification">Recording stopped, but saving could not be confirmed: %1$s\nPlease check the file before relying on it.</string>
     <string name="recording_needs_verification_unknown_location">Recording stopped, but saving could not be confirmed. Please check the destination folder before relying on it.</string>

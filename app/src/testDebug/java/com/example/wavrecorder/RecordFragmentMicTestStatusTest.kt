@@ -86,7 +86,7 @@ class RecordFragmentMicTestStatusTest {
     @Test
     fun `starting a test shows the active headline and a neutral waiting-for-signal status`() {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(silentBlockingSource(), 48000, 4) },
             levelUpdateIntervalMs = 0
         )
@@ -108,7 +108,7 @@ class RecordFragmentMicTestStatusTest {
     @Test
     fun `a level crossing the threshold shows Signal detected`() {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(loudBlockingSource(), 48000, 4) },
             levelUpdateIntervalMs = 0
         )
@@ -126,7 +126,7 @@ class RecordFragmentMicTestStatusTest {
     @Test
     fun `stopping the test resets the status back to idle`() {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(silentBlockingSource(), 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(silentBlockingSource(), 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -149,7 +149,7 @@ class RecordFragmentMicTestStatusTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         val chunk = byteArrayOf(1, 2, 3, 4)
         val fake = FakeAudioSource(scriptedReads = List(50) { chunk }, connected = { false })
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) },
             routeCheckIntervalMs = 0
         )

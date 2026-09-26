@@ -86,17 +86,12 @@ class RecordFragment : Fragment() {
     // setting happens to be by then.
     internal var pendingSplitDuration: RecordingSplitDuration = RecordingSplitDuration.DEFAULT
 
-    // Snapshotted at the moment a start attempt is actually made (see startAndCheckMicRoute()):
-    // whether an external input was detected/preferred beforehand, and whether the user has
-    // already explicitly agreed to fall back to the phone mic for this specific attempt (via the
-    // post-start mismatch dialog below). Together these decide whether onMicrophoneInfo's
-    // verified-route mismatch check applies at all.
-    private var expectedExternalMic = false
-    private var acceptPhoneMicForThisAttempt = false
-    // Set from within the (synchronous) onMicrophoneInfo callback and only acted on once
-    // service.startRecording() has actually returned -- see startAndCheckMicRoute() for why this
-    // can't just call stopRecording() reentrantly from inside the callback itself.
-    private var pendingMicMismatch = false
+    // Snapshotted when Record is pressed (see beginRecording()) and carried alongside
+    // pendingRequestId to the service: an external input was detected/preferred beforehand and the
+    // user hasn't explicitly agreed (via the mismatch dialog below) to use the phone mic for this
+    // attempt -- so RecordingService must refuse a session whose verified microphone isn't an
+    // external one (see RecordingService.startRecording's requireExternalMic).
+    private var pendingRequireExternalMic = false
 
     // internal (not private) + var so a test can substitute a MicTestSession wired to a fake
     // AudioSource, mirroring RecordingService's own recorder/destinationManager test seams.
@@ -106,22 +101,16 @@ class RecordFragment : Fragment() {
     // immediately, not just once the background test loop actually starts.
     private var micTestActive = false
     // Snapshotted the moment a test attempt begins: whether an external input was
-    // detected/preferred beforehand -- mirrors expectedExternalMic's identical rationale for real
-    // recording (see below). If true and the route MicTestSession actually verifies doesn't back
+    // detected/preferred beforehand -- mirrors pendingRequireExternalMic's rationale for real
+    // recording (see above). If true and the route MicTestSession actually verifies doesn't back
     // that up, the test must stop rather than silently continue against the built-in mic.
     private var expectedExternalMicForTest = false
-    // Set synchronously from within MicTestSession's onMicrophoneInfo callback and only acted on
-    // once MicTestSession.start() has actually returned -- mirrors pendingMicMismatch's identical
-    // timing constraint below. MicTestSession.start() has not finished its own start transition
-    // (generation/isActive/testThread) at the moment onMicrophoneInfo fires -- see that method's
-    // doc -- so calling MicTestSession.stop() reentrantly from inside it here would race the
-    // still-in-flight start() and could release the AudioSource out from under the background
-    // thread start() is about to spin up against it.
-    private var pendingTestMicMismatch = false
     // One-way per test session: true once a level has crossed MIC_TEST_SIGNAL_THRESHOLD, so the
     // "Signal detected" status is written at most once per test rather than toggling back and
     // forth on every throttled level update -- see updateMicTestSignalStatus().
     private var micTestSignalDetected = false
+    // The route the current microphone test verified, for the format line (see showFormat()).
+    private var lastTestMicInfo: MicrophoneInfo? = null
     // True from the moment resetMicTestUiForServiceUnavailable() runs (a service disconnect caught
     // mid-test) until a subsequent connection actually confirms genuine state -- lets
     // syncUiWithService() tell "this Fragment is showing a real, known idle state" apart from
@@ -199,7 +188,7 @@ class RecordFragment : Fragment() {
             serviceStateKnown = true
             if (pendingStart) {
                 pendingStart = false
-                startAndCheckMicRoute(service, pendingRequestId, pendingSplitDuration)
+                startRecordingOn(service, pendingRequestId, pendingSplitDuration, pendingRequireExternalMic)
             }
             syncUiWithService()
             refreshTestButtonEnabled()
@@ -283,18 +272,10 @@ class RecordFragment : Fragment() {
         }
 
         override fun onMicrophoneInfo(info: MicrophoneInfo) {
-            if (_binding != null) {
-                updateMicDeviceLabel(info)
-                // An external mic was detected/preferred for this attempt and the user hasn't
-                // already agreed to fall back to the phone mic -- but the route actually verified
-                // is either the builtin mic or couldn't be verified at all. Recorded here (not
-                // acted on) because this fires synchronously from inside recorder.start(), before
-                // RecordingService.startRecording() has even returned -- see
-                // startAndCheckMicRoute() for why stopping the session right here would be unsafe.
-                if (expectedExternalMic && !acceptPhoneMicForThisAttempt && !(info.verified && info.isExternal)) {
-                    pendingMicMismatch = true
-                }
-            }
+            // Display only: whether this microphone is acceptable for the attempt (an external one
+            // was expected) is decided by RecordingService itself before the session ever starts
+            // recording -- see pendingRequireExternalMic and handleError()'s mismatch case.
+            if (_binding != null) updateMicDeviceLabel(info)
         }
 
         override fun onFinalizationFailed(target: OutputTarget?, cause: Exception) {
@@ -304,9 +285,20 @@ class RecordFragment : Fragment() {
         override fun onFinalizationUnknown(target: OutputTarget?) {
             if (_binding != null) handleFinalizationUnknown(target)
         }
+
+        override fun onMicrophoneReleasePending() = showMicrophoneReleasePending(true)
+
+        override fun onMicrophoneReleased() = showMicrophoneReleasePending(false)
     }
 
     private fun handleError(e: Exception) {
+        if (e is ExternalMicrophoneNotInUseException) {
+            // Nothing was recorded: the session was refused before it started, because the
+            // external microphone expected for it couldn't be confirmed in use.
+            resetToIdle()
+            showExternalMicMismatchDialog()
+            return
+        }
         val message = when (e) {
             is MicrophoneDisconnectedException -> getString(R.string.mic_disconnected_error)
             is MicrophoneRouteChangedException -> getString(R.string.mic_route_changed_error)
@@ -316,10 +308,33 @@ class RecordFragment : Fragment() {
             // rather than re-wrapped in the generic "Recording error: %s" template below, which
             // would otherwise double up on wording that's already complete.
             is PersistedOutcomeException -> e.message ?: getString(R.string.recording_error, null)
-            else -> getString(R.string.recording_error, e.message)
+            else -> microphoneUnavailableMessage(e) ?: getString(R.string.recording_error, e.message)
         }
         Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
         resetToIdle()
+    }
+
+    /** The message for a start the audio worker couldn't serve -- an earlier release still running,
+     * or the startup watchdog's limit reached (see [AudioStartup]) -- or null for any other error. */
+    private fun microphoneUnavailableMessage(e: Exception): String? = when (e) {
+        is MicrophoneBusyException -> getString(R.string.mic_busy_error)
+        is MicrophoneStartTimeoutException ->
+            getString(if (e.waitedForRelease) R.string.mic_busy_error else R.string.mic_start_timeout_error)
+        else -> null
+    }
+
+    /** Adds or removes the "still releasing the microphone" line under the idle status. Reported
+     * separately from the file's own outcome, which it never changes (see
+     * [RecordingService.Listener.onMicrophoneReleasePending]). */
+    private fun showMicrophoneReleasePending(pending: Boolean) {
+        if (_binding == null || panelState != PanelState.IDLE) return
+        val line = getString(R.string.mic_release_pending)
+        val detail = binding.statusDetailText
+        val shown = if (detail.visibility == View.VISIBLE) detail.text.toString() else ""
+        val base = shown.lines().filter { it.isNotEmpty() && it != line }.joinToString("\n")
+        val text = if (pending) listOf(base, line).filter { it.isNotEmpty() }.joinToString("\n") else base
+        detail.text = text
+        detail.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
     }
 
     private fun handleSaved(lastTarget: OutputTarget?, startedAt: Long?) {
@@ -466,6 +481,9 @@ class RecordFragment : Fragment() {
         binding.chooseFolderButton.setOnClickListener { folderPicker.launch(null) }
         binding.recordButton.setOnClickListener {
             when {
+                // Still negotiating the microphone: nothing is recorded yet, so this cancels
+                // straight away, without the stop confirmation.
+                recordingService?.isStarting == true -> recordingService?.stopRecording()
                 recordingService?.isRecording == true -> confirmStopRecording()
                 latestPreferredMicStatus == PreferredMicStatus.NoneDetected -> confirmRecordWithoutExternalMic()
                 else -> requestPermissionAndRecord()
@@ -603,6 +621,10 @@ class RecordFragment : Fragment() {
             updateRecordingStatus()
             renderPanel(PanelState.RECORDING)
             service.lastMicrophoneInfo?.let { updateMicDeviceLabel(it) }
+        } else if (service.isStarting) {
+            // Reconnecting (e.g. after rotation) while the session is still negotiating its
+            // microphone -- the same "Preparing…" state this screen showed when it started it.
+            showStartingUi()
         } else if (service.isFinalizing) {
             // Reconnecting (e.g. after rotation) while a previous session's background join is
             // still in flight -- mirrors onStopping()'s live callback so this screen shows the
@@ -623,6 +645,7 @@ class RecordFragment : Fragment() {
                 // update at all).
                 resetToIdle()
             }
+            if (service.microphoneReleasePending) showMicrophoneReleasePending(true)
         }
     }
 
@@ -675,8 +698,8 @@ class RecordFragment : Fragment() {
      * fall back to the phone mic for that one attempt, so this attempt's own mismatch check must
      * not fire again for the same, already-acknowledged outcome. */
     private fun beginRecording(acceptPhoneMic: Boolean = false) {
-        expectedExternalMic = latestPreferredMicStatus is PreferredMicStatus.ExternalConnected
-        acceptPhoneMicForThisAttempt = acceptPhoneMic
+        val requireExternalMic = !acceptPhoneMic && latestPreferredMicStatus is PreferredMicStatus.ExternalConnected
+        pendingRequireExternalMic = requireExternalMic
         binding.waveformView.clear()
         binding.statusDetailText.visibility = View.GONE
 
@@ -707,42 +730,45 @@ class RecordFragment : Fragment() {
 
         val service = recordingService
         if (service != null) {
-            startAndCheckMicRoute(service, requestId, splitDuration)
+            startRecordingOn(service, requestId, splitDuration, requireExternalMic)
         } else {
             pendingStart = true
         }
         refreshTestButtonEnabled()
     }
 
-    /** Starts recording and then, only once [RecordingService.startRecording] has actually
-     * returned, checks whether [pendingMicMismatch] got set: [MicrophoneInfo] is delivered
-     * synchronously from inside [RecordingService.startRecording] (via [WavRecorder.start]),
-     * *before* the recorder's own `isRecording` flag even flips true -- calling
-     * [RecordingService.stopRecording] reentrantly from within that callback would silently no-op
-     * (stopRecording() bails out whenever the recorder doesn't consider itself active yet) and
-     * let recording continue unnoticed on the wrong input. Deferring the check to right after
-     * startRecording() returns avoids that race entirely. */
-    private fun startAndCheckMicRoute(
+    /** Asks the service to start this attempt. It returns at once: the microphone is negotiated
+     * off the main thread, so the session is normally still STARTING here -- shown as
+     * "Preparing…", with the record button offering to cancel -- and the live callbacks
+     * (onSegmentStarted for the recording, onError for a failure or a refused microphone) take it
+     * from there. With [requireExternalMic], the service itself refuses a microphone that isn't a
+     * verified external one before recording anything; that arrives as
+     * [ExternalMicrophoneNotInUseException] (see [handleError]). */
+    private fun startRecordingOn(
         service: RecordingService,
         requestId: Long,
-        splitDuration: RecordingSplitDuration
+        splitDuration: RecordingSplitDuration,
+        requireExternalMic: Boolean
     ) {
-        pendingMicMismatch = false
-        service.startRecording(requestId, splitDuration.minutes)
-        if (pendingMicMismatch) {
-            pendingMicMismatch = false
-            // The session just started (almost certainly before any audio was ever captured, per
-            // the timing above) is stopped immediately -- WavRecorder's own empty-segment cleanup
-            // deletes it rather than leaving a pointless silent file behind.
-            service.stopRecording()
-            showExternalMicMismatchDialog()
-        }
+        service.startRecording(requestId, splitDuration.minutes, requireExternalMic)
+        if (service.isStarting) showStartingUi()
+    }
+
+    /** STARTING: the microphone is still being negotiated. Nothing is recorded yet; the record
+     * button already offers to stop, which cancels the start (see the button's click handler). */
+    private fun showStartingUi() {
+        if (_binding == null) return
+        binding.statusText.text = getString(R.string.status_preparing)
+        setRecordButtonRecording(true)
+        binding.recordButton.isEnabled = true
+        refreshTestButtonEnabled()
     }
 
     /** Blocking: the user must explicitly choose, rather than recording silently continuing on an
      * input they didn't expect. Mirrors [confirmRecordWithoutExternalMic]'s wording/tone but for a
      * distinct situation -- an external mic *was* detected beforehand, it just didn't verify as
-     * actually in use once recording tried to start. */
+     * actually in use once recording tried to start (the service refused that session, so nothing
+     * was recorded). "Use phone microphone" starts a new attempt that accepts it. */
     private fun showExternalMicMismatchDialog() {
         MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.mic_mismatch_title)
@@ -824,11 +850,10 @@ class RecordFragment : Fragment() {
         if (micTestActive || recordingBusy()) return
         micTestActive = true
         micTestSignalDetected = false
-        // Snapshotted now, exactly like beginRecording()'s identical expectedExternalMic --
+        // Snapshotted now, exactly like beginRecording()'s pendingRequireExternalMic --
         // whatever AudioManager reports changing mid-test doesn't retroactively change what this
         // one attempt promised the user.
         expectedExternalMicForTest = latestPreferredMicStatus is PreferredMicStatus.ExternalConnected
-        pendingTestMicMismatch = false
         binding.testMicButton.text = getString(R.string.stop_test)
         binding.testMicButton.setIconResource(R.drawable.ic_stop)
         binding.recordButton.isEnabled = false
@@ -838,15 +863,21 @@ class RecordFragment : Fragment() {
         binding.statusDetailText.text = getString(R.string.mic_test_status_waiting)
         binding.statusDetailText.visibility = View.VISIBLE
         renderPanel(PanelState.TESTING)
+        // Returns at once: the microphone is negotiated off the main thread (the UI above already
+        // shows the test, and "Stop test" cancels it while it's still starting). Once the session
+        // is fully TESTING, onMicrophoneInfo reports the verified route -- last, so stopping the
+        // test from inside it (a mismatch) is safe.
         micTestSession.start(
             context = requireContext(),
             onMicrophoneInfo = { info ->
+                lastTestMicInfo = info
                 if (_binding != null) updateMicDeviceLabel(info)
-                // Fires synchronously from inside start(), before its own start transition has
-                // finished (see pendingTestMicMismatch's doc) -- recorded here, not acted on until
-                // start() actually returns below.
                 if (expectedExternalMicForTest && !(info.verified && info.isExternal)) {
-                    pendingTestMicMismatch = true
+                    handleMicTestMismatch()
+                } else if (micTestActive && micTestSession.active) {
+                    // The exact format a recording started now would save: the test negotiates
+                    // through the same openBestAudioRecord() real recording uses.
+                    showFormat(info, micTestSession.format, micTestSession.negotiation, micTestSession.deviceFormat)
                 }
             },
             onLevel = { level ->
@@ -857,13 +888,6 @@ class RecordFragment : Fragment() {
             },
             onError = { e -> handleMicTestError(e) }
         )
-        // Only safe to act on now that start() has fully returned -- see pendingTestMicMismatch's
-        // doc for why calling stop() from inside onMicrophoneInfo itself would race start()'s own
-        // still-in-flight generation/isActive/testThread setup.
-        if (pendingTestMicMismatch) {
-            pendingTestMicMismatch = false
-            handleMicTestMismatch()
-        }
     }
 
     private fun stopMicTest() {
@@ -882,7 +906,7 @@ class RecordFragment : Fragment() {
         val message = when (e) {
             is MicrophoneDisconnectedException -> getString(R.string.mic_test_disconnected_error)
             is MicrophoneRouteChangedException -> getString(R.string.mic_test_route_changed_error)
-            else -> getString(R.string.mic_test_error, e.message)
+            else -> microphoneUnavailableMessage(e) ?: getString(R.string.mic_test_error, e.message)
         }
         Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
         resetMicTestUi()
@@ -963,18 +987,40 @@ class RecordFragment : Fragment() {
      * changed -- see RecordingService.sessionSplitDuration), and the actual capture format. */
     private fun updateRecordingStatus() {
         binding.statusText.text = getString(R.string.status_recording)
-        val split = recordingService?.sessionSplitDuration ?: RecordingSplitDuration.DEFAULT
-        binding.sessionDetailsText.text = getString(R.string.session_details, currentPartNumber, split.minutes)
-        val format = recordingService?.sessionAudioFormat
-        binding.audioFormatText.text = format?.let { formatAudioFormat(it) }
-        binding.audioFormatText.visibility = if (format != null && panelState == PanelState.RECORDING) View.VISIBLE else View.GONE
+        val service = recordingService
+        val plan = service?.sessionSplitPlan
+        binding.sessionDetailsText.text = if (plan != null && plan.limitedByRiff) {
+            // The format outgrows a WAV file before the chosen interval: say where it really splits.
+            getString(R.string.session_details_wav_limit, currentPartNumber, (plan.effectiveSeconds / 60).toInt())
+        } else {
+            val split = service?.sessionSplitDuration ?: RecordingSplitDuration.DEFAULT
+            getString(R.string.session_details, currentPartNumber, split.minutes)
+        }
+        showFormat(service?.lastMicrophoneInfo, service?.sessionFormat, service?.sessionNegotiation, service?.sessionDeviceFormat)
     }
 
-    private fun formatAudioFormat(format: SessionAudioFormat): String {
-        val khz = format.sampleRate / 1000.0
-        val rateText = if (khz % 1.0 == 0.0) khz.toInt().toString() else String.format(Locale.getDefault(), "%.1f", khz)
-        val channels = getString(if (format.channels == 1) R.string.audio_channels_mono else R.string.audio_channels_stereo)
-        return getString(R.string.audio_format, getString(R.string.sample_rate_khz, rateText), format.bitsPerSample, channels)
+    /** The format actually being saved (or, during a microphone test, metered) with the verified
+     * device's name, plus a short note only when useful -- see [AudioFormatLabels]. Hidden when
+     * there's no format to show. */
+    private fun showFormat(
+        info: MicrophoneInfo?,
+        format: PcmFormat?,
+        negotiation: NegotiatedAudio?,
+        deviceFormat: DeviceSideFormat?
+    ) {
+        if (_binding == null) return
+        if (format == null) {
+            binding.audioFormatText.visibility = View.GONE
+            binding.formatNoteText.visibility = View.GONE
+            return
+        }
+        val context = requireContext()
+        binding.audioFormatText.text =
+            AudioFormatLabels.line(context, info?.takeIf { it.verified }?.label, format)
+        binding.audioFormatText.visibility = View.VISIBLE
+        val note = AudioFormatLabels.note(context, format, negotiation, deviceFormat)
+        binding.formatNoteText.text = note
+        binding.formatNoteText.visibility = if (note != null) View.VISIBLE else View.GONE
     }
 
     /** Shows/hides the central panel's per-state elements. The headline (statusText) and the
@@ -987,8 +1033,10 @@ class RecordFragment : Fragment() {
         val recording = state == PanelState.RECORDING
         binding.elapsedText.visibility = if (recording) View.VISIBLE else View.GONE
         binding.sessionDetailsText.visibility = if (recording) View.VISIBLE else View.GONE
-        binding.audioFormatText.visibility =
-            if (recording && recordingService?.sessionAudioFormat != null) View.VISIBLE else View.GONE
+        if (state == PanelState.IDLE || state == PanelState.FINALIZING) {
+            binding.audioFormatText.visibility = View.GONE
+            binding.formatNoteText.visibility = View.GONE
+        }
         binding.micTestNoticeText.visibility = if (state == PanelState.TESTING) View.VISIBLE else View.GONE
         binding.testMicButton.visibility =
             if (recording || state == PanelState.FINALIZING) View.GONE else View.VISIBLE

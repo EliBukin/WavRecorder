@@ -47,7 +47,7 @@ internal sealed class RecoveryOutcome {
          * actually reached storage. Without a successful reopen+readback there is no way to know
          * the real bytes on disk -- must not be assumed either fully patched or fully untouched. */
         MAYBE_PARTIAL,
-        /** The complete 44-byte header write call returned successfully and was forced to
+        /** The complete header write call returned successfully and was forced to
          * storage without error -- unlike [MAYBE_PARTIAL], the write itself is confirmed durable.
          * But the read-side reopen+verify step never *confirmed* it: verification either failed
          * outright (a parse/field mismatch), threw, or was never reached at all. Does not cover a
@@ -225,8 +225,10 @@ private fun openReadableRecoveryChannel(context: Context, target: OutputTarget):
  * touches any other WAV file, however it's shaped -- an imported or otherwise unrelated file with
  * trailing bytes is never "repaired" just because it looks similar.
  *
- * Conservative by design: recovery only ever seeks to byte 0 and rewrites the fixed 44-byte
- * header -- it never touches (or truncates) the PCM payload itself -- and only removes a
+ * Conservative by design: recovery only ever seeks to byte 0 and rewrites the segment's own header
+ * in place -- exactly as many bytes as the header the segment was created with (44 for records
+ * from earlier app versions; 44-80 depending on format now, per [ActiveSegmentJournal.Record.dataOffset])
+ * -- it never touches (or truncates) the PCM payload itself, and only removes a
  * candidate from the queue once its patch has actually been forced to storage, reopened, and
  * verified. A candidate this can't fully verify is reported honestly (see [RecoveryOutcome]) and
  * left in the queue for a later retry; independent candidates in the same queue never affect one
@@ -295,22 +297,35 @@ internal class WavRecoveryManager(
             } catch (e: Exception) {
                 return RecoveryOutcome.Failed(record.target, "Could not determine the file's real length: ${e.message}", mutation)
             }
-            if (actualLength < WavHeaderWriter.HEADER_SIZE) {
-                return RecoveryOutcome.Failed(record.target, "File is smaller than a WAV header ($actualLength bytes)", mutation)
+            val format = record.format
+                ?: return RecoveryOutcome.Failed(record.target, "Unrecognized recorded format", mutation)
+            val headerSize = record.dataOffset
+            if (actualLength < headerSize) {
+                return RecoveryOutcome.Failed(record.target, "File is smaller than its WAV header ($actualLength bytes)", mutation)
             }
-            val frameSize = record.channels * (record.bitsPerSample / 8)
-            if (frameSize <= 0) {
-                return RecoveryOutcome.Failed(record.target, "Invalid recorded format (frame size <= 0)", mutation)
-            }
-            val rawAudioBytes = actualLength - WavHeaderWriter.HEADER_SIZE
             // Align down to a complete frame: a crash can land mid-sample, and a declared data
             // size that isn't a whole number of frames would leave the trailing partial sample
-            // audible as a click/glitch in players that trust it literally.
-            alignedAudioBytes = (rawAudioBytes / frameSize) * frameSize
+            // audible as a click/glitch in players that trust it literally. Also never declare
+            // more than a WAV header can represent (a segment can't legitimately exceed it).
+            val rawAudioBytes = actualLength - headerSize
+            alignedAudioBytes = format.alignToFrame(minOf(rawAudioBytes, WavHeaderWriter.maxDataBytes(format)))
 
-            val header = WavHeaderWriter.build(record.sampleRate, record.channels, record.bitsPerSample, alignedAudioBytes)
+            val header = if (record.isLegacy) {
+                // Exactly the header an earlier app version wrote for this file.
+                WavHeaderWriter.build(record.sampleRate, record.channels, record.bitsPerSample, alignedAudioBytes)
+            } else {
+                // The RIFF size only counts a pad byte after odd-length audio if one is really there.
+                WavHeaderWriter.build(format, alignedAudioBytes, includePadByte = rawAudioBytes > alignedAudioBytes)
+            }
             val headerBytes = ByteArray(header.remaining())
             header.get(headerBytes)
+            if (headerBytes.size.toLong() != headerSize) {
+                // Never write a header of a different size than the one on disk: a longer one would
+                // overwrite audio, a shorter one would leave stale bytes before the data.
+                return RecoveryOutcome.Failed(
+                    record.target, "Recorded header size $headerSize doesn't match its format (${headerBytes.size})", mutation
+                )
+            }
 
             try {
                 writable.position(0)
@@ -366,11 +381,12 @@ internal class WavRecoveryManager(
         var readableCloseFailureMessage: String? = null
         val verified = try {
             readable.position(0)
-            val readBack = readable.readFully(WavHeaderWriter.HEADER_SIZE)
+            val readBack = readable.readFully(record.dataOffset.toInt())
             val parsed = WavRiffParser.parse(readBack.inputStream())
-            parsed != null && parsed.dataSize == alignedAudioBytes &&
+            parsed != null && parsed.dataSize == alignedAudioBytes && parsed.dataOffset == record.dataOffset &&
                 parsed.sampleRate == record.sampleRate && parsed.channels == record.channels &&
-                parsed.bitsPerSample == record.bitsPerSample
+                parsed.bitsPerSample == record.bitsPerSample &&
+                parsed.isFloat == (record.encoding?.isFloat ?: false)
         } catch (e: Exception) {
             false
         } finally {

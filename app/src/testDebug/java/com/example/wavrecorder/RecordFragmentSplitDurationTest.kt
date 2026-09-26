@@ -46,7 +46,7 @@ class RecordFragmentSplitDurationTest {
             listOf(AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_USB_DEVICE).build())
         )
         boundService = Robolectric.buildService(RecordingService::class.java).create().get()
-        boundService.recorder = WavRecorder(
+        boundService.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val stopped = CountDownLatch(1)
                 val source = object : AudioSource {

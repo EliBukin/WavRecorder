@@ -49,7 +49,7 @@ class MicTestSessionTest {
     @Test
     fun `starting and stopping a test never opens a file, journal entry, or the recording service`() {
         val fake = FakeAudioSource(scriptedReads = listOf(byteArrayOf(1, 2, 3, 4)))
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
 
         var micInfoCalls = 0
         session.start(context(), onMicrophoneInfo = { micInfoCalls++ }, onLevel = {}, onError = {})
@@ -66,7 +66,7 @@ class MicTestSessionTest {
     @Test
     fun `stop releases the AudioSource and the session reports inactive`() {
         val fake = FakeAudioSource(scriptedReads = listOf(byteArrayOf(1, 2, 3, 4)))
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
 
         session.start(context(), onMicrophoneInfo = {}, onLevel = {}, onError = {})
         assertTrue(session.active)
@@ -81,7 +81,7 @@ class MicTestSessionTest {
     fun `repeated start-stop cycles release every previous AudioSource exactly once, never leaking`() {
         val sources = List(5) { FakeAudioSource(scriptedReads = listOf(byteArrayOf(1, 2, 3, 4))) }
         var index = 0
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(sources[index++], 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(sources[index++], 48000, 4) })
 
         repeat(5) {
             session.start(context(), onMicrophoneInfo = {}, onLevel = {}, onError = {})
@@ -99,7 +99,7 @@ class MicTestSessionTest {
     fun `a disconnect detected mid-test reports MicrophoneDisconnectedException, and the caller's stop() then releases resources`() {
         val chunk = byteArrayOf(1, 2, 3, 4)
         val fake = FakeAudioSource(scriptedReads = List(50) { chunk }, connected = { false })
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) },
             routeCheckIntervalMs = 0
         )
@@ -123,7 +123,7 @@ class MicTestSessionTest {
     fun `a route change detected mid-test reports MicrophoneRouteChangedException, never silently falling back to the phone mic`() {
         val chunk = byteArrayOf(1, 2, 3, 4)
         val fake = FakeAudioSource(scriptedReads = List(50) { chunk }, routeUnchanged = { false })
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) },
             routeCheckIntervalMs = 0
         )
@@ -139,7 +139,7 @@ class MicTestSessionTest {
     @Test
     fun `a negative read result reports a fatal error and stops the test`() {
         val fake = FakeAudioSource(scriptedReads = listOf(byteArrayOf(1, 2, 3, 4))) // exhausted -> -1 next read
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
 
         var error: Exception? = null
         session.start(context(), onMicrophoneInfo = {}, onLevel = {}, onError = { e -> error = e; session.stop() })
@@ -153,7 +153,7 @@ class MicTestSessionTest {
     fun `a read() that throws is reported via onError`() {
         val boom = IOException("simulated: driver died")
         val fake = FakeAudioSource(readException = boom)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
 
         var error: Exception? = null
         session.start(context(), onMicrophoneInfo = {}, onLevel = {}, onError = { e -> error = e; session.stop() })
@@ -169,7 +169,7 @@ class MicTestSessionTest {
         val fake = FakeAudioSource(scriptedReads = List(200) { chunk })
         // A deliberately huge interval: within this fast test, at most the very first read's
         // level can ever cross it -- proving updates are throttled, not posted once per read.
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) },
             levelUpdateIntervalMs = 60_000L
         )
@@ -203,7 +203,7 @@ class MicTestSessionTest {
             override fun stop() { readReleased.countDown() } // unblocks the pending read, like SystemAudioSource
             override fun release() {}
         }
-        val session = MicTestSession(
+        val session = MicTestSession(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(blockingSource, 48000, 4) },
             levelUpdateIntervalMs = 0
         )
@@ -249,7 +249,7 @@ class MicTestSessionTest {
         }
         val fake2 = FakeAudioSource(scriptedReads = listOf(byteArrayOf(1, 2, 3, 4)))
         var callCount = 0
-        val session = MicTestSession(openAudioSource = {
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = {
             callCount++
             WavRecorder.RecorderConfig(if (callCount == 1) fake1 else fake2, 48000, 4)
         })
@@ -264,7 +264,7 @@ class MicTestSessionTest {
     @Test
     fun `openAudioSource throwing is reported via onError without leaving the session active`() {
         val boom = IllegalStateException("Microphone is unavailable")
-        val session = MicTestSession(openAudioSource = { throw boom })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { throw boom })
 
         var error: Exception? = null
         session.start(context(), onMicrophoneInfo = {}, onLevel = {}, onError = { e -> error = e })
@@ -277,7 +277,7 @@ class MicTestSessionTest {
     fun `a startRecording failure releases the just-opened source and reports onError`() {
         val boom = IllegalStateException("AudioRecord failed to initialize")
         val fake = FakeAudioSource(startRecordingException = boom)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
 
         var error: Exception? = null
         session.start(context(), onMicrophoneInfo = {}, onLevel = {}, onError = { e -> error = e })

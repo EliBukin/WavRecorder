@@ -10,18 +10,20 @@ import java.util.concurrent.atomic.AtomicInteger
  * Lets the user visually confirm the selected microphone is receiving sound -- a live level
  * meter, nothing more -- without ever touching a file, the crash-recovery journal, or
  * [RecordingService]'s foreground-service/notification machinery. Deliberately reuses the exact
- * same input-discovery/source-selection/sample-rate-negotiation/route-verification building
+ * same input-discovery/source-selection/format-negotiation/route-verification building
  * blocks [WavRecorder] itself uses for real recording ([openBestAudioRecord], [AudioSource],
  * [MicrophoneInfo], [MicrophoneDisconnectedException], [MicrophoneRouteChangedException],
- * [peakAmplitude]) rather than a second, independently-maintained implementation of USB
+ * [peakAmplitude]) -- including format negotiation, so the test meters exactly the format a real
+ * recording would save -- rather than a second, independently-maintained implementation of USB
  * microphone routing that could quietly drift from the real recording path's behavior.
  *
  * Structurally mirrors [WavRecorder]'s own start/stop/generation pattern (see that class's doc
- * for the full rationale, which applies identically here): [generation] is bumped on every
- * [start] and every [stop] so a callback from an old, already-stopped test session can never
- * update a newer session's (or no session's) UI, and [stop] never blocks its caller -- it
- * synchronously releases the [AudioSource] (which is what actually unblocks a pending [AudioSource.read])
- * and hands the bounded thread-join off to its own short-lived background thread instead.
+ * for the full rationale, which applies identically here): negotiation runs off the main thread
+ * ([AudioStartup]), [generation] is bumped on every activation and every [stop] so a callback
+ * from an old, already-stopped test session can never update a newer session's (or no session's)
+ * UI, and [stop] never blocks its caller -- it hands the [AudioSource] to the audio worker to be
+ * stopped (which is what actually unblocks a pending [AudioSource.read]) and released, and the
+ * bounded thread-join to its own short-lived background thread.
  *
  * Never opens a segment, never writes a file, never touches [ActiveSegmentJournal], never starts
  * [RecordingService] -- this is a pure, ephemeral, in-memory microphone check.
@@ -31,11 +33,15 @@ internal class MicTestSession(
     // Same rationale as WavRecorder's own identically-shaped seam: lets tests substitute a fake
     // AudioSource without a real microphone, and reuses openBestAudioRecord() by default so
     // production behavior is exactly what WavRecorder itself would pick.
-    private val openAudioSource: (Context) -> WavRecorder.RecorderConfig = ::openBestAudioRecord,
+    private val openAudioSource: StartupScope.(Context) -> WavRecorder.RecorderConfig = { openBestAudioRecord(this, it) },
     // Configurable purely so tests can shrink these below their production defaults instead of
     // waiting out real wall-clock time to exercise the cadence.
     private val levelUpdateIntervalMs: Long = LEVEL_UPDATE_INTERVAL_MS,
-    private val routeCheckIntervalMs: Long = ROUTE_CHECK_INTERVAL_MS
+    private val routeCheckIntervalMs: Long = ROUTE_CHECK_INTERVAL_MS,
+    // Same as WavRecorder's: negotiation runs on the shared audio-startup worker -- the same single
+    // thread real recording uses, so a test's startup (or its cleanup) and a recording's can never
+    // hold the microphone at once -- and its result is delivered on the main thread.
+    private val startup: AudioStartup = AudioStartup.shared
 ) {
     companion object {
         private const val THREAD_JOIN_TIMEOUT_MS = 2000L
@@ -51,82 +57,145 @@ internal class MicTestSession(
         private const val ROUTE_CHECK_INTERVAL_MS = 3000L
     }
 
+    /** IDLE -> STARTING ([start]: negotiating off the main thread) -> TESTING (the level meter
+     * runs) -> IDLE ([stop], which also cancels a STARTING test). */
+    enum class State { IDLE, STARTING, TESTING }
+
     private var audioSource: AudioSource? = null
     private var testThread: Thread? = null
     private val isActive = AtomicBoolean(false)
+
+    // The startup in flight, or null -- main-thread confined, exactly like WavRecorder's own
+    // pendingStartup: a delivery for a scope that is no longer this one is declined, and its
+    // source released on the startup worker.
+    @Volatile private var pendingStartup: StartupScope? = null
 
     // Bumped on every start() *and* every stop() -- identical rationale to WavRecorder.generation:
     // a callback already posted to the main looper by a just-stopped (or superseded) session must
     // never be allowed to update a newer session's (or no session's) UI once delivered.
     private val generation = AtomicInteger(0)
 
+    /** True while TESTING. */
     val active: Boolean get() = isActive.get()
 
-    /** Starts the test. [onMicrophoneInfo] fires synchronously, before this call returns, exactly
-     * like [WavRecorder.start] -- callers must not read it as "verified" any earlier than
-     * [MicrophoneInfo.verified] itself says (see that class's doc): this only ever reports what
-     * [AudioSource.describeMicrophone] can actually back up right now. [onLevel] fires at most
-     * every [levelUpdateIntervalMs] on the main thread. [onError] fires at most once, from the
-     * main thread; exactly like [WavRecorder]'s own `onError` contract, the session is *not* yet
-     * released when it fires -- the caller must call [stop] in response, which is what actually
-     * releases the [AudioSource] and joins the background thread. (This -- rather than releasing
-     * directly from the background thread inside the error path itself -- keeps every mutation of
-     * [audioSource]/[testThread] confined to the main thread, exactly like [WavRecorder]'s own
-     * `audioSource`/`recordingThread` fields: the background loop never touches them, only reads
-     * its own local parameters, so there's no unsynchronized cross-thread field access.) */
+    /** True while STARTING. */
+    val starting: Boolean get() = pendingStartup != null
+
+    val state: State
+        get() = when {
+            pendingStartup != null -> State.STARTING
+            isActive.get() -> State.TESTING
+            else -> State.IDLE
+        }
+
+    /** The format the current (or most recent) test opened the microphone in -- negotiated by the
+     * same [openBestAudioRecord] real recording uses, so it's exactly what a recording started now
+     * would save. Null before a test has opened, or if the most recent attempt failed. */
+    @Volatile var format: PcmFormat? = null
+        private set
+
+    /** How [format] was negotiated (null for a test/fake source). */
+    @Volatile var negotiation: NegotiatedAudio? = null
+        private set
+
+    /** The format Android captures from the device in, when known (see [DeviceSideFormat]). */
+    @Volatile var deviceFormat: DeviceSideFormat? = null
+        private set
+
+    /** Starts the test: returns at once, in STARTING, while the microphone is negotiated on the
+     * startup worker (see [AudioStartup]); the caller's (main) thread never waits for it. Once it's
+     * ready the session becomes TESTING, and then -- last, so the caller may [stop] from inside it
+     * -- [onMicrophoneInfo] reports the verified route. Callers must not read it as "verified" any
+     * earlier than [MicrophoneInfo.verified] itself says (see that class's doc). [onLevel] fires at
+     * most every [levelUpdateIntervalMs] on the main thread. [onError] fires at most once, on the
+     * main thread -- including for a startup that failed; exactly like [WavRecorder]'s own
+     * `onError` contract, the session is *not* yet released when it fires -- the caller must call
+     * [stop] in response, which is what actually releases the [AudioSource] and joins the
+     * background thread. (This -- rather than releasing directly from the background thread
+     * inside the error path itself -- keeps every mutation of [audioSource]/[testThread] confined
+     * to the main thread, exactly like [WavRecorder]'s own `audioSource`/`recordingThread` fields:
+     * the background loop never touches them, only reads its own local parameters, so there's no
+     * unsynchronized cross-thread field access.) A start the audio worker refuses (an earlier
+     * release stalled: [MicrophoneBusyException]) or its watchdog ends
+     * ([MicrophoneStartTimeoutException]) is reported through [onError] the same way, exactly
+     * once. A [stop] while STARTING cancels the startup: nothing further is reported, and what it
+     * opened is released on the worker. */
     fun start(
         context: Context,
         onMicrophoneInfo: (MicrophoneInfo) -> Unit,
         onLevel: (Float) -> Unit,
         onError: (Exception) -> Unit
     ) {
-        if (isActive.get()) return
+        if (isActive.get() || pendingStartup != null) return
+        format = null
+        negotiation = null
+        deviceFormat = null
 
-        val config = try {
-            openAudioSource(context)
-        } catch (e: Exception) {
-            onError(e)
-            return
-        }
+        val scope = startup.newScope()
+        pendingStartup = scope
+        startup.launch(
+            scope, context, openAudioSource,
+            onReady = { config ->
+                if (pendingStartup !== scope) {
+                    // Stopped or superseded meanwhile: AudioStartup releases the source.
+                    AudioStartup.Decision.Discard()
+                } else {
+                    pendingStartup = null
+                    activate(config, onMicrophoneInfo, onLevel, onError)
+                    AudioStartup.Decision.Keep
+                }
+            },
+            onFailed = { e ->
+                if (pendingStartup === scope) {
+                    pendingStartup = null
+                    onError(e)
+                }
+            }
+        )
+    }
 
+    private fun activate(
+        config: WavRecorder.RecorderConfig,
+        onMicrophoneInfo: (MicrophoneInfo) -> Unit,
+        onLevel: (Float) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        format = config.format
+        negotiation = config.negotiation
         val source = config.source
         audioSource = source
-        try {
-            source.startRecording()
-        } catch (e: Exception) {
-            try { source.release() } catch (_: Exception) {}
-            audioSource = null
-            onError(e)
-            return
-        }
-
-        // Synchronous, on the caller's own thread, exactly like WavRecorder.start() -- so a UI
-        // observing this call sees the pre-verification "connected" status immediately, and the
-        // verified one the moment startRecording() above actually confirms it.
-        onMicrophoneInfo(source.describeMicrophone())
+        deviceFormat = source.deviceSideFormat()
 
         val myGeneration = generation.incrementAndGet()
         isActive.set(true)
         testThread = Thread({
-            testLoop(myGeneration, source, config.bufferSize, onLevel, onError)
+            testLoop(myGeneration, source, config.frameAlignedBufferSize, config.format, onLevel, onError)
         }, "MicTestThread").apply { start() }
+
+        // Last, once fully TESTING: the Record screen's route check may stop the test from right
+        // here, and nothing after this line touches the session.
+        onMicrophoneInfo(source.describeMicrophone())
     }
 
     /** Never blocks: flips [isActive] false and bumps [generation] synchronously (suppressing any
-     * callback already queued on the main looper), stops/releases the [AudioSource] synchronously
-     * (which is what unblocks a pending [AudioSource.read] on most implementations, same as
-     * [WavRecorder.requestStop]), and hands the bounded thread-join off to a short-lived
-     * background thread rather than the caller's own -- so this is always safe to call directly
-     * from the main thread (a button tap, a lifecycle callback) with zero risk of stalling it,
-     * even in the worst case of a genuinely wedged driver. Idempotent: safe to call when already
-     * stopped or never started. */
+     * callback already queued on the main looper), cancels a STARTING test, and hands the active
+     * [AudioSource] to the audio worker to be stopped and released there ([AudioStartup.shutdown],
+     * exactly like [WavRecorder.requestStop]: stopping it is what unblocks a pending
+     * [AudioSource.read], and a native stop or release that stalls stalls the worker, not the
+     * caller). The bounded thread-join runs on a short-lived background thread. So this is safe to
+     * call directly from the main thread (a button tap, a lifecycle callback): it never waits on a
+     * lock, latch, thread or native call. Idempotent: safe to call when already stopped or never
+     * started. */
     fun stop() {
+        // A test still negotiating is cancelled: its delivery will be declined and whatever it
+        // opened released on the startup worker.
+        pendingStartup?.let {
+            startup.cancel(it)
+            pendingStartup = null
+        }
         isActive.set(false)
         generation.incrementAndGet()
-        audioSource?.let {
-            try { it.stop() } catch (_: Exception) {}
-            try { it.release() } catch (_: Exception) {}
-        }
+        audioSource?.let { startup.shutdown(it) }
         audioSource = null
         val thread = testThread
         testThread = null
@@ -142,6 +211,7 @@ internal class MicTestSession(
         myGeneration: Int,
         source: AudioSource,
         bufferSize: Int,
+        format: PcmFormat,
         onLevel: (Float) -> Unit,
         onError: (Exception) -> Unit
     ) {
@@ -149,6 +219,7 @@ internal class MicTestSession(
         val buffer = ByteArray(bufferSize)
         var lastLevelPost = 0L
         var lastRouteCheck = System.currentTimeMillis()
+        val emptyReads = EmptyReadBackoff()
 
         while (isActive.get() && generation.get() == myGeneration) {
             val read = try {
@@ -172,12 +243,23 @@ internal class MicTestSession(
                 )
                 break
             }
-            if (read == 0) continue
+            if (read == 0) {
+                // Paced, not retried immediately: see EmptyReadBackoff. Interrupted only when a
+                // stopped test's thread is being abandoned, so that just ends the loop.
+                try {
+                    emptyReads.onEmpty()
+                } catch (_: InterruptedException) {
+                    break
+                }
+                continue
+            }
+            emptyReads.onData()
 
             val now = System.currentTimeMillis()
             if (now - lastLevelPost >= levelUpdateIntervalMs) {
                 lastLevelPost = now
-                val level = peakAmplitude(buffer, read)
+                // Only whole frames are metered; a trailing partial frame is simply not counted.
+                val level = peakAmplitude(buffer, read, format)
                 postIfCurrent(myGeneration, handler) { onLevel(level) }
             }
 

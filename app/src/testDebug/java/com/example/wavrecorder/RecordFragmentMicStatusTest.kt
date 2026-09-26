@@ -18,6 +18,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -52,8 +53,20 @@ class RecordFragmentMicStatusTest {
         shadowOf(app()).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
     }
 
+    // Every service a test binds, so tearDown() can stop whatever recording its taps started --
+    // through the real, asynchronous startup when a test doesn't substitute a recorder: a start
+    // still pending when the test ends must not be delivered (and start recording) during a later
+    // test.
+    private val boundServices = mutableListOf<RecordingService>()
+
+    @After
+    fun stopRecordingsStartedByTheTest() {
+        boundServices.forEach { it.recorder.requestStop() }
+    }
+
     private fun bindRealService(): RecordingService {
         val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        boundServices += service
         shadowOf(app()).setComponentNameAndServiceForBindService(
             ComponentName(app(), RecordingService::class.java),
             service.LocalBinder()
@@ -70,6 +83,9 @@ class RecordFragmentMicStatusTest {
         while (service.isFinalizing && System.currentTimeMillis() < deadline) Thread.sleep(5)
         shadowOf(Looper.getMainLooper()).idle()
     }
+
+    /** Names of the recordings in the default (app-private) destination. */
+    private fun recordingFiles(): Set<String> = DestinationManager(app()).listRecordings().map { it.toString() }.toSet()
 
     private fun usbDevice(): AudioDeviceInfo =
         AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_USB_DEVICE).build()
@@ -275,7 +291,7 @@ class RecordFragmentMicStatusTest {
             override fun describeMicrophone() =
                 MicrophoneInfo(label = "Insta360 Mic Air", isExternal = true, verified = true)
         }
-        service.recorder = WavRecorder(
+        service.recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fakeSource, sampleRate = 48000, bufferSize = chunk.size) }
         )
 
@@ -320,7 +336,7 @@ class RecordFragmentMicStatusTest {
      * always points at whichever session is currently blocked in `read()`, so a test can release
      * it at the end without leaking a background thread past itself. */
     private fun recorderVerifyingAs(info: MicrophoneInfo, latestBlockLatch: Array<CountDownLatch?>): WavRecorder =
-        WavRecorder(
+        WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 val blockForever = CountDownLatch(1)
                 latestBlockLatch[0] = blockForever
@@ -349,6 +365,7 @@ class RecordFragmentMicStatusTest {
         val audioManager = app().getSystemService(AudioManager::class.java)
         shadowOf(audioManager).setInputDevices(listOf(usbDevice()))
 
+        val recordingsBefore = recordingFiles()
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         scenario.onFragment { fragment ->
             fragment.view!!.findViewById<View>(R.id.recordButton).performClick()
@@ -356,6 +373,12 @@ class RecordFragmentMicStatusTest {
 
         assertFalse("recording must not continue once the verified route mismatches what was " +
             "expected before recording started", service.isRecording)
+        // The refused session ends through the service's normal terminal-outcome path (its own
+        // background finalization), which is what delivers the dialog -- as for the retry and
+        // continue tests below.
+        awaitFinalizationAndIdle(service)
+        assertFalse("it never recorded at all", service.isRecording)
+        assertEquals("a refused session never creates a recording file", recordingsBefore, recordingFiles())
         val dialog = ShadowDialog.getLatestDialog() as? AlertDialog
         assertNotNull("expected a mismatch dialog explaining the external mic wasn't actually used",
             dialog)
@@ -373,12 +396,16 @@ class RecordFragmentMicStatusTest {
         val audioManager = app().getSystemService(AudioManager::class.java)
         shadowOf(audioManager).setInputDevices(listOf(usbDevice()))
 
+        val recordingsBefore = recordingFiles()
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         scenario.onFragment { fragment ->
             fragment.view!!.findViewById<View>(R.id.recordButton).performClick()
         }
 
         assertFalse(service.isRecording)
+        awaitFinalizationAndIdle(service) // delivers the refused session's outcome -- see above
+        assertFalse(service.isRecording)
+        assertEquals(recordingsBefore, recordingFiles())
         assertNotNull("an unverifiable route must not be allowed to silently continue either",
             ShadowDialog.getLatestDialog())
 

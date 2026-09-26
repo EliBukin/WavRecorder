@@ -20,6 +20,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.AudioDeviceInfoBuilder
 import org.robolectric.shadows.ShadowToast
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Covers the microphone test's own route-verification policy, mirroring real recording's: an
@@ -57,21 +59,35 @@ class RecordFragmentMicTestMismatchTest {
 
     private fun fakeReads() = List(50) { byteArrayOf(1, 2, 3, 4) }
 
+    /** Waits until the test loop has consumed every scripted read, so an assertion that the test
+     * is still running is made after it has genuinely been metering audio, not before. */
+    private fun awaitAllReadsConsumed(exhausted: CountDownLatch) {
+        assertTrue("the test loop never consumed its scripted reads", exhausted.await(3, TimeUnit.SECONDS))
+    }
+
     @Test
     fun `an external mic that verifies correctly lets the test keep running`() {
         expectExternalMic()
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        val exhausted = CountDownLatch(1)
         val fake = FakeAudioSource(
             scriptedReads = fakeReads(),
-            micInfo = MicrophoneInfo(label = "USB Mic", isExternal = true, verified = true)
+            onExhausted = { exhausted.countDown() },
+            micInfo = MicrophoneInfo(label = "USB Mic", isExternal = true, verified = true),
+            // Once the scripted reads are used up, the source goes quiet (0-byte reads) instead of
+            // failing with end-of-stream, which would stop the test for a reason unrelated to route
+            // verification -- the only thing that may stop it here (see the phone-mic test below).
+            readReturnsZeroWhenExhausted = true
         )
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
         }
 
         assertTrue("a verified external route must let the test keep running", session.active)
+        awaitAllReadsConsumed(exhausted)
+        assertTrue("...including after it has metered every buffer", session.active)
         session.stop()
     }
 
@@ -83,7 +99,7 @@ class RecordFragmentMicTestMismatchTest {
             scriptedReads = fakeReads(),
             micInfo = MicrophoneInfo(label = "Phone microphone", isExternal = false, verified = true)
         )
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -106,7 +122,7 @@ class RecordFragmentMicTestMismatchTest {
         expectExternalMic()
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         val fake = FakeAudioSource(scriptedReads = fakeReads(), micInfo = MicrophoneInfo.UNVERIFIED)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -121,17 +137,24 @@ class RecordFragmentMicTestMismatchTest {
         // Deliberately no expectExternalMic() call: the default (no external input registered)
         // state is exactly "no external mic was ever expected".
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        val exhausted = CountDownLatch(1)
         val fake = FakeAudioSource(
             scriptedReads = fakeReads(),
-            micInfo = MicrophoneInfo(label = "Phone microphone", isExternal = false, verified = true)
+            onExhausted = { exhausted.countDown() },
+            micInfo = MicrophoneInfo(label = "Phone microphone", isExternal = false, verified = true),
+            // Goes quiet (0-byte reads, no end-of-stream error) once the scripted reads are used
+            // up, so only the route check under test can stop the session.
+            readReturnsZeroWhenExhausted = true
         )
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
         }
 
         assertTrue("phone-mic testing must proceed normally when no external mic was ever expected", session.active)
+        awaitAllReadsConsumed(exhausted)
+        assertTrue("...including after it has metered every buffer", session.active)
         session.stop()
     }
 
@@ -148,7 +171,7 @@ class RecordFragmentMicTestMismatchTest {
             override fun describeMicrophone(): MicrophoneInfo =
                 MicrophoneInfo(label = "Phone microphone", isExternal = false, verified = true)
         }
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()
@@ -163,7 +186,7 @@ class RecordFragmentMicTestMismatchTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         shadowOf(app()).nextStartedService // drain onStart()'s bindService()-adjacent noise, if any
         val fake = FakeAudioSource(scriptedReads = fakeReads(), micInfo = MicrophoneInfo.UNVERIFIED)
-        val session = MicTestSession(openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
+        val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
         scenario.onFragment { fragment ->
             fragment.micTestSession = session
             fragment.view!!.findViewById<Button>(R.id.testMicButton).performClick()

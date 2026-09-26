@@ -112,7 +112,7 @@ class WavRecorderTest {
             OutputTarget.FileTarget(file)
         }
 
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             segmentMaxSeconds = 1,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 1, bufferSize = chunk.size) }
         )
@@ -151,7 +151,7 @@ class WavRecorderTest {
         // segmentMaxSeconds=1 (a 2-byte limit) rolls over on every chunk.
         val chunk = byteArrayOf(1, 2, 3, 4)
         var sessionCount = 0
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 sessionCount++
                 WavRecorder.RecorderConfig(FakeAudioSource(listOf(chunk, chunk)), sampleRate = 1, bufferSize = chunk.size)
@@ -204,7 +204,7 @@ class WavRecorderTest {
     fun `stopping before any audio is ever read deletes the empty segment`() {
         val fake = FakeAudioSource() // no scripted reads: exhausted (returns -1) on the very first call
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) }
         )
 
@@ -227,7 +227,7 @@ class WavRecorderTest {
         val failure = IOException("device disconnected")
         val fake = FakeAudioSource(readException = failure)
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) }
         )
 
@@ -269,7 +269,7 @@ class WavRecorderTest {
         // sampleRate=1 + segmentMaxSeconds=1 => segmentMaxBytes=2, so the first 4-byte chunk
         // immediately triggers a rollover into the broken second target.
         val fake = FakeAudioSource(scriptedReads = listOf(chunk, chunk))
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             segmentMaxSeconds = 1,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 1, bufferSize = chunk.size) }
         )
@@ -340,7 +340,7 @@ class WavRecorderTest {
         // -- making this assertion a direct check of the resource cleanup, not just the deletion.
         val segmentFile = tempFolder.newFile("segment.wav")
         val fake = FakeAudioSource() // recording never gets past opening the first segment
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) },
             wrapChannel = { channel -> FailingWriteWrapper(channel) }
         )
@@ -366,7 +366,7 @@ class WavRecorderTest {
     fun `a failure from AudioSource startRecording is caught, released, and reported`() {
         val failure = IllegalStateException("mic busy")
         val fake = FakeAudioSource(startRecordingException = failure)
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) }
         )
 
@@ -405,7 +405,7 @@ class WavRecorderTest {
             }
             override fun release() {}
         }
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
         )
         recorder.start(
@@ -457,7 +457,7 @@ class WavRecorderTest {
         }
 
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
 
@@ -542,7 +542,7 @@ class WavRecorderTest {
         }
 
         var startCallCount = 0
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 50, // fast, deterministic timeout for the test
             openAudioSource = {
                 startCallCount++
@@ -666,7 +666,7 @@ class WavRecorderTest {
             override fun release() {}
         }
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 44100, bufferSize = 4) }
         )
 
@@ -717,7 +717,7 @@ class WavRecorderTest {
         }
         val segmentFile = tempFolder.newFile("segment.wav")
         val journal = ActiveSegmentJournal(ApplicationProvider.getApplicationContext())
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             journalFor = { journal }
         )
@@ -769,7 +769,7 @@ class WavRecorderTest {
         }
         val segmentFile = tempFolder.newFile("segment.wav")
         val journal = ActiveSegmentJournal(ApplicationProvider.getApplicationContext())
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> FailingHeaderPatchWriter(channel) },
             journalFor = { journal }
@@ -821,7 +821,7 @@ class WavRecorderTest {
             override fun release() {}
         }
         val journal = ActiveSegmentJournal(ApplicationProvider.getApplicationContext())
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             segmentMaxSeconds = 1,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 1, bufferSize = chunk.size) },
             journalFor = { journal }
@@ -865,13 +865,12 @@ class WavRecorderTest {
         // than silently proceeding with degraded (nonexistent) crash protection.
         val failingJournal = object : ActiveSegmentJournal(ApplicationProvider.getApplicationContext()) {
             override fun persistActive(
-                token: String, expectedPreviousToken: String?, target: OutputTarget,
-                sampleRate: Int, channels: Int, bitsPerSample: Int
+                token: String, expectedPreviousToken: String?, target: OutputTarget, format: PcmFormat
             ): Boolean = false
         }
         val segmentFile = tempFolder.newFile("segment.wav")
         val fake = FakeAudioSource() // never actually read from -- open must fail before any read
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) },
             journalFor = { failingJournal }
         )
@@ -905,7 +904,7 @@ class WavRecorderTest {
         val clearFailingJournal = object : ActiveSegmentJournal(ApplicationProvider.getApplicationContext()) {
             override fun clearActiveIfMatches(token: String): Boolean = false
         }
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) },
             journalFor = { clearFailingJournal }
         )
@@ -955,7 +954,7 @@ class WavRecorderTest {
         // sampleRate=1 + segmentMaxSeconds=1 => segmentMaxBytes=2, so the first 4-byte chunk
         // immediately triggers a rollover into the broken second target.
         val fake = FakeAudioSource(scriptedReads = listOf(chunk, chunk))
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             segmentMaxSeconds = 1,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 1, bufferSize = chunk.size) }
         )
@@ -1052,7 +1051,7 @@ class WavRecorderTest {
         }
 
         var startCallCount = 0
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             segmentMaxSeconds = 1,
             threadJoinTimeoutMs = 50, // fast, deterministic timeout for the test
             openAudioSource = {
@@ -1162,12 +1161,15 @@ class WavRecorderTest {
     @Test
     fun `writes are looped to completion even when the writer only makes partial progress`() {
         val chunk = ByteArray(37) { it.toByte() } // deliberately not a multiple of the 5-byte cap below
+        // Only whole frames are ever written: the 37th byte is half a 16-bit sample, held back
+        // until this next read completes its frame -- so all 38 bytes must still land, in order.
+        val completion = byteArrayOf(37)
         val doneLatch = CountDownLatch(1)
-        val fake = FakeAudioSource(scriptedReads = listOf(chunk), onExhausted = { doneLatch.countDown() })
+        val fake = FakeAudioSource(scriptedReads = listOf(chunk, completion), onExhausted = { doneLatch.countDown() })
         val segmentFile = tempFolder.newFile("segment.wav")
 
-        val recorder = WavRecorder(
-            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) },
+        val recorder = WavRecorder(startup = ImmediateStartup,
+            openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size + 1) },
             wrapChannel = { channel -> PartialWriteWrapper(channel, maxBytesPerCall = 5) }
         )
 
@@ -1184,9 +1186,9 @@ class WavRecorderTest {
 
         segmentFile.inputStream().use { input ->
             val format = WavRiffParser.parse(input)
-            assertEquals(chunk.size.toLong(), format?.dataSize)
+            assertEquals(chunk.size.toLong() + completion.size, format?.dataSize)
             assertArrayEquals("audio data must be complete and byte-for-byte correct despite " +
-                "every write() call only draining 5 bytes at a time", chunk, input.readBytes())
+                "every write() call only draining 5 bytes at a time", chunk + completion, input.readBytes())
         }
     }
 
@@ -1205,7 +1207,7 @@ class WavRecorderTest {
             override fun release() {}
             override fun describeMicrophone(): MicrophoneInfo = expectedInfo
         }
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) }
         )
 
@@ -1231,7 +1233,7 @@ class WavRecorderTest {
         // A fake/test source (or a real device that can't determine routing) must never be
         // reported as a confidently-external mic it can't actually back up.
         val fake = FakeAudioSource() // no describeMicrophone() override: uses the interface default
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = 4) }
         )
 
@@ -1271,7 +1273,7 @@ class WavRecorderTest {
             override fun isDeviceConnected(): Boolean = connected.get()
         }
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             headerFlushIntervalMs = 10, // fast disconnect-check cadence for the test
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -1325,7 +1327,7 @@ class WavRecorderTest {
             override fun isRouteUnchanged(): Boolean = routeUnchanged.get()
         }
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             headerFlushIntervalMs = 10, // fast route-check cadence for the test
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -1376,7 +1378,7 @@ class WavRecorderTest {
             override fun release() {}
         }
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             // position(0) is only ever called to seek back and (re)write the header -- regular
             // audio writes never reposition -- so failing exactly that call simulates a header
@@ -1436,7 +1438,7 @@ class WavRecorderTest {
             override fun release() {}
         }
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> FailingCloseWriter(channel) }
         )
@@ -1469,7 +1471,7 @@ class WavRecorderTest {
         // sampleRate=1 + segmentMaxSeconds=1 => segmentMaxBytes=2, so the first 4-byte chunk
         // immediately triggers a rollover -- straight into the header patch failure below.
         val fake = FakeAudioSource(scriptedReads = listOf(chunk, chunk, chunk))
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             segmentMaxSeconds = 1,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 1, bufferSize = chunk.size) },
             wrapChannel = { channel -> FailingHeaderPatchWriter(channel) }
@@ -1561,7 +1563,7 @@ class WavRecorderTest {
             override fun release() {}
         }
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             headerFlushIntervalMs = 10, // fast flush cadence so the test doesn't wait out the 3s default
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> HeaderWriteThenBrokenRestoreWriter(channel) }
@@ -1639,7 +1641,7 @@ class WavRecorderTest {
             override fun release() {}
         }
         val segmentFile = tempFolder.newFile("segment.wav")
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             headerFlushIntervalMs = 10,
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
             wrapChannel = { channel -> TransientHeaderWriteFailureWriter(channel) }
@@ -1701,7 +1703,7 @@ class WavRecorderTest {
         // Session B (the second start() call on this same recorder) fails synchronously while
         // "opening the microphone" -- before any recording thread, segment, or finalization
         // attempt of its own could ever exist.
-        val recorder = WavRecorder(
+        val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = {
                 startCount++
                 if (startCount == 1) {

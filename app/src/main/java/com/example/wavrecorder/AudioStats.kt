@@ -3,7 +3,6 @@ package com.example.wavrecorder
 import android.content.Context
 import android.net.Uri
 import java.io.InputStream
-import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.sqrt
 
@@ -16,7 +15,9 @@ data class AudioStats(
     val sampleCount: Long,
     val peakDbfs: Double?,
     val rmsDbfs: Double?,
-    val clippedSamples: Long
+    val clippedSamples: Long,
+    /** True for IEEE-float samples. */
+    val isFloat: Boolean = false
 ) {
     val bitrateKbps: Double get() = sampleRate.toLong() * channels * bitsPerSample / 1000.0
 }
@@ -33,13 +34,12 @@ internal data class Pcm16ScanResult(
 )
 
 /**
- * Parses the WAV header for its declared format, then scans every 16-bit
- * PCM sample once to get peak level, RMS level and clipped-sample count.
+ * Parses the WAV header for its declared format, then scans every sample once (any encoding
+ * [WavRiffParser.Format.encoding] recognizes: 16/24/32-bit integer or 32-bit float, any number of
+ * channels) to get peak level, RMS level and clipped-sample count.
  * Meant to run off the main thread: reading + scanning is O(file size).
  */
 object AudioStatsReader {
-
-    private const val FULL_SCALE = 32768.0 // magnitude of a full-scale 16-bit sample
 
     fun read(context: Context, uri: Uri): AudioStats? {
         return try {
@@ -53,10 +53,11 @@ object AudioStatsReader {
                 val actualFileSize = WavFileInfo.queryActualSize(context, uri)
                 if (WavRiffParser.isDataComplete(actualFileSize, format) == false) return null
 
-                val scan: Pcm16ScanResult?
+                val encoding = format.encoding
+                val scan: PcmScanResult?
                 val dataBytesAvailable: Long
-                if (format.bitsPerSample == 16) {
-                    val result = scanPcm16Samples(input, format.dataSize)
+                if (encoding != null) {
+                    val result = scanPcmSamples(input, format.dataSize, encoding)
                     scan = result
                     dataBytesAvailable = result.bytesRead
                 } else {
@@ -68,12 +69,13 @@ object AudioStatsReader {
                 // be misleading, so treat the whole file as unreadable rather than report them.
                 if (dataBytesAvailable < format.dataSize) return null
 
+                val fullScale = encoding?.let { PcmSamples.fullScale(it) } ?: 1.0
                 val peakDbfs = if (scan != null && scan.sampleCount > 0 && scan.peak > 0) {
-                    20 * log10(scan.peak / FULL_SCALE)
+                    20 * log10(scan.peak / fullScale)
                 } else null
                 val rmsDbfs = if (scan != null && scan.sampleCount > 0) {
                     val rms = sqrt(scan.sumSquares / scan.sampleCount)
-                    if (rms > 0) 20 * log10(rms / FULL_SCALE) else null
+                    if (rms > 0) 20 * log10(rms / fullScale) else null
                 } else null
 
                 val duration = if (format.byteRate > 0) format.dataSize.toDouble() / format.byteRate else 0.0
@@ -88,7 +90,8 @@ object AudioStatsReader {
                     sampleCount = scan?.sampleCount ?: 0L,
                     peakDbfs = peakDbfs,
                     rmsDbfs = rmsDbfs,
-                    clippedSamples = scan?.clippedSamples ?: 0L
+                    clippedSamples = scan?.clippedSamples ?: 0L,
+                    isFloat = format.isFloat
                 )
             }
         } catch (e: InterruptedException) {
@@ -103,58 +106,14 @@ object AudioStatsReader {
     }
 }
 
-/**
- * Scans exactly [dataSize] bytes of 16-bit little-endian PCM audio from [input]. Each
- * [InputStream.read] call can return an arbitrary number of bytes, including an odd count, so a
- * sample can straddle two reads; the trailing unpaired byte from one read is carried over
- * ([leftover]) and combined with the first byte of the next read instead of being discarded,
- * which would otherwise desync every following sample boundary in that segment.
- */
+/** 16-bit shorthand for [scanPcmSamples] (the only format earlier versions recorded). */
 internal fun scanPcm16Samples(input: InputStream, dataSize: Long): Pcm16ScanResult {
-    var peak = 0
-    var sumSquares = 0.0
-    var sampleCount = 0L
-    var clipped = 0L
-    var leftover: Byte? = null
-
-    fun consumeSample(low: Byte, high: Byte) {
-        val sample = ((high.toInt() shl 8) or (low.toInt() and 0xFF)).toShort().toInt()
-        val magnitude = abs(sample)
-        if (magnitude > peak) peak = magnitude
-        sumSquares += sample.toDouble() * sample.toDouble()
-        sampleCount++
-        if (magnitude >= 32767) clipped++
-    }
-
-    var remaining = dataSize
-    val buffer = ByteArray(8192)
-    while (remaining > 0) {
-        // Checked once per chunk (not per sample): cooperative cancellation only needs to be
-        // noticed promptly, not instantly, and this is cheap enough to not matter either way. A
-        // cancelled coroutine's runInterruptible() wrapper (see LibraryFragment.showStats) marks
-        // this thread interrupted; without a check somewhere in this loop a large file would keep
-        // scanning to completion regardless of cancellation, exactly the gap this closes.
-        if (Thread.interrupted()) throw InterruptedException("Audio stats scan interrupted")
-        val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-        val n = input.read(buffer, 0, toRead)
-        if (n < 0) break
-        remaining -= n
-
-        var i = 0
-        val pending = leftover
-        if (pending != null && n > 0) {
-            consumeSample(low = pending, high = buffer[0])
-            leftover = null
-            i = 1
-        }
-        while (i + 1 < n) {
-            consumeSample(low = buffer[i], high = buffer[i + 1])
-            i += 2
-        }
-        if (i < n) {
-            leftover = buffer[i]
-        }
-    }
-
-    return Pcm16ScanResult(peak, sumSquares, sampleCount, clipped, bytesRead = dataSize - remaining)
+    val result = scanPcmSamples(input, dataSize, PcmEncoding.PCM_16)
+    return Pcm16ScanResult(
+        peak = result.peak.toInt(),
+        sumSquares = result.sumSquares,
+        sampleCount = result.sampleCount,
+        clippedSamples = result.clippedSamples,
+        bytesRead = result.bytesRead
+    )
 }

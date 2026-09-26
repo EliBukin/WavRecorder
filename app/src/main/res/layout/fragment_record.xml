@@ -183,7 +183,8 @@
                         tools:text="Jul 27, 2026 · 1:31 AM · 13 seconds"
                         tools:visibility="visible" />
 
-                    <!-- Recording only: elapsed time, part/split, and the capture format. -->
+                    <!-- Recording only: elapsed time and part/split. The format line below is also
+                         shown during a microphone test. -->
                     <TextView
                         android:id="@+id/elapsedText"
                         android:layout_width="wrap_content"
@@ -212,7 +213,21 @@
                         android:layout_marginTop="2dp"
                         android:textAppearance="@style/TextAppearance.WavRecorder.Secondary"
                         android:visibility="gone"
-                        tools:text="48 kHz · 16-bit · Mono"
+                        tools:text="Insta360 Mic Air • 48 kHz • 24-bit • Stereo"
+                        tools:visibility="visible" />
+
+                    <!-- Only when useful (see AudioFormatLabels.note): Android converting the
+                         format or not reporting whether it does, a compatibility fallback after
+                         the advertised formats failed, and/or a format search that stopped early. -->
+                    <TextView
+                        android:id="@+id/formatNoteText"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:textAppearance="?attr/textAppearanceBodySmall"
+                        android:textColor="?attr/colorOnSurfaceVariant"
+                        android:visibility="gone"
+                        tools:text="Android converts this from 44.1 kHz • 16-bit • Mono"
                         tools:visibility="visible" />
 
                     <!-- Audio level: hidden entirely while idle, since a flat idle waveform carries
