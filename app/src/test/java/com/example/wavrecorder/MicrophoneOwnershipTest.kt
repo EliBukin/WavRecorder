@@ -6,6 +6,7 @@ import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -20,6 +21,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -143,6 +145,40 @@ class MicrophoneOwnershipTest {
         }
         shadowOf(Looper.getMainLooper()).idle()
         check(condition()) { "timed out waiting: $what" }
+    }
+
+    /**
+     * Waits, at most [timeoutMs], until every microphone operation queued on [worker] so far has
+     * finished -- not just whatever happens to be running at this moment. Each round queues a
+     * barrier behind everything on the worker (single-threaded, so first in, first out) and waits
+     * for it, then runs what that work delivered to the main looper, which may queue more (a
+     * declined source's release). It ends once a round leaves nothing queued, running or posted.
+     */
+    private fun awaitMicrophoneWorkDone(worker: ExecutorService, startup: AudioStartup, timeoutMs: Long = 5000) {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        val looper = shadowOf(Looper.getMainLooper())
+        while (true) {
+            val outstanding = "${startup.workerState()}, ${startup.queuedTasks} queued, main looper idle: ${looper.isIdle}"
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) throw AssertionError("microphone work still outstanding after $timeoutMs ms: $outstanding")
+            try {
+                worker.submit {}.get(remaining, TimeUnit.NANOSECONDS)
+            } catch (e: TimeoutException) {
+                throw AssertionError("microphone work still outstanding after $timeoutMs ms: $outstanding", e)
+            }
+            looper.idle()
+            if (startup.queuedTasks == 0 && startup.workerState() == AudioStartup.WorkerState.Idle && looper.isIdle) return
+        }
+    }
+
+    /** Runs [worker] and [deliver] until neither has anything left (deliveries can queue releases). */
+    private fun drain(worker: ManualExecutor, deliver: ManualExecutor) {
+        repeat(100) {
+            if (worker.pending == 0 && deliver.pending == 0) return
+            worker.runAll()
+            deliver.runAll()
+        }
+        throw AssertionError("still queuing work after 100 rounds: ${worker.pending} on the worker, ${deliver.pending} to deliver")
     }
 
     // ---- A delivery that runs before the stop's cleanup -----------------------------------------
@@ -380,7 +416,8 @@ class MicrophoneOwnershipTest {
     @Test
     fun `rapid switching between the microphone test and recording never has two owners`() {
         val ledger = Ledger()
-        val startup = AudioStartup(realWorker(), mainThread)
+        val worker = realWorker()
+        val startup = AudioStartup(worker, mainThread)
         val session = session(startup, opener(ledger, "test") { Thread.sleep(1) })
         val recorder = recorder(startup, opener(ledger, "rec") { Thread.sleep(1) })
         val dir = tempFolder.newFolder()
@@ -392,12 +429,81 @@ class MicrophoneOwnershipTest {
             if (random.nextBoolean()) shadowOf(Looper.getMainLooper()).idle()
             if (round % 2 == 0) session.stop() else recorder.requestStop()
         }
-        session.begin()
+        // A slow worker can fall far enough behind these rounds that a start right now would be
+        // refused, by design, for the queue being full (covered on its own below). The start that
+        // must succeed therefore waits until all of that work has finished and every source has
+        // been released.
+        awaitMicrophoneWorkDone(worker, startup)
+        assertEquals("every source released before the final start: ${ledger.log}", emptySet<String>(), ledger.holding)
+
+        val errors = Collections.synchronizedList(mutableListOf<Exception>())
+        session.begin(errors)
         awaitStartupDelivered { session.starting }
-        assertTrue(session.active)
+        assertTrue("the final start failed: $errors", session.active)
         session.stop()
-        waitFor("everything released") { ledger.holding.isEmpty() && startup.workerState() == AudioStartup.WorkerState.Idle }
+        awaitMicrophoneWorkDone(worker, startup)
+        assertEquals("everything released: ${ledger.log}", emptySet<String>(), ledger.holding)
 
         assertEquals("never two owners: ${ledger.log}", 1, ledger.maxHeld)
+    }
+
+    // ---- A full worker queue -----------------------------------------------------------------------
+
+    @Test
+    fun `a start behind a full worker queue is refused at once, opens nothing, and a start after the queue drains succeeds`() {
+        val ledger = Ledger()
+        val worker = ManualExecutor()
+        val deliver = ManualExecutor()
+        val limits = StartupLimits()
+        val startup = AudioStartup(worker, deliver, limits = limits)
+        val session = session(startup, opener(ledger, "test"))
+        val recorder = recorder(startup, opener(ledger, "rec"))
+        val dir = tempFolder.newFolder()
+
+        session.begin()
+        drain(worker, deliver)
+        assertTrue(session.active)              // test1 holds the microphone
+
+        // Nothing runs on the worker from here until it is drained: test1's release, then rapid
+        // starts and stops -- each queuing its open, then its cleanup -- until the queue is full.
+        session.stop()
+        var round = 0
+        while (startup.queuedTasks < limits.maxQueuedTasks) {
+            if (round++ % 2 == 0) {
+                recorder.begin(dir)
+                recorder.requestStop()
+            } else {
+                session.begin()
+                session.stop()
+            }
+        }
+        val queued = startup.queuedTasks
+
+        val errors = mutableListOf<Exception>()
+        session.begin(errors)
+        deliver.runAll()
+        assertTrue("got $errors", errors.single() is MicrophoneBusyException)
+        assertTrue(errors.single().message!!.startsWith("Too many earlier microphone operations are still waiting"))
+        assertFalse("a refused start isn't left starting", session.starting)
+        assertFalse(session.active)
+        assertEquals("the refused start queued nothing", queued, startup.queuedTasks)
+        assertEquals("nothing opened while test1 is held", listOf("+test1"), ledger.log)
+
+        drain(worker, deliver)                  // test1 is released; the stopped starts open nothing
+        assertEquals(0, startup.queuedTasks)
+        assertEquals(AudioStartup.WorkerState.Idle, startup.workerState())
+        assertEquals(emptySet<String>(), ledger.holding)
+        assertEquals("the refusal is reported once", 1, errors.size)
+
+        val retryErrors = mutableListOf<Exception>()
+        session.begin(retryErrors)
+        drain(worker, deliver)
+        assertTrue("the start after the queue drained failed: $retryErrors", session.active)
+        session.stop()
+        drain(worker, deliver)
+
+        assertEquals(listOf("+test1", "-test1", "+test2", "-test2"), ledger.log)
+        assertEquals("never two owners", 1, ledger.maxHeld)
+        assertEquals(emptySet<String>(), ledger.holding)
     }
 }
