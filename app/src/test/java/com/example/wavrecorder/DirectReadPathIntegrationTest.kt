@@ -41,6 +41,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class DirectReadPathIntegrationTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()

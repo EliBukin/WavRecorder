@@ -15,6 +15,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.ShadowMediaPlayer
@@ -31,6 +32,9 @@ import java.time.Duration
  */
 @RunWith(RobolectricTestRunner::class)
 class LibraryFragmentPlaybackTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
@@ -54,7 +58,7 @@ class LibraryFragmentPlaybackTest {
     }
 
     private fun launchWithItems(items: List<RecordingItem>): FragmentScenario<LibraryFragment> {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(app()) {
                 override fun listRecordings(): List<RecordingItem> = items

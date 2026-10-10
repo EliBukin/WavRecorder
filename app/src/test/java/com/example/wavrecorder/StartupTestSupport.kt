@@ -109,3 +109,19 @@ internal fun awaitStartupDelivered(timeoutMs: Long = 5_000, starting: () -> Bool
     org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
     check(!starting()) { "startup was not delivered within $timeoutMs ms" }
 }
+
+/**
+ * Stops [this] service's session and waits for its background finalization to be delivered, so
+ * nothing it posts to the main looper can land in -- and break -- a later test. Fails if it isn't
+ * delivered within [timeoutMs]: a cleanup that timed out is not a clean finish.
+ */
+internal fun RecordingService.stopAndAwaitFinalization(timeoutMs: Long = 5_000) {
+    stopRecording()
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (isFinalizing && System.currentTimeMillis() < deadline) {
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        Thread.sleep(5)
+    }
+    org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+    check(!isFinalizing) { "The recording's finalization was not delivered within $timeoutMs ms" }
+}

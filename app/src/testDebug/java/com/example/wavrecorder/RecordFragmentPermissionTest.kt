@@ -7,6 +7,7 @@ import android.content.DialogInterface
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Looper
+import android.view.View
 import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.testing.launchFragmentInContainer
 import androidx.test.core.app.ApplicationProvider
@@ -17,6 +18,7 @@ import org.junit.Test
 import org.junit.After
 import org.junit.Before
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -35,6 +37,9 @@ import org.robolectric.shadows.ShadowToast
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class RecordFragmentPermissionTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
@@ -81,8 +86,10 @@ class RecordFragmentPermissionTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         shadowOf(app()).nextStartedService // drain the bindService() from onStart() before checking
         scenario.onFragment { fragment ->
-            // Simulates what RequestMultiplePermissions actually hands back in this situation:
-            // only the permission that was requested (and denied) appears in the map.
+            // The Record tap launches the permission request (only notifications are missing)...
+            fragment.requireView().findViewById<View>(R.id.recordButton).performClick()
+            // ...and this simulates what RequestMultiplePermissions actually hands back in this
+            // situation: only the permission that was requested (and denied) appears in the map.
             fragment.handlePermissionResult(mapOf(Manifest.permission.POST_NOTIFICATIONS to false))
         }
 
@@ -108,6 +115,7 @@ class RecordFragmentPermissionTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         shadowOf(app()).nextStartedService
         scenario.onFragment { fragment ->
+            fragment.requireView().findViewById<View>(R.id.recordButton).performClick()
             fragment.handlePermissionResult(mapOf(Manifest.permission.POST_NOTIFICATIONS to false))
         }
 
@@ -125,6 +133,7 @@ class RecordFragmentPermissionTest {
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
         shadowOf(app()).nextStartedService // drain the bindService() from onStart() before checking
         scenario.onFragment { fragment ->
+            fragment.requireView().findViewById<View>(R.id.recordButton).performClick()
             fragment.handlePermissionResult(mapOf(Manifest.permission.RECORD_AUDIO to false))
         }
 

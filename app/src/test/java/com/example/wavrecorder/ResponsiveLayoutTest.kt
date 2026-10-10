@@ -17,6 +17,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -37,6 +38,9 @@ import java.util.concurrent.TimeUnit
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(qualifiers = "w320dp-h640dp-xhdpi", fontScale = 1.3f)
 class ResponsiveLayoutTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
     private lateinit var service: RecordingService
@@ -126,7 +130,7 @@ class ResponsiveLayoutTest {
     }
 
     private fun launch(): ActivityScenario<MainActivity> {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         idle()
         return scenario
     }
@@ -163,7 +167,7 @@ class ResponsiveLayoutTest {
                 a.findViewById<TextView>(it).assertFullyShown()
             }
         }
-        service.stopRecording()
+        service.stopAndAwaitFinalization()
     }
 
     private fun libraryScreen(selection: Boolean) {

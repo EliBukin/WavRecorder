@@ -30,6 +30,9 @@ class RecordingsAdapter(
     private val isSelected: (Uri) -> Boolean = { false },
     private val onToggleSelect: (RecordingItem) -> Unit = {},
     private val onLongPress: (RecordingItem) -> Unit = {},
+    /** True while the file is being recorded, finalized or repaired ([RecordingOwnership]): the
+     * row is labelled so, and offers no playback, deletion or selection. */
+    private val isInUse: (Uri) -> Boolean = { false },
     // "Now" for the presentation-only date group headers (Today/Yesterday/...) -- see
     // RecordingDateGroups. A seam only so tests can pin the date.
     private val nowMillis: () -> Long = System::currentTimeMillis
@@ -84,12 +87,14 @@ class RecordingsAdapter(
         ViewCompat.setAccessibilityHeading(holder.binding.dateHeader, header != null)
 
         val selectionMode = isSelectionModeActive()
+        val inUse = isInUse(item.uri)
         val selected = selectionMode && isSelected(item.uri)
         holder.binding.root.isActivated = selected
         holder.binding.root.setOnClickListener { if (isSelectionModeActive()) onToggleSelect(item) }
         holder.binding.root.setOnLongClickListener { onLongPress(item); true }
         holder.binding.selectionCheckbox.visibility = if (selectionMode) View.VISIBLE else View.GONE
         holder.binding.selectionCheckbox.isChecked = selected
+        holder.binding.selectionCheckbox.isEnabled = !inUse
         // isActivated above only drives the visual (background) selected state -- TalkBack doesn't
         // announce it. A localized state description does, layered on top of (not replacing) the
         // row's default "speak children" announcement, so the filename (from the fileName TextView
@@ -98,13 +103,13 @@ class RecordingsAdapter(
         // last showed.
         ViewCompat.setStateDescription(
             holder.binding.root,
-            if (selectionMode) {
-                holder.binding.root.context.getString(
+            when {
+                inUse -> holder.binding.root.context.getString(R.string.recording_in_use)
+                selectionMode -> holder.binding.root.context.getString(
                     if (selected) R.string.selection_row_selected_description
                     else R.string.selection_row_not_selected_description
                 )
-            } else {
-                null
+                else -> null
             }
         )
 
@@ -123,7 +128,24 @@ class RecordingsAdapter(
             holder.binding.fileMeta.visibility = View.VISIBLE
             holder.binding.seekRow.visibility = View.GONE
             holder.binding.seekBar.setOnSeekBarChangeListener(null)
-            holder.binding.fileMeta.text = formatMeta(holder, item)
+            holder.binding.fileMeta.text = if (inUse) context.getString(R.string.recording_in_use) else formatMeta(holder, item)
+            return
+        }
+
+        if (inUse) {
+            // Being written right now: no playback, no delete, and no size/duration that would
+            // already be out of date.
+            holder.binding.activeAccent.visibility = View.INVISIBLE
+            holder.binding.rowActions.visibility = View.VISIBLE
+            holder.binding.preparingIndicator.visibility = View.GONE
+            holder.binding.playButton.visibility = View.INVISIBLE
+            holder.binding.playButton.setOnClickListener(null)
+            holder.binding.overflowButton.visibility = View.INVISIBLE
+            holder.binding.overflowButton.setOnClickListener(null)
+            holder.binding.seekRow.visibility = View.GONE
+            holder.binding.seekBar.setOnSeekBarChangeListener(null)
+            holder.binding.fileMeta.visibility = View.VISIBLE
+            holder.binding.fileMeta.text = context.getString(R.string.recording_in_use)
             return
         }
 

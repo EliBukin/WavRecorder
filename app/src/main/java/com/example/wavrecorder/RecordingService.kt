@@ -125,6 +125,7 @@ class RecordingService : Service() {
 
     private var sessionTimestamp: String? = null
     private var sessionStartedAtMillis: Long? = null
+    private var sessionRecordedMillis: Long? = null
     private val partCounter = AtomicInteger(0)
     private var currentTarget: OutputTarget? = null
     private var currentPartNumber = 1
@@ -241,6 +242,9 @@ class RecordingService : Service() {
      * [lastTarget] and [lastMicrophoneInfo] already do. Null once reset by a new [startRecording]
      * call, same lifecycle as the rest of this session's state. */
     val lastSessionStartedAtMillis: Long? get() = sessionStartedAtMillis
+    /** How much audio the most recently finished session wrote, across all its files (see
+     * [RecordingOutcome.Saved.recordedMillis]); null until one has finished. */
+    val lastSessionRecordedMillis: Long? get() = sessionRecordedMillis
     /** The already-validated split duration the current (or most recently started) session was
      * started with -- fixed for that session's whole lifetime, regardless of any later change to
      * the user's setting. Null until the first [startRecording] call. */
@@ -489,6 +493,7 @@ class RecordingService : Service() {
         // report that old, already-finished file as if it were this session's newly saved result.
         currentTarget = null
         microphoneInfo = null
+        sessionRecordedMillis = null
         if (!RecordingSplitDuration.isValidMinutes(splitMinutes)) {
             Log.w(TAG, "Unsupported split duration of $splitMinutes minutes requested; " +
                 "using ${RecordingSplitDuration.DEFAULT.minutes} minutes instead")
@@ -584,10 +589,15 @@ class RecordingService : Service() {
      *
      * [genericError], when non-null, is the mid-recording failure that triggered this. If the
      * segment still finalized cleanly despite it, the outcome is "failed, but the file up to that
-     * point is saved" ([RecordingOutcome.FailedButSaved]) when a segment actually existed, or
-     * plain [RecordingOutcome.Failed] when the failure happened before any segment was ever
-     * opened (e.g. the microphone itself never opened) -- never a claim that something was
-     * "saved" when there is no file at all. `null` for a normal user-requested stop.
+     * point is saved" ([RecordingOutcome.FailedButSaved]) when audio was actually saved, or
+     * plain [RecordingOutcome.Failed] when it wasn't: when the failure happened before any segment
+     * was ever opened (e.g. the microphone itself never opened), or before any audio reached the
+     * file that was (a [NothingSavedException], whose message says so) -- never a claim that
+     * something was "saved" when there is no file at all. `null` for a normal user-requested stop.
+     *
+     * What was saved is the recorder's [WavRecorder.lastSavedTarget] -- the last file finalized
+     * with audio in it -- never simply the last file opened, which may have received no audio
+     * and been deleted.
      */
     private fun beginAsyncFinalize(genericError: Exception?) {
         val stoppedRequestId = currentRequestId
@@ -601,6 +611,10 @@ class RecordingService : Service() {
         showFinalizingNotification()
         Thread({
             val result = recorder.awaitFinalization(pendingStop)
+            // Counted from the frames actually written, across every file of the session -- what
+            // the saved summary shows, however long after the stop it is displayed.
+            val recordedMillis = recorder.lastRecordedMillis
+            val saved = recorder.lastSavedTarget
             mainHandler.post {
                 if (finalizingRequestId == stoppedRequestId) finalizingRequestId = null
                 if (currentRequestId != stoppedRequestId) {
@@ -620,12 +634,22 @@ class RecordingService : Service() {
                         // being finalized when this failed, but they're normally the same file.
                         RecordingOutcome.FinalizationFailed(result.target ?: target, result.cause)
                     WavRecorder.FinalizeResult.Unknown -> RecordingOutcome.FinalizationUnknown(target)
+                    // Audio saved only up to a write failure -- during the recording, or while
+                    // writing what was captured after Stop, when no live error could have been
+                    // reported. Reported once, here, whatever else went wrong. result.target is the
+                    // last file that holds audio.
+                    is WavRecorder.FinalizeResult.Incomplete -> RecordingOutcome.FailedButSaved(result.target, result.cause)
+                    // A write failure before any audio was saved: nothing to point to.
+                    is WavRecorder.FinalizeResult.NothingSaved -> RecordingOutcome.Failed(result.cause)
                     WavRecorder.FinalizeResult.Ok -> when {
-                        genericError != null && target != null -> RecordingOutcome.FailedButSaved(target, genericError)
+                        genericError != null && saved != null -> RecordingOutcome.FailedButSaved(saved, genericError)
+                        // A file was started, but the failure came before any audio reached it.
+                        genericError != null && target != null -> RecordingOutcome.Failed(NothingSavedException(genericError))
                         genericError != null -> RecordingOutcome.Failed(genericError)
-                        else -> RecordingOutcome.Saved(target, startedAt)
+                        else -> RecordingOutcome.Saved(saved, startedAt, recordedMillis)
                     }
                 }
+                sessionRecordedMillis = recordedMillis
                 reportOutcome(outcome)
                 // The file's outcome above describes the file alone. Whether Android has finished
                 // releasing the microphone is separate, and reported separately.
@@ -777,6 +801,11 @@ class RecordingService : Service() {
         is MicrophoneDisconnectedException -> getString(R.string.mic_disconnected_error)
         is MicrophoneRouteChangedException -> getString(R.string.mic_route_changed_error)
         is ExternalMicrophoneNotInUseException -> getString(R.string.mic_mismatch_message)
+        is MicrophoneStalledException -> getString(R.string.mic_stalled_error)
+        is StorageTooSlowException -> getString(R.string.storage_too_slow_error)
+        is IncompleteRecordingException -> getString(R.string.recording_incomplete_error)
+        is RecordingNotSavedException -> getString(R.string.recording_not_saved_error)
+        is NothingSavedException -> nothingSavedMessage(this, e)
         is MicrophoneBusyException -> getString(R.string.mic_busy_error)
         is MicrophoneStartTimeoutException ->
             getString(if (e.waitedForRelease) R.string.mic_busy_error else R.string.mic_start_timeout_error)

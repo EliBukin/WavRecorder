@@ -31,6 +31,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class AsyncStartupTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     private fun context() = ApplicationProvider.getApplicationContext<Context>()
@@ -660,10 +663,16 @@ class AsyncStartupTest {
         val calls = Calls()
         recorder.begin(calls)
         settle()
+        // The session is inactive as soon as the read fails; the error itself is then posted to
+        // the main thread -- so this waits for the report, not just for the session to end.
         val deadline = System.currentTimeMillis() + 2000
-        while (recorder.isActive && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        while ((recorder.isActive || calls.errors.isEmpty()) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+            org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
+        }
+        Thread.sleep(50)
         org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
-        assertEquals("the error is reported", 1, calls.errors.size)
+        assertEquals("the error is reported, once", 1, calls.errors.size)
 
         recorder.requestStop() // what RecordingService does in response
         assertEquals(0, releases)

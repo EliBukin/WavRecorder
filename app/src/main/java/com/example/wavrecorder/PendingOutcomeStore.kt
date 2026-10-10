@@ -65,6 +65,7 @@ internal class PendingOutcomeStore(
         private const val KEY_TARGET_NAME = "target_name"
         private const val KEY_MESSAGE = "message"
         private const val KEY_STARTED_AT = "started_at"
+        private const val KEY_RECORDED_MS = "recorded_ms"
 
         private const val CATEGORY_SAVED = "SAVED"
         private const val CATEGORY_FAILED_BUT_SAVED = "FAILED_BUT_SAVED"
@@ -92,6 +93,8 @@ internal class PendingOutcomeStore(
         if (safeMessage != null) editor.putString(KEY_MESSAGE, safeMessage) else editor.remove(KEY_MESSAGE)
         val startedAt = (outcome as? RecordingOutcome.Saved)?.startedAtMillis
         if (startedAt != null) editor.putLong(KEY_STARTED_AT, startedAt) else editor.remove(KEY_STARTED_AT)
+        val recordedMs = (outcome as? RecordingOutcome.Saved)?.recordedMillis
+        if (recordedMs != null) editor.putLong(KEY_RECORDED_MS, recordedMs) else editor.remove(KEY_RECORDED_MS)
         commitEditor(editor)
     }
 
@@ -111,13 +114,20 @@ internal class PendingOutcomeStore(
         val target = readTarget()
         val message = prefs.getString(KEY_MESSAGE, null)
         val startedAt = if (prefs.contains(KEY_STARTED_AT)) prefs.getLong(KEY_STARTED_AT, 0L) else null
+        val recordedMs = if (prefs.contains(KEY_RECORDED_MS)) prefs.getLong(KEY_RECORDED_MS, 0L) else null
         if (!clearLocked()) {
             Log.w(TAG, "Failed to durably clear a consumed pending outcome (session id " +
                 "$sessionId, category $category); if this process dies before a later write " +
                 "clears it, the same outcome may be read and delivered again after a restart")
         }
+        if (message == null && (category == CATEGORY_FAILED || category == CATEGORY_FAILED_BUT_SAVED)) {
+            // Always persisted with its message (see RecordingService.safeMessageFor): without one
+            // the record is incomplete -- nothing is shown rather than an empty error.
+            Log.w(TAG, "Discarded an incomplete pending outcome (session id $sessionId, category $category): no message")
+            return@synchronized null
+        }
         when (category) {
-            CATEGORY_SAVED -> RecordingOutcome.Saved(target, startedAt)
+            CATEGORY_SAVED -> RecordingOutcome.Saved(target, startedAt, recordedMs)
             CATEGORY_FAILED_BUT_SAVED -> target?.let {
                 RecordingOutcome.FailedButSaved(it, PersistedOutcomeException(message.orEmpty()))
             } ?: RecordingOutcome.Failed(PersistedOutcomeException(message.orEmpty()))

@@ -31,14 +31,18 @@ internal object ProcessInstanceId {
  *
  * There are two independently-keyed records:
  * - **ACTIVE**: the single segment [WavRecorder] is (or was most recently, in *this* process)
- *   actively writing to. Written by [persistActive] when a segment opens, cleared by
- *   [clearActiveIfMatches] once it finalizes successfully. Tagged with [ProcessInstanceId] so a
+ *   actively writing to. Written by [persistActive] when a segment opens, and settled by
+ *   [settleFinishedSegment] once its writer has finished with the file for good: cleared if it
+ *   finalized cleanly, or moved to the recovery queue if it may need recovery -- so a failed
+ *   recording never blocks the next one in the same process. Tagged with [ProcessInstanceId] so a
  *   same-process Service recreation can recognize -- and refuse to claim -- its own still-owned
  *   record; see [claimActiveAsRecoveryCandidate].
- * - **RECOVERY_PENDING**: an ordered, durable *queue* of records proven to belong to an earlier,
- *   now-gone process -- populated only by [claimActiveAsRecoveryCandidate] appending to the end,
- *   never written directly. [WavRecoveryManager] reads/removes entries from this queue, never
- *   ACTIVE. A queue (not a single slot) so a segment that fails to recover on one attempt is
+ * - **RECOVERY_PENDING**: an ordered, durable *queue* of records no writer holds any more --
+ *   proven to belong to an earlier, now-gone process ([claimActiveAsRecoveryCandidate]), or handed
+ *   over by this process's own writer once it finished with a file that may need recovery
+ *   ([settleFinishedSegment]) -- always appended to the end, never written directly.
+ *   [WavRecoveryManager] reads/removes entries from this queue, never ACTIVE. A queue (not a
+ *   single slot) so a segment that fails to recover on one attempt is
  *   never silently evicted by a *later* crash's own leftover record claimed at a subsequent
  *   startup -- each candidate accumulates independently until it's individually removed by a
  *   successful, verified recovery.
@@ -139,6 +143,21 @@ internal open class ActiveSegmentJournal(
 
         private const val TARGET_FILE = "FILE"
         private const val TARGET_SAF = "SAF"
+
+        // Segments whose writer in this process has finished with the file for good, but whose
+        // ACTIVE record couldn't yet be settled (its durable write failed) -- retried before the
+        // next segment is persisted and at the next service start. In memory only: after a
+        // process death, the next process claims the record as a previous process's instead.
+        // Guarded by LOCK.
+        private val finished = HashMap<String, Settle>()
+    }
+
+    /** How a finished segment's record is settled ([settleFinishedSegment]). */
+    enum class Settle {
+        /** The file finalized cleanly: nothing to recover, the record is cleared. */
+        CLEAR,
+        /** The file may need recovery: the record moves to the end of the recovery queue. */
+        RECOVER
     }
 
     /** The SharedPreferences keys of one record. [encoding], [channelMask], [channelIndexMask] and
@@ -243,6 +262,9 @@ internal open class ActiveSegmentJournal(
     }
 
     private fun persistRecord(record: Record, expectedPreviousToken: String?): Boolean = synchronized(LOCK) {
+        // A segment this process has finished with may still occupy ACTIVE (settling it failed
+        // earlier): settle it first. Only ever one whose own writer marked it finished.
+        readRecord(ACTIVE_KEYS)?.token?.takeIf { it in finished }?.let { settleFinishedLocked(it) }
         val before = snapshotActive()
         if (before.record != null && before.record.token != expectedPreviousToken) return@synchronized false
         val editor = prefs.edit()
@@ -282,6 +304,54 @@ internal open class ActiveSegmentJournal(
         restoreActive(before)
         false
     }
+
+    /**
+     * Called by a segment's writer once it has finished with the file for good -- finalizing it
+     * closed it, and nothing will ever write to it again, whatever the outcome. Only the writer can
+     * know that: a stop request, a timeout or an idle screen is no proof that file work is over, so
+     * nothing else calls this. Settles [token]'s record as [settle] says, in one commit:
+     * [Settle.CLEAR] clears it; [Settle.RECOVER] moves it -- target, format and all -- from ACTIVE
+     * to the end of the recovery queue (unless it is already queued), where recovery finds it,
+     * instead of leaving it to block every later segment in this process.
+     *
+     * Only [token]'s own record is ever touched -- a newer segment's is not -- and settling it
+     * again changes nothing. If the durable write fails, the record is left exactly as it was
+     * (still ACTIVE, still recoverable; see the class doc's rollback note), and settling it is
+     * retried before the next segment is persisted ([persistActive]) and at the next service start
+     * ([claimActiveAsRecoveryCandidate]). Returns true once nothing is left to do for [token].
+     */
+    open fun settleFinishedSegment(token: String, settle: Settle): Boolean = synchronized(LOCK) {
+        finished[token] = settle
+        settleFinishedLocked(token)
+    }
+
+    /** Settles [token] as its writer asked, if it is still ACTIVE. Under [LOCK]. */
+    private fun settleFinishedLocked(token: String): Boolean {
+        val settle = finished[token] ?: return true
+        val before = snapshotActive()
+        if (before.record?.token != token) {
+            // Not (or no longer) ACTIVE: already settled -- and whatever is ACTIVE now is some other
+            // segment's, never this one's to touch.
+            finished.remove(token)
+            return true
+        }
+        val queueBefore = readRecoveryQueue()
+        val editor = prefs.edit()
+        clearKeys(editor, ACTIVE_KEYS)
+        editor.remove(ACTIVE_OWNER_KEY)
+        if (settle == Settle.RECOVER && queueBefore.none { it.token == token }) appendRecoveryEntry(editor, before.record)
+        if (commitEditor(editor)) {
+            finished.remove(token)
+            return true
+        }
+        // Restore both halves in one corrective commit, exactly as a failed claim does: the record
+        // stays ACTIVE -- still recoverable -- and is settled again later.
+        restoreActiveAndQueue(before, queueBefore)
+        return false
+    }
+
+    /** Test-only: whether [token]'s writer finished with it but its record is not settled yet. */
+    internal fun isSettlementPendingForTest(token: String): Boolean = synchronized(LOCK) { token in finished }
 
     /** Test-only seam: persists an ACTIVE record tagged with an explicit [ownerProcessId] rather
      * than this process's own [ProcessInstanceId], and without [persistActive]'s
@@ -335,7 +405,7 @@ internal open class ActiveSegmentJournal(
      * that some record with a matching token reappeared. Production code must never call this. */
     internal fun peekActiveOwnerForTest(): String? = synchronized(LOCK) { prefs.getString(ACTIVE_OWNER_KEY, null) }
 
-    // ---- RECOVERY_PENDING: an ordered queue of records proven to belong to an earlier, now-gone process ----
+    // ---- RECOVERY_PENDING: an ordered queue of records no writer holds any more ----
 
     /**
      * Atomically appends the current ACTIVE record (if any, and if not owned by this same
@@ -349,7 +419,16 @@ internal open class ActiveSegmentJournal(
     open fun claimActiveAsRecoveryCandidate(): ClaimResult = synchronized(LOCK) {
         val active = readRecord(ACTIVE_KEYS) ?: return@synchronized ClaimResult.Empty
         val owner = prefs.getString(ACTIVE_OWNER_KEY, null)
-        if (owner == ProcessInstanceId.value) return@synchronized ClaimResult.OwnedByThisProcess
+        if (owner == ProcessInstanceId.value) {
+            // Still this process's -- untouched, unless its own writer has finished with it and only
+            // settling it failed: that is retried now (see settleFinishedSegment).
+            val settle = finished[active.token] ?: return@synchronized ClaimResult.OwnedByThisProcess
+            return@synchronized when {
+                !settleFinishedLocked(active.token) -> ClaimResult.OwnedByThisProcess
+                settle == Settle.RECOVER -> ClaimResult.Claimed(active)
+                else -> ClaimResult.Empty
+            }
+        }
         val queueBefore = readRecoveryQueue()
         val editor = prefs.edit()
         clearKeys(editor, ACTIVE_KEYS)

@@ -86,14 +86,23 @@ internal class FakeAudioSource(
 class WavRecorderTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     /** Waits (without touching the main looper) for the background recording thread to flip
      * [WavRecorder.isActive] false after a fatal error, then drains the main looper once so any
      * `handler.post { onError(...) }` from that thread gets to run. */
+    /** Waits for a session to end -- and for its threads to finish, not just for [WavRecorder.isActive]
+     * to turn false: that happens the moment a failure ends it, before the error is posted and before
+     * the writer finalizes its file. Then delivers what they posted. */
     private fun awaitTerminatedAndDeliverCallbacks(recorder: WavRecorder, timeoutMs: Long = 2000) {
         val deadline = System.currentTimeMillis() + timeoutMs
-        while (recorder.isActive && System.currentTimeMillis() < deadline) Thread.sleep(5)
+        fun threadsRunning() = Thread.getAllStackTraces().keys.any {
+            it.isAlive && (it.name == "WavRecorderThread" || it.name == "WavRecorderCapture")
+        }
+        while ((recorder.isActive || threadsRunning()) && System.currentTimeMillis() < deadline) Thread.sleep(5)
         shadowOf(Looper.getMainLooper()).idle()
     }
 
@@ -126,9 +135,9 @@ class WavRecorderTest {
         )
 
         assertTrue("recording loop never finished", doneLatch.await(2, TimeUnit.SECONDS))
-        // The exhausted signal fires from inside the last read() call; give the same background
-        // thread a moment to fall through its while loop and finish closing/deleting that segment.
-        Thread.sleep(50)
+        // The exhausted signal fires from inside the last read() call; the writer then finishes
+        // closing/deleting that segment -- waited for, not guessed at with a fixed sleep.
+        awaitTerminatedAndDeliverCallbacks(recorder)
 
         // 2 chunks each triggering a rollover => the initial segment, one rollover, plus a 3rd
         // segment opened for the read that signalled the end and never got any audio written to it.
@@ -217,6 +226,9 @@ class WavRecorderTest {
         )
 
         awaitTerminatedAndDeliverCallbacks(recorder)
+        // The failed read ends the session at once, but the file is finalized by the writer
+        // afterwards; stopping in response -- as the caller must -- waits for that.
+        recorder.stop()
 
         assertFalse("a segment with zero audio bytes should be deleted, not left as a silent file",
             segmentFile.exists())
@@ -470,9 +482,10 @@ class WavRecorderTest {
             onError = { e -> errorReported = e }
         )
 
+        // A second read means the first one's audio was accepted -- it is written before the file
+        // is finalized, however long storage takes.
         val deadline = System.currentTimeMillis() + 2000
-        while (readCount < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
-        Thread.sleep(20) // let the first read's write land before stopping
+        while (readCount < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5)
 
         val stopCompleted = CountDownLatch(1)
         Thread { recorder.stop(); stopCompleted.countDown() }.start()
@@ -605,9 +618,12 @@ class WavRecorderTest {
         // not an intentional stop) must still be reported normally -- proving the generation
         // guard only suppresses stale sessions, not the current one.
         session2Blocked.countDown()
+        // Inactive the moment it fails; its error is posted just after -- so this waits for the report.
         val session2Deadline = System.currentTimeMillis() + 2000
-        while (recorder.isActive && System.currentTimeMillis() < session2Deadline) Thread.sleep(5)
-        shadowOf(Looper.getMainLooper()).idle()
+        while ((recorder.isActive || session2ErrorReported == null) && System.currentTimeMillis() < session2Deadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
         assertNotNull("session 2's own failure should still be reported normally", session2ErrorReported)
     }
 
@@ -749,7 +765,7 @@ class WavRecorderTest {
     }
 
     @Test
-    fun `a finalization failure leaves the active-segment journal record in place for later recovery`() {
+    fun `a finalization failure keeps its journal record for later recovery, handed to the recovery queue`() {
         val chunk = byteArrayOf(1, 2, 3, 4)
         val blockUntilStopped = CountDownLatch(1)
         var readCount = 0
@@ -790,11 +806,15 @@ class WavRecorderTest {
         val result = recorder.stop()
 
         assertTrue(result is WavRecorder.FinalizeResult.Failed)
-        assertNotNull(
+        // Its writer, done with the file, hands the record to the recovery queue: a later recovery
+        // pass still finds and repairs it, and it no longer occupies the active slot.
+        val queued = journal.peekRecoveryCandidates()
+        assertEquals(
             "a segment that failed to finalize must keep its journal record so a later " +
                 "recovery pass can still find and repair it",
-            journal.peekActive()
+            listOf(segmentFile.absolutePath), queued.map { (it.target as OutputTarget.FileTarget).file.absolutePath }
         )
+        assertNull(journal.peekActive())
     }
 
     @Test
@@ -901,8 +921,9 @@ class WavRecorderTest {
         val doneLatch = CountDownLatch(1)
         val fake = FakeAudioSource(scriptedReads = listOf(chunk), onExhausted = { doneLatch.countDown() })
         val segmentFile = tempFolder.newFile("segment.wav")
+        // Settling -- here, clearing -- a finished segment's record is how the writer clears it.
         val clearFailingJournal = object : ActiveSegmentJournal(ApplicationProvider.getApplicationContext()) {
-            override fun clearActiveIfMatches(token: String): Boolean = false
+            override fun settleFinishedSegment(token: String, settle: Settle): Boolean = false
         }
         val recorder = WavRecorder(startup = ImmediateStartup,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 48000, bufferSize = chunk.size) },
@@ -980,16 +1001,15 @@ class WavRecorderTest {
         // recording could have written to) should remain either.
         assertFalse(undoableTarget.listFiles()?.isNotEmpty() ?: false)
 
-        // The key regression assertion: stop() must report the first segment as cleanly saved,
-        // never as a finalization failure -- the actual failure is "recording stopped due to a
-        // rollover error", which is already reported above via onError, not via a corrupted-file
-        // claim about the perfectly good first segment.
+        // The key regression assertion: stop() must never report the perfectly good first
+        // segment as a finalization failure (needing recovery) just because the *next* segment's
+        // destination failed to open. It is reported as what it is: a valid file, complete in
+        // itself, that holds the recording only up to the failure (FinalizeResult.Incomplete) --
+        // not a complete save, since the recording couldn't continue into the next file.
         val result = recorder.stop()
-        assertEquals(
-            "the already-finalized, healthy first segment must not be reported as needing " +
-                "recovery just because the *next* segment's destination failed to open",
-            WavRecorder.FinalizeResult.Ok, result
-        )
+        assertTrue("got $result", result is WavRecorder.FinalizeResult.Incomplete)
+        assertEquals(goodFile.absolutePath,
+            ((result as WavRecorder.FinalizeResult.Incomplete).target as OutputTarget.FileTarget).file.absolutePath)
     }
 
     @Test
@@ -1263,6 +1283,7 @@ class WavRecorderTest {
         val fake = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -1317,6 +1338,7 @@ class WavRecorderTest {
         val fake = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -1469,8 +1491,10 @@ class WavRecorderTest {
         val chunk = byteArrayOf(1, 2, 3, 4)
         var segmentCreateCount = 0
         // sampleRate=1 + segmentMaxSeconds=1 => segmentMaxBytes=2, so the first 4-byte chunk
-        // immediately triggers a rollover -- straight into the header patch failure below.
-        val fake = FakeAudioSource(scriptedReads = listOf(chunk, chunk, chunk))
+        // immediately triggers a rollover -- straight into the header patch failure below. After
+        // its chunks the source delivers nothing (rather than failing): the microphone is read on
+        // its own thread, so a read error of its own could otherwise be reported first.
+        val fake = FakeAudioSource(scriptedReads = listOf(chunk, chunk, chunk), readReturnsZeroWhenExhausted = true)
         val recorder = WavRecorder(startup = ImmediateStartup,
             segmentMaxSeconds = 1,
             openAudioSource = { WavRecorder.RecorderConfig(fake, sampleRate = 1, bufferSize = chunk.size) },

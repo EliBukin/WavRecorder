@@ -38,6 +38,9 @@ import java.nio.ByteBuffer
 class WavRecoveryManagerTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = org.junit.rules.TemporaryFolder()
 
     private fun context() = ApplicationProvider.getApplicationContext<Context>()

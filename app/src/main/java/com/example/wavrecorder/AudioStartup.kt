@@ -397,12 +397,12 @@ internal class AudioStartup(
             return
         }
         val delivered = deliverSafely {
-            // Taken here, on the owner's thread -- unless a cancel's cleanup already took it.
+            // Cancelled or timed out before it got here: left for the cleanup that did so, which it
+            // queued on the worker at that moment -- ahead of any startup launched since. Taking the
+            // source here instead would release it only behind such a startup's open: two owners.
+            if (scope.isCancelled || scope.resolvedAs != null) return@deliverSafely
+            // Taken here, on the owner's thread.
             val config = scope.take() ?: return@deliverSafely
-            if (scope.isCancelled || scope.resolvedAs != null) {
-                releaseOnWorker(config)
-                return@deliverSafely
-            }
             when (val decision = onReady(config)) {
                 Decision.Keep -> scope.resolve(StartupScope.Resolution.READY)
                 // Released on the worker, never here on the owner's thread; the owner hears why only

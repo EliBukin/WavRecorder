@@ -149,11 +149,13 @@ class RecordFragment : Fragment() {
         }
     }
 
-    private enum class PendingPermissionAction { RECORD, MIC_TEST }
-    // Which flow a just-launched permission request belongs to, consulted only from within
-    // handlePermissionResult() once the launcher's callback actually fires -- see
-    // requestPermissionAndRecord()/the test button's click listener for where this is set.
-    private var pendingPermissionAction = PendingPermissionAction.RECORD
+    private enum class PendingPermissionAction { NONE, RECORD, MIC_TEST }
+    // Which flow an outstanding permission request belongs to: set only when a request is actually
+    // launched (see requestPermissionAndRecord()/the test button's click listener), saved across
+    // recreation (the result can arrive in a new instance of this screen), and consumed exactly
+    // once by handlePermissionResult(). NONE -- the default, and after consumption -- starts
+    // nothing: a permission grant is never taken as consent to an operation nobody asked for.
+    private var pendingPermissionAction = PendingPermissionAction.NONE
 
     private var audioManager: AudioManager? = null
     // Defaults to "none detected" rather than an optimistic guess: until the first real query
@@ -268,7 +270,9 @@ class RecordFragment : Fragment() {
         }
 
         override fun onStopped(lastTarget: OutputTarget?) {
-            if (_binding != null) handleSaved(lastTarget, recordingService?.lastSessionStartedAtMillis)
+            if (_binding != null) {
+                handleSaved(lastTarget, recordingService?.lastSessionStartedAtMillis, recordingService?.lastSessionRecordedMillis)
+            }
         }
 
         override fun onMicrophoneInfo(info: MicrophoneInfo) {
@@ -308,7 +312,7 @@ class RecordFragment : Fragment() {
             // rather than re-wrapped in the generic "Recording error: %s" template below, which
             // would otherwise double up on wording that's already complete.
             is PersistedOutcomeException -> e.message ?: getString(R.string.recording_error, null)
-            else -> microphoneUnavailableMessage(e) ?: getString(R.string.recording_error, e.message)
+            else -> captureSafeguardMessage(e) ?: microphoneUnavailableMessage(e) ?: getString(R.string.recording_error, e.message)
         }
         Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
         resetToIdle()
@@ -320,6 +324,16 @@ class RecordFragment : Fragment() {
         is MicrophoneBusyException -> getString(R.string.mic_busy_error)
         is MicrophoneStartTimeoutException ->
             getString(if (e.waitedForRelease) R.string.mic_busy_error else R.string.mic_start_timeout_error)
+        else -> null
+    }
+
+    /** Messages for the recorder's own safeguards (see [WavRecorder]), or null for any other error. */
+    private fun captureSafeguardMessage(e: Exception): String? = when (e) {
+        is MicrophoneStalledException -> getString(R.string.mic_stalled_error)
+        is StorageTooSlowException -> getString(R.string.storage_too_slow_error)
+        is IncompleteRecordingException -> getString(R.string.recording_incomplete_error)
+        is RecordingNotSavedException -> getString(R.string.recording_not_saved_error)
+        is NothingSavedException -> nothingSavedMessage(requireContext(), e)
         else -> null
     }
 
@@ -337,10 +351,10 @@ class RecordFragment : Fragment() {
         detail.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
     }
 
-    private fun handleSaved(lastTarget: OutputTarget?, startedAt: Long?) {
+    private fun handleSaved(lastTarget: OutputTarget?, startedAt: Long?, recordedMillis: Long?) {
         resetToIdle()
         if (lastTarget != null) {
-            showSavedSummary(startedAt)
+            showSavedSummary(startedAt, recordedMillis)
             setStateDotColor(R.color.status_verified_green)
         } else {
             binding.statusText.text = getString(R.string.status_idle)
@@ -377,7 +391,7 @@ class RecordFragment : Fragment() {
      * on later. */
     private fun displayPendingOutcome(outcome: RecordingOutcome) {
         when (outcome) {
-            is RecordingOutcome.Saved -> handleSaved(outcome.target, outcome.startedAtMillis)
+            is RecordingOutcome.Saved -> handleSaved(outcome.target, outcome.startedAtMillis, outcome.recordedMillis)
             is RecordingOutcome.FailedButSaved -> handleError(outcome.cause)
             is RecordingOutcome.Failed -> handleError(outcome.cause)
             is RecordingOutcome.FinalizationFailed -> handleFinalizationFailed(outcome.target, outcome.cause)
@@ -396,8 +410,12 @@ class RecordFragment : Fragment() {
     // of the live permission state would misread that absence as a denial. internal for testing.
     @Suppress("UNUSED_PARAMETER")
     internal fun handlePermissionResult(results: Map<String, Boolean>) {
+        // Consumed once, whatever happens next: a stale or repeated result starts nothing.
+        val action = pendingPermissionAction
+        pendingPermissionAction = PendingPermissionAction.NONE
+        if (action == PendingPermissionAction.NONE) return
         if (!hasMicrophonePermission()) {
-            val deniedMessage = if (pendingPermissionAction == PendingPermissionAction.MIC_TEST) {
+            val deniedMessage = if (action == PendingPermissionAction.MIC_TEST) {
                 R.string.mic_test_permission_denied
             } else {
                 R.string.permission_denied
@@ -405,16 +423,37 @@ class RecordFragment : Fragment() {
             Toast.makeText(requireContext(), deniedMessage, Toast.LENGTH_LONG).show()
             return
         }
-        when (pendingPermissionAction) {
+        // Still able to act on it? The screen may have gone away, or recording or a test may have
+        // started meanwhile (e.g. from the notification): then nothing is started.
+        if (_binding == null || !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        when (action) {
             // The test never touches POST_NOTIFICATIONS -- it never starts a foreground service or
             // shows a notification -- so unlike RECORD's flow below, RECORD_AUDIO alone is enough.
+            // startMicTest() itself declines while recording is busy or a test is already running.
             PendingPermissionAction.MIC_TEST -> startMicTest()
-            PendingPermissionAction.RECORD -> if (notificationPermissionDenied()) {
-                confirmRecordWithoutNotificationPermission()
-            } else {
-                beginRecording()
+            PendingPermissionAction.RECORD -> {
+                if (micTestActive || recordingService?.let { it.state != ServiceState.IDLE } == true) return
+                if (notificationPermissionDenied()) {
+                    confirmRecordWithoutNotificationPermission()
+                } else {
+                    beginRecording()
+                }
             }
+            PendingPermissionAction.NONE -> Unit
         }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Restored before any permission result can be delivered to this new instance.
+        savedInstanceState?.getString(STATE_PENDING_PERMISSION_ACTION)?.let { saved ->
+            pendingPermissionAction = PendingPermissionAction.entries.firstOrNull { it.name == saved } ?: PendingPermissionAction.NONE
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_PENDING_PERMISSION_ACTION, pendingPermissionAction.name)
     }
 
     private fun hasMicrophonePermission(): Boolean =
@@ -492,13 +531,11 @@ class RecordFragment : Fragment() {
         binding.testMicButton.setOnClickListener {
             if (micTestActive) {
                 stopMicTest()
+            } else if (hasMicrophonePermission()) {
+                startMicTest()
             } else {
                 pendingPermissionAction = PendingPermissionAction.MIC_TEST
-                if (hasMicrophonePermission()) {
-                    startMicTest()
-                } else {
-                    requestPermissionsLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
-                }
+                requestPermissionsLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
             }
         }
     }
@@ -671,7 +708,6 @@ class RecordFragment : Fragment() {
     }
 
     private fun requestPermissionAndRecord() {
-        pendingPermissionAction = PendingPermissionAction.RECORD
         val needed = mutableListOf<String>()
         if (!hasMicrophonePermission()) {
             needed += Manifest.permission.RECORD_AUDIO
@@ -689,6 +725,7 @@ class RecordFragment : Fragment() {
             // handlePermissionResult's notification check to catch that isn't already true here.
             beginRecording()
         } else {
+            pendingPermissionAction = PendingPermissionAction.RECORD
             requestPermissionsLauncher.launch(needed.toTypedArray())
         }
     }
@@ -906,6 +943,7 @@ class RecordFragment : Fragment() {
         val message = when (e) {
             is MicrophoneDisconnectedException -> getString(R.string.mic_test_disconnected_error)
             is MicrophoneRouteChangedException -> getString(R.string.mic_test_route_changed_error)
+            is MicrophoneStalledException -> getString(R.string.mic_test_stalled_error)
             else -> microphoneUnavailableMessage(e) ?: getString(R.string.mic_test_error, e.message)
         }
         Toast.makeText(requireContext(), message, Toast.LENGTH_LONG).show()
@@ -1092,18 +1130,20 @@ class RecordFragment : Fragment() {
     }
 
     /** Friendly "Recording saved" summary shown once a session actually finalizes -- deliberately
-     * never the raw filename (that stays available in the Library); [startedAt] is
-     * [RecordingService.lastSessionStartedAtMillis], captured before [resetToIdle] runs, which is
-     * both the displayed date/time and (paired with "now") the elapsed duration, with no file I/O
-     * involved at all. */
-    private fun showSavedSummary(startedAt: Long?) {
+     * never the raw filename (that stays available in the Library). [startedAt] gives the date
+     * and time; [recordedMillis] the duration: how much audio the session actually wrote, across
+     * all its files, fixed at the stop -- never "now" minus the start, which would count the time
+     * since the stop (and the microphone negotiation) whenever this is shown later. No duration is
+     * shown when it isn't known. */
+    private fun showSavedSummary(startedAt: Long?, recordedMillis: Long?) {
         binding.statusText.text = getString(R.string.status_saved_title)
         if (startedAt == null) return
         val dateText = SAVED_AT_FORMAT.format(Date(startedAt))
-        val durationText = DurationFormatter.format(
-            requireContext(), (System.currentTimeMillis() - startedAt).coerceAtLeast(0) / 1000
-        )
-        binding.statusDetailText.text = getString(R.string.status_saved_detail, dateText, durationText)
+        binding.statusDetailText.text = if (recordedMillis != null) {
+            getString(R.string.status_saved_detail, dateText, DurationFormatter.format(requireContext(), recordedMillis / 1000))
+        } else {
+            dateText
+        }
         binding.statusDetailText.visibility = View.VISIBLE
     }
 
@@ -1259,6 +1299,8 @@ class RecordFragment : Fragment() {
     }
 
     companion object {
+        private const val STATE_PENDING_PERMISSION_ACTION = "pending_permission_action"
+
         // A modest floor above pure silence/room noise (see peakAmplitude's -45dBFS..0dBFS
         // mapping onto 0f..1f) -- picked to reliably trigger on a normal speaking voice or a
         // tap/clap without false-triggering on typical quiet-room background noise. Not a precise

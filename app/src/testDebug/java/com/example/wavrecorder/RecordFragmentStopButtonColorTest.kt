@@ -14,6 +14,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -27,6 +28,9 @@ import org.robolectric.shadows.AudioDeviceInfoBuilder
  */
 @RunWith(RobolectricTestRunner::class)
 class RecordFragmentStopButtonColorTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
@@ -105,7 +109,7 @@ class RecordFragmentStopButtonColorTest {
             "the record button must use the theme's own colorError once it represents Stop recording",
             errorColor, buttonColor
         )
-        boundService.stopRecording()
+        boundService.stopAndAwaitFinalization()
     }
 
     @Test

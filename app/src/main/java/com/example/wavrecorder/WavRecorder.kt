@@ -11,14 +11,19 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -49,6 +54,27 @@ class MicrophoneDisconnectedException(message: String) : IOException(message)
  * mic may still be physically plugged in, it's just no longer the one actually being recorded. */
 class MicrophoneRouteChangedException(message: String) : IOException(message)
 
+/** The microphone stopped delivering audio -- not even silence -- for longer than the recorder's
+ * no-progress limit: a driver whose reads never return, or a device that keeps returning nothing.
+ * Distinct from silent audio, which is still audio (a muted microphone, or another app's call
+ * taking priority, delivers zero-valued samples and keeps recording). */
+class MicrophoneStalledException(message: String) : IOException(message)
+
+/** Storage fell so far behind that the bounded capture queue filled up. Recording stops rather
+ * than drop audio silently; everything captured before that point is written and saved. */
+class StorageTooSlowException(message: String) : IOException(message)
+
+/** Writing to storage failed before all captured audio reached the file -- during the recording or
+ * while the audio already captured was still being written after Stop. The file is a valid WAV,
+ * but holds the audio only up to the failure: [FinalizeResult.Incomplete]'s cause. */
+class IncompleteRecordingException(cause: Exception) :
+    IOException("Writing to storage failed, so the recording holds audio only up to that point: ${cause.message}", cause)
+
+/** Writing to storage failed before any of the session's audio reached it, so nothing was saved:
+ * the file it had started received no audio and was deleted. [FinalizeResult.NothingSaved]'s cause. */
+class RecordingNotSavedException(cause: Exception) :
+    IOException("Writing to storage failed before any audio was saved, so nothing was recorded: ${cause.message}", cause)
+
 /** A recording was started expecting an external microphone (one was attached, and the user hadn't
  * chosen the phone microphone), but the microphone negotiation verified was not an external one --
  * typically because the external microphone couldn't be used in any format. Nothing was recorded;
@@ -61,6 +87,16 @@ class ExternalMicrophoneNotInUseException(message: String) : IOException(message
  * few buffers unflushed, so it needs to be treated as "may need recovery", never as a normal save. */
 class WavFinalizationException(val target: OutputTarget, cause: Exception) :
     IOException("Failed to finalize ${target.displayPath}: ${cause.message}", cause)
+
+/** An audio write to [target] failed, and the file may hold more audio than the writer confirmed
+ * -- its size shows whole frames past the confirmed audio, or can't be read. The file is kept as
+ * it is -- never deleted or truncated -- with its crash-recovery record, so recovery settles it
+ * from what is physically there; until then its header describes the confirmed audio only.
+ * Distinct from [WavFinalizationException] (a header patch or close that failed): [cause] is the
+ * write failure itself. [FinalizeResult.Failed]'s cause. */
+class UnconfirmedAudioException(val target: OutputTarget, cause: Exception) :
+    IOException("Writing to storage failed, and ${target.displayPath} may hold more audio than was confirmed; " +
+        "it is kept for recovery: ${cause.message}", cause)
 
 /** Thin seam over [AudioRecord] so recording logic (segment rollover, error handling) can be
  * unit tested with a fake instead of a real microphone. The production implementation
@@ -207,7 +243,20 @@ internal class WavRecorder(
     private val splitPlanFor: (PcmFormat, Long, Int) -> SegmentSplitPlan = { format, seconds, buffer -> SegmentSplitPlan.of(format, seconds, buffer) },
     // Where opening the source runs and how its result comes back: production negotiates on the
     // shared audio-startup worker and delivers on the main thread; tests may run both inline.
-    private val startup: AudioStartup = AudioStartup.shared
+    private val startup: AudioStartup = AudioStartup.shared,
+    // Monotonic milliseconds for every interval the capture and writer loops measure (header
+    // flushes, forced writes, health checks, the no-progress limit) -- never the wall clock, which
+    // the user or the network can move backwards or forwards. Injectable for tests.
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000 },
+    // How long capture may go without a single frame (not even silence) before the session is
+    // ended as stalled; see NO_PROGRESS_TIMEOUT_MS.
+    private val noProgressTimeoutMs: Long = NO_PROGRESS_TIMEOUT_MS,
+    // Overrides the capture queue's size, in buffers (0: sized from the format; see
+    // CAPTURE_QUEUE_SECONDS). Tests use a tiny queue to exercise overflow.
+    private val maxQueuedBuffers: Int = 0,
+    // A file's size in bytes, or null if it can't be determined -- how finalization tells whether a
+    // failed write may have stored more than it confirmed. Seam so tests can make it unknown.
+    private val targetSize: (Context, OutputTarget) -> Long? = ::sizeOf
 ) {
 
     companion object {
@@ -232,6 +281,30 @@ internal class WavRecorder(
         // first; this timeout is just a backstop against the recording thread being stuck
         // somewhere else entirely (e.g. blocked file I/O), so stop() can't hang its caller forever.
         private const val THREAD_JOIN_TIMEOUT_MS = 2000L
+
+        // No audio at all -- not even silence -- for this long ends the session as stalled
+        // (MicrophoneStalledException). Reads normally return every 20-100 ms, and capture that
+        // Android silences (a call, the microphone privacy toggle) still returns zero-valued
+        // samples, which count as audio. Ten seconds is far outside any transient reroute or HAL
+        // restart, so a working recording is never ended by it, yet a dead one is reported well
+        // before it could be mistaken for a working recording.
+        private const val NO_PROGRESS_TIMEOUT_MS = 10_000L
+
+        // The capture queue between the capture thread and the writer holds up to this much audio,
+        // so storage may stall this long without a single frame being lost -- capped in bytes for
+        // very high formats (10 s of 192 kHz 32-bit stereo is about 15 MB of the 48 MiB). Buffers
+        // are allocated only as the queue actually fills, so memory grows only while storage lags.
+        private const val CAPTURE_QUEUE_SECONDS = 10L
+        private const val CAPTURE_QUEUE_MAX_BYTES = 48L * 1024 * 1024
+        private const val MIN_QUEUE_BUFFERS = 4
+
+        // How often the writer wakes with nothing to write: to notice a stop or a stalled capture.
+        private const val WRITER_POLL_MS = 20L
+
+        // The live level is posted to the UI at most this often -- the loudest peak since the last
+        // update, so nothing is missed -- rather than once per read: a read can be far shorter
+        // than a frame of the display, and each post is main-thread work.
+        private const val AMPLITUDE_POST_INTERVAL_MS = 50L
     }
 
     /** Called each time a new segment file is needed: the first one, and every rollover after. */
@@ -279,6 +352,18 @@ internal class WavRecorder(
         /** The last segment's header patch or writer close failed; [target] (if known) may be
          * truncated or carry a stale header and should be treated as needing recovery. */
         data class Failed(val target: OutputTarget?, val cause: Exception) : FinalizeResult()
+        /** Every file closed cleanly and is a valid WAV, but writing failed before all the audio
+         * captured reached it -- while recording, or while the audio already captured was still
+         * being written after Stop -- so the session holds audio only up to the failure. [target]
+         * is the last of its files that holds audio: the one the failure cut short, or an earlier
+         * one when the failure came before any audio reached the file after it (which, empty, is
+         * deleted). A valid partial save, not a complete one, and not one a header repair could
+         * complete. [cause] is an [IncompleteRecordingException]. */
+        data class Incomplete(val target: OutputTarget, val cause: Exception) : FinalizeResult()
+        /** Every file closed cleanly, but writing failed before any of the session's audio reached
+         * storage: the file it had started received none and was deleted, so nothing was saved.
+         * [cause] is a [RecordingNotSavedException]. */
+        data class NothingSaved(val cause: Exception) : FinalizeResult()
     }
 
     /** The recorder's lifecycle. IDLE -> STARTING ([start]: the source is being negotiated off
@@ -301,6 +386,19 @@ internal class WavRecorder(
     // The recording thread a requestStop() left finishing its last file, for [state] (STOPPING).
     @Volatile private var finishingThread: Thread? = null
     @Volatile private var lastFinalizeResult: FinalizeResult = FinalizeResult.Ok
+
+    /** How much audio the current (or most recently finished) session actually wrote, across all
+     * of its files, in milliseconds -- counted from written frames, never from the wall clock.
+     * Final once [awaitFinalization] has returned a joined result. */
+    @Volatile var lastRecordedMillis: Long = 0L
+        private set
+
+    /** The last file of the current (or most recently finished) session that was finalized with
+     * audio in it -- what the session saved, as opposed to the last file it opened, which may have
+     * received no audio and been deleted. Null when nothing was saved. Final once
+     * [awaitFinalization] has returned a joined result. */
+    @Volatile var lastSavedTarget: OutputTarget? = null
+        private set
 
     // Bumped on every start() *and* on every stop(). recordLoop() captures the value current at
     // its own launch and rechecks it (together with isRecording) before mutating any shared
@@ -405,6 +503,8 @@ internal class WavRecorder(
         // failure.
         val mySession = sessionCounter.incrementAndGet()
         lastFinalizeResult = FinalizeResult.Ok
+        lastRecordedMillis = 0L
+        lastSavedTarget = null
         sessionFormat = null
         sessionNegotiation = null
         sessionSplitPlan = null
@@ -619,6 +719,69 @@ internal class WavRecorder(
         return lastFinalizeResult
     }
 
+    /** One captured chunk of whole frames, handed from the capture thread to the writer. */
+    private class Chunk(val bytes: ByteArray) {
+        var length = 0
+    }
+
+    /**
+     * The bounded, reusable buffers between a session's capture thread and its writer. At most
+     * [capacity] buffers ever exist, allocated only as the queue actually fills; the capture thread
+     * never waits for one -- running out is an overflow it reports ([StorageTooSlowException]),
+     * never audio dropped silently, and never unbounded memory.
+     */
+    private class CaptureQueue(private val bufferSize: Int, private val capacity: Int) {
+        private val free = ArrayBlockingQueue<Chunk>(capacity)
+        // Chunks (at most [capacity] of them) and one END marker: never blocks the capture thread.
+        private val filled = LinkedBlockingQueue<Any>()
+        private var created = 0 // capture thread only
+
+        /** A buffer to read into, or null when every buffer is queued for the writer (overflow). */
+        fun acquire(): Chunk? = free.poll() ?: if (created < capacity) Chunk(ByteArray(bufferSize)).also { created++ } else null
+
+        fun recycle(chunk: Chunk) {
+            free.offer(chunk)
+        }
+
+        fun submit(chunk: Chunk) = filled.put(chunk)
+
+        /** The capture thread is done: nothing more will be submitted. */
+        fun end() = filled.put(END)
+
+        fun take(timeoutMs: Long): Any? = filled.poll(timeoutMs, TimeUnit.MILLISECONDS)
+
+        fun takeNow(): Any? = filled.poll()
+
+        companion object {
+            val END = Any()
+        }
+    }
+
+    /** When the capture thread last accepted audio (monotonic ms): what the writer's no-progress
+     * check watches -- updated while storage lags, frozen while the microphone delivers nothing. */
+    private class CaptureProgress(start: Long) {
+        @Volatile var lastAudioAt = start
+    }
+
+    private fun queueCapacity(format: PcmFormat, bufferSize: Int): Int {
+        if (maxQueuedBuffers > 0) return maxQueuedBuffers
+        val bytes = minOf(format.byteRate * CAPTURE_QUEUE_SECONDS, CAPTURE_QUEUE_MAX_BYTES)
+        return maxOf(MIN_QUEUE_BUFFERS.toLong(), bytes / bufferSize).toInt()
+    }
+
+    /**
+     * The session's writer, on its recording thread: the only thread that touches its files --
+     * opening segments, writing PCM, header flushes and forced writes, rollover, the journal,
+     * finalization. The microphone is read by a separate capture thread ([captureLoop]) into a
+     * bounded queue, so slow storage (a stalled write, a slow provider creating the next file, a
+     * forced flush) never stops the microphone being drained.
+     *
+     * Stopping: once the session is stopped (or fails), every chunk the capture thread accepted is
+     * still written before the file is finalized. The capture thread normally ends at once (the
+     * stop unblocks its read); if its read never returns, the writer waits at most half the stop
+     * join timeout for it, then writes what was accepted and finalizes regardless -- a stuck native
+     * read can't keep the file unfinalized.
+     */
     // segmentFinalized's `true` assignment below is flagged as an unused value: the compiler's
     // dataflow analysis doesn't model openSegment() throwing between it and the following `false`
     // reset, but that exception path is exactly why the flag exists -- see its declaration.
@@ -637,7 +800,6 @@ internal class WavRecorder(
         onError: (Exception) -> Unit
     ) {
         val handler = Handler(Looper.getMainLooper())
-        val buffer = ByteArray(bufferSize)
         var segment = try {
             // previousToken = null: this is the very first segment of the session, so the journal
             // must currently be empty -- see persistActive()'s expectedPreviousToken doc.
@@ -654,129 +816,157 @@ internal class WavRecorder(
         // onto an already-closed writer and misreporting a perfectly healthy, already-saved file
         // as needing recovery.
         var segmentFinalized = false
-        // Bytes of an incomplete trailing frame from the previous read, kept at the start of
-        // [buffer]: only whole frames are ever written, so every byte count, header and split
-        // point stays frame-aligned even if a read ever ends mid-frame.
-        var pending = 0
-        val emptyReads = EmptyReadBackoff()
+        var recordedBytes = 0L
+        // The last file finalized with audio in it: what the session has saved so far. A file that
+        // received no audio is deleted when it is closed, so it is never what was saved.
+        var savedTarget: OutputTarget? = null
+        // A file whose finalization failed (header patch or writer close): it may need recovery,
+        // which outranks anything else the result could say.
+        var finalizationFailure: FinalizeResult.Failed? = null
+        // A failure closing a file that held no audio and was then confirmed deleted: it cost no
+        // audio, so it only explains a session that saved nothing (see the result below).
+        var discardFailure: Exception? = null
+
+        /** Finalizes the current file, exactly once: records it as saved if it holds audio, or the
+         * failure if finalizing it failed -- and then rethrows that. */
+        fun finalizeCurrent() {
+            segmentFinalized = true
+            val end = try {
+                closeSegment(context, segment, format)
+            } catch (e: Exception) {
+                finalizationFailure = FinalizeResult.Failed(segment.target, e)
+                // Finalizing closed the file, whatever failed, and nothing -- not this thread, not
+                // the capture thread, which never touches files -- will write to it again: its
+                // record moves to the recovery queue, so recovery still finds it, and it doesn't
+                // block the next recording. (A writer still stuck in here never gets this far, so its
+                // record is never handed over early.)
+                settleJournalRecord(context, segment, ActiveSegmentJournal.Settle.RECOVER)
+                throw e
+            }
+            when (end) {
+                SegmentEnd.Saved -> savedTarget = segment.target
+                is SegmentEnd.NoAudio -> end.closeFailure?.let { if (discardFailure == null) discardFailure = it }
+            }
+        }
+
+        fun rollover() {
+            val justClosedToken = segment.token
+            // closeSegment() throws on a genuine finalization failure (header patch or writer
+            // close): that propagates to the caller as fatal, instead of silently opening a new
+            // segment and continuing as if nothing happened.
+            finalizeCurrent()
+            // previousToken = the just-closed segment's own token: whether or not settling its
+            // record actually succeeded, this new segment is the only thing allowed to
+            // legitimately supersede it in the ACTIVE slot.
+            segment = openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted, format, previousToken = justClosedToken)
+            segmentFinalized = false
+        }
+
+        fun write(chunk: Chunk) {
+            val whole = chunk.length
+            // Belt and braces for the WAV size limit: splitPlan's threshold already keeps a margin
+            // far larger than any read, so this never triggers in practice -- but no write may ever
+            // take a segment past what its header can describe.
+            if (segment.audioLen > 0 && segment.audioLen + whole > splitPlan.hardLimitBytes) rollover()
+            val pcm = ByteBuffer.wrap(chunk.bytes, 0, whole)
+            try {
+                writeFully(segment.writer, pcm)
+            } catch (e: Exception) {
+                // The whole frames the writer accepted before failing are in the file, right after
+                // the audio before them: they are audio, finalized with the rest -- never discarded
+                // as if nothing had been written. Past them, the file's contents are unconfirmed
+                // (see settleWithoutAudio).
+                val accepted = format.alignToFrame(pcm.position().toLong())
+                segment.audioLen += accepted
+                recordedBytes += accepted
+                if (segment.failedWrite == null) segment.failedWrite = e
+                throw e
+            }
+            segment.audioLen += whole
+            recordedBytes += whole
+            val now = clock()
+            if (now - segment.lastHeaderFlush >= headerFlushIntervalMs) {
+                flushHeader(segment, format)
+                segment.lastHeaderFlush = now
+            }
+            if (now - segment.lastForce >= DATA_FORCE_INTERVAL_MS) {
+                forceSegment(segment)
+                segment.lastForce = now
+            }
+            if (segment.audioLen >= splitPlan.effectiveLimitBytes) {
+                if (splitPlan.limitedByRiff) {
+                    riffLimitedSplits++
+                    Log.i(TAG, "Starting a new file early at ${segment.audioLen} bytes: the WAV size " +
+                        "limit for $format comes before the chosen split duration")
+                }
+                rollover()
+            }
+        }
+
+        val queue = CaptureQueue(bufferSize, queueCapacity(format, bufferSize))
+        val progress = CaptureProgress(clock())
+        // Capture starts only once the first file is ready, so nothing is read with nowhere to go.
+        Thread({
+            captureLoop(myGeneration, source, format, queue, progress, handler, onAmplitude, onError)
+        }, "WavRecorderCapture").start()
+        val readerGraceMs = maxOf(1L, threadJoinTimeoutMs / 2)
+        var stopNoticedAt = -1L
+        // The first write that failed -- disk full, a revoked SAF permission, a closed channel, a
+        // rollover that can't finalize or open. Kept for this session whatever happens next: after
+        // Stop there is no live callback left to report it to, yet audio that was captured is then
+        // missing from the file, which the result must say (FinalizeResult.Incomplete).
+        var writeFailure: Exception? = null
+
+        /** Writes [chunk]; false (the failure recorded and reported) if that failed. */
+        fun writeOrFail(chunk: Chunk): Boolean = try {
+            write(chunk)
+            true
+        } catch (e: Exception) {
+            if (writeFailure == null) writeFailure = e
+            reportFatal(myGeneration, handler, onError, e)
+            false
+        } finally {
+            queue.recycle(chunk)
+        }
+
+        /** Writes whatever capture has already queued, without waiting for more. */
+        fun drainQueued() {
+            while (true) {
+                val rest = queue.takeNow() as? Chunk ?: return
+                if (!writeOrFail(rest)) return
+            }
+        }
 
         try {
-            while (isRecording.get() && generation.get() == myGeneration) {
-                // Everything here — the mic read, the file write, segment rollover — can throw
-                // (dead AudioRecord, disk full, revoked SAF permission, a closed/broken
-                // FileChannel). Previously only rollover's openSegment() was guarded, so a read()
-                // or write() failure would kill this thread silently: isRecording would stay
-                // true, the foreground notification would stick around, the mic would never be
-                // released, and the user would see no error at all. Catching per-iteration keeps
-                // the failure contained to this recording and routes it through the same cleanup
-                // and onError path as every other fatal condition below.
-                try {
-                    val read = source.read(buffer, pending, buffer.size - pending)
-
-                    // source.read() can block for an arbitrary time (a hung driver, a
-                    // disconnected mic) and stop() only waits up to threadJoinTimeoutMs for it
-                    // before giving up (see stop()'s doc). If this thread is still stuck in that
-                    // read() when a newer session starts, the read may eventually return *valid*
-                    // data instead of an error -- recheck right away, before this data touches
-                    // any state, and quietly bail if this thread is no longer current. Otherwise
-                    // this would write stale audio into a segment that's already being finalized
-                    // (or gone), roll it over into a segment nothing else knows about, and/or
-                    // finalize using a newer session's sampleRate/segmentMaxBytes.
-                    if (generation.get() != myGeneration || !isRecording.get()) break
-
-                    if (read < 0) {
-                        // A negative result usually means a real AudioSource failure (another app
-                        // seized the mic, a dead object, etc.) -- but stop() intentionally
-                        // stops/releases the AudioSource *before* joining specifically to unblock
-                        // a pending read(), so a blocked read returning negative right after an
-                        // intentional stop is expected, not a failure. reportFatal() below tells
-                        // the two apart by checking whether isRecording is still true.
-                        throw IllegalStateException("Recording stopped unexpectedly (AudioRecord error $read)")
+            while (true) {
+                val item = try {
+                    queue.take(WRITER_POLL_MS)
+                } catch (_: InterruptedException) {
+                    // Only a stop that gave up waiting for this thread interrupts it: write what
+                    // is already queued, then finalize.
+                    drainQueued()
+                    break
+                }
+                if (item === CaptureQueue.END) break
+                if (item is Chunk && !writeOrFail(item)) break
+                val now = clock()
+                if (isRecording.get() && generation.get() == myGeneration) {
+                    // A microphone that delivers nothing at all -- a read that never returns, or
+                    // one that keeps returning no data -- ends the session rather than leaving it
+                    // "recording" nothing. Measured from what capture accepted, so slow storage
+                    // here never counts against the microphone.
+                    if (now - progress.lastAudioAt >= noProgressTimeoutMs) {
+                        reportFatal(
+                            myGeneration, handler, onError,
+                            MicrophoneStalledException("The microphone delivered no audio for ${noProgressTimeoutMs / 1000} s")
+                        )
                     }
-                    if (read == 0) {
-                        // Retried after a short, growing pause rather than immediately: see
-                        // EmptyReadBackoff. (An interrupt while waiting lands in the catch below,
-                        // which stays silent for a stopped session.)
-                        emptyReads.onEmpty()
-                        continue
-                    }
-                    emptyReads.onData()
-
-                    val available = pending + read
-                    val whole = available - available % format.bytesPerFrame
-                    if (whole == 0) {
-                        pending = available
-                        continue
-                    }
-                    // Belt and braces for the WAV size limit: splitPlan's threshold already keeps
-                    // a margin far larger than any read, so this never triggers in practice -- but
-                    // no write may ever take a segment past what its header can describe.
-                    if (segment.audioLen > 0 && segment.audioLen + whole > splitPlan.hardLimitBytes) {
-                        val justClosedToken = segment.token
-                        closeSegment(context, segment, format)
-                        segmentFinalized = true
-                        segment = openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted, format, previousToken = justClosedToken)
-                        segmentFinalized = false
-                    }
-                    writeFully(segment.writer, ByteBuffer.wrap(buffer, 0, whole))
-                    segment.audioLen += whole
-                    val amplitude = peakAmplitude(buffer, whole, format)
-                    pending = available - whole
-                    if (pending > 0) System.arraycopy(buffer, whole, buffer, 0, pending)
-                    postIfCurrent(myGeneration, handler) { onAmplitude(amplitude) }
-
-                    val now = System.currentTimeMillis()
-                    if (now - segment.lastHeaderFlush >= headerFlushIntervalMs) {
-                        // Piggybacks on the header-flush cadence rather than being checked on
-                        // every read: a real AudioRecord can keep handing back samples for a
-                        // short while after its routed device is actually gone (buffered/stale
-                        // data, or silently re-routed to the phone mic), so this doesn't need
-                        // read()-level responsiveness -- it just must not go unnoticed for long.
-                        if (!source.isDeviceConnected()) {
-                            throw MicrophoneDisconnectedException(
-                                "External microphone disconnected during recording"
-                            )
-                        }
-                        // Checked in addition to (not instead of) isDeviceConnected() above: a
-                        // silent reroute away from the verified device may never fire a removal
-                        // callback at all, so relying on that alone would let recording continue
-                        // unnoticed on the phone mic.
-                        if (!source.isRouteUnchanged()) {
-                            throw MicrophoneRouteChangedException(
-                                "Recording input changed unexpectedly; no longer using the " +
-                                    "verified external microphone"
-                            )
-                        }
-                        flushHeader(segment, format)
-                        segment.lastHeaderFlush = now
-                    }
-                    if (now - segment.lastForce >= DATA_FORCE_INTERVAL_MS) {
-                        forceSegment(segment)
-                        segment.lastForce = now
-                    }
-
-                    if (segment.audioLen >= splitPlan.effectiveLimitBytes) {
-                        if (splitPlan.limitedByRiff) {
-                            riffLimitedSplits++
-                            Log.i(TAG, "Starting a new file early at ${segment.audioLen} bytes: the WAV size " +
-                                "limit for $format comes before the chosen split duration")
-                        }
-                        // closeSegment() now throws on a genuine finalization failure (header
-                        // patch or writer close) instead of swallowing it -- letting that
-                        // propagate here means a rollover that fails to finalize is treated as
-                        // fatal via the same catch below, instead of silently opening a new
-                        // segment and continuing as if nothing happened.
-                        val justClosedToken = segment.token
-                        closeSegment(context, segment, format)
-                        segmentFinalized = true
-                        // previousToken = the just-closed segment's own token: whether or not its
-                        // clearActiveIfMatches() above actually succeeded, this new segment is the
-                        // only thing allowed to legitimately supersede it in the ACTIVE slot.
-                        segment = openSegment(myGeneration, context, nextTarget, handler, onSegmentStarted, format, previousToken = justClosedToken)
-                        segmentFinalized = false
-                    }
-                } catch (e: Exception) {
-                    reportFatal(myGeneration, handler, onError, e)
+                } else if (stopNoticedAt < 0) {
+                    stopNoticedAt = now
+                } else if (now - stopNoticedAt >= readerGraceMs) {
+                    // The capture thread hasn't ended (its read never returned): write what it had
+                    // already accepted, and finalize without it.
+                    drainQueued()
                     break
                 }
             }
@@ -789,15 +979,145 @@ internal class WavRecorder(
             // can tell a genuine save apart from a segment that needs recovery.
             try {
                 // See segmentFinalized's doc above: `segment` was already finalized by the
-                // rollover branch above and its destination's open failed, so it must not be
-                // finalized (and its journal record cleared) a second time here.
-                if (!segmentFinalized) closeSegment(context, segment, format)
-                if (sessionCounter.get() == mySession) lastFinalizeResult = FinalizeResult.Ok
-            } catch (e: Exception) {
-                if (sessionCounter.get() == mySession) {
-                    lastFinalizeResult = FinalizeResult.Failed(segment.target, e)
+                // rollover branch above -- whether that succeeded, or failed and was recorded --
+                // so it must not be finalized (and its journal record cleared) a second time here.
+                if (!segmentFinalized) finalizeCurrent()
+            } catch (_: Exception) {
+                // Recorded in finalizationFailure.
+            }
+            if (sessionCounter.get() == mySession) {
+                // A finalization failure may need recovery, whatever else happened. Otherwise
+                // cleanly closed files are a complete save only if nothing failed to reach them;
+                // if something did, the result names the last file that actually holds audio --
+                // or says nothing was saved, rather than point at a file deleted for being empty.
+                val saved = savedTarget
+                // A failure closing an empty, deleted file cost no audio: it only matters when
+                // nothing at all was saved -- then it is why.
+                val failure = writeFailure ?: discardFailure?.takeIf { saved == null }
+                if (failure == null && discardFailure != null) {
+                    Log.w(TAG, "A file that held no audio failed to close, then was deleted; no audio was lost", discardFailure)
+                }
+                lastFinalizeResult = finalizationFailure ?: when {
+                    failure == null -> FinalizeResult.Ok
+                    saved != null -> FinalizeResult.Incomplete(saved, IncompleteRecordingException(failure))
+                    else -> FinalizeResult.NothingSaved(RecordingNotSavedException(failure))
+                }
+                lastSavedTarget = saved
+                lastRecordedMillis = recordedBytes * 1000 / format.byteRate
+            }
+        }
+    }
+
+    /**
+     * The session's capture thread: reads the microphone into [queue] as fast as it delivers,
+     * whole frames only, and never touches a file -- so storage latency can't stop it. It also
+     * runs the route and disconnect checks, on their own monotonic cadence whatever the reads
+     * return, so a source that keeps returning nothing is still checked.
+     */
+    private fun captureLoop(
+        myGeneration: Int,
+        source: AudioSource,
+        format: PcmFormat,
+        queue: CaptureQueue,
+        progress: CaptureProgress,
+        handler: Handler,
+        onAmplitude: (Float) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        // An incomplete trailing frame from the previous read, put back at the start of the next
+        // buffer: only whole frames are ever queued, so every byte count, header and split point
+        // stays frame-aligned even if a read ever ends mid-frame.
+        val carry = ByteArray(format.bytesPerFrame)
+        var carryLen = 0
+        val emptyReads = EmptyReadBackoff()
+        var lastHealthCheck = clock()
+        var peakSincePost = 0f
+        var lastAmplitudePost = Long.MIN_VALUE
+
+        try {
+            while (isRecording.get() && generation.get() == myGeneration) {
+                var chunk: Chunk? = null
+                try {
+                    val now = clock()
+                    if (now - lastHealthCheck >= headerFlushIntervalMs) {
+                        lastHealthCheck = now
+                        // A real AudioRecord can keep handing back samples for a short while after
+                        // its routed device is actually gone (buffered/stale data, or silently
+                        // re-routed to the phone mic), so this doesn't need read()-level
+                        // responsiveness -- it just must not go unnoticed for long.
+                        if (!source.isDeviceConnected()) {
+                            throw MicrophoneDisconnectedException("External microphone disconnected during recording")
+                        }
+                        // Checked in addition to (not instead of) isDeviceConnected(): a silent
+                        // reroute away from the verified device may never fire a removal callback.
+                        if (!source.isRouteUnchanged()) {
+                            throw MicrophoneRouteChangedException(
+                                "Recording input changed unexpectedly; no longer using the verified external microphone"
+                            )
+                        }
+                    }
+                    // Never waits for the writer: with every buffer still queued, capture would
+                    // otherwise stop draining the microphone, whose own buffer would then overrun
+                    // unseen. A full queue is reported instead -- whatever the source's apparent
+                    // pace, since an audio clock may drift from the system clock.
+                    chunk = queue.acquire() ?: throw StorageTooSlowException(
+                        "Storage fell more than the capture queue behind; recording stopped rather than lose audio"
+                    )
+                    if (carryLen > 0) System.arraycopy(carry, 0, chunk.bytes, 0, carryLen)
+                    val read = source.read(chunk.bytes, carryLen, chunk.bytes.size - carryLen)
+
+                    // source.read() can block for an arbitrary time (a hung driver, a disconnected
+                    // mic). If the session was stopped meanwhile -- or superseded by a newer one --
+                    // this data belongs to nobody: drop it quietly, before it touches any state or
+                    // callback.
+                    if (generation.get() != myGeneration || !isRecording.get()) break
+
+                    if (read < 0) {
+                        // A negative result usually means a real AudioSource failure (another app
+                        // seized the mic, a dead object, etc.); after an intentional stop the check
+                        // above already ended this loop quietly.
+                        throw IllegalStateException("Recording stopped unexpectedly (AudioRecord error $read)")
+                    }
+                    if (read == 0) {
+                        // Retried after a short, growing pause rather than immediately: see
+                        // EmptyReadBackoff. The writer's no-progress check ends the session if this
+                        // goes on too long. (An interrupt while waiting lands in the catch below.)
+                        emptyReads.onEmpty()
+                        continue
+                    }
+                    emptyReads.onData()
+                    progress.lastAudioAt = clock()
+
+                    val available = carryLen + read
+                    val whole = available - available % format.bytesPerFrame
+                    val leftover = available - whole
+                    if (whole == 0) {
+                        System.arraycopy(chunk.bytes, 0, carry, 0, available)
+                        carryLen = available
+                        continue
+                    }
+                    if (leftover > 0) System.arraycopy(chunk.bytes, whole, carry, 0, leftover)
+                    carryLen = leftover
+                    chunk.length = whole
+                    peakSincePost = maxOf(peakSincePost, peakAmplitude(chunk.bytes, whole, format))
+                    queue.submit(chunk)
+                    chunk = null // now the writer's
+                    val postedAt = clock()
+                    if (lastAmplitudePost == Long.MIN_VALUE || postedAt - lastAmplitudePost >= AMPLITUDE_POST_INTERVAL_MS) {
+                        val amplitude = peakSincePost
+                        peakSincePost = 0f
+                        lastAmplitudePost = postedAt
+                        postIfCurrent(myGeneration, handler) { onAmplitude(amplitude) }
+                    }
+                } catch (e: Exception) {
+                    reportFatal(myGeneration, handler, onError, e)
+                    break
+                } finally {
+                    chunk?.let(queue::recycle)
                 }
             }
+        } finally {
+            queue.end()
         }
     }
 
@@ -835,15 +1155,33 @@ internal class WavRecorder(
         val target: OutputTarget,
         val writer: SegmentWriter,
         val pfd: ParcelFileDescriptor?,
-        /** Uniquely identifies this segment for [ActiveSegmentJournal.clearActiveIfMatches] -- a
+        /** Uniquely identifies this segment for [ActiveSegmentJournal.settleFinishedSegment] -- a
          * random UUID (not a resettable in-process counter), so it can never collide with a
          * still-outstanding record from an *earlier* process -- see [ActiveSegmentJournal]'s own
          * doc for why that matters. */
-        val token: String
+        val token: String,
+        /** Keeps the file from being deleted until it is finalized (see [RecordingOwnership]). */
+        val claim: RecordingOwnership.Claim,
+        /** When it was opened, in [clock] time: the header-flush and forced-write cadence start here. */
+        openedAt: Long
     ) {
+        /** Audio confirmed written: whole frames the writer accepted. */
         var audioLen = 0L
-        var lastHeaderFlush = System.currentTimeMillis()
-        var lastForce = System.currentTimeMillis()
+        var lastHeaderFlush = openedAt
+        var lastForce = openedAt
+        /** The first audio write to this file that failed. Past [audioLen], the file's contents
+         * are then unconfirmed: the writer may have stored more than it reported. */
+        var failedWrite: Exception? = null
+    }
+
+    /** What finalizing a segment left behind; a failure to finalize one is thrown instead. */
+    private sealed class SegmentEnd {
+        /** Finalized cleanly, holding audio. */
+        object Saved : SegmentEnd()
+        /** It held no audio, and nothing is left to recover: deleted -- or, if that couldn't be
+         * confirmed, a valid WAV with no audio. [closeFailure] is a failure closing it that cost no
+         * audio, as the file was confirmed deleted afterward. */
+        class NoAudio(val closeFailure: Exception?) : SegmentEnd()
     }
 
     /**
@@ -893,7 +1231,14 @@ internal class WavRecorder(
         // just-closed segment's own token for every rollover after.
         previousToken: String?
     ): Segment {
-        val target = nextTarget.create()
+        // Created, claimed, then checked to still exist: a delete from the Library that races the
+        // creation makes this create another file, and once claimed nothing can delete it -- see
+        // RecordingOwnership.createClaimed. (Opening a deleted local file below would silently
+        // recreate it, hence the explicit check.)
+        val (target, claim) = RecordingOwnership.createClaimed(
+            RecordingOwnership.Use.CAPTURING,
+            exists = { created -> targetExists(context, created) }
+        ) { nextTarget.create() }
         // Declared outside the try so a failure partway through construction (a bad truncate, a
         // wrapChannel seam throwing, a disk-full header write) still leaves the catch block a
         // reference to whatever was actually opened before the failure -- each is assigned
@@ -942,7 +1287,7 @@ internal class WavRecorder(
                 )
             }
             postIfCurrent(myGeneration, handler) { onSegmentStarted(target) }
-            return Segment(target, writer, pfd, token)
+            return Segment(target, writer, pfd, token, claim, clock())
         } catch (e: Exception) {
             // Without this, any of the failures above would leak the FileChannel/RandomAccessFile
             // (or, for SAF, the ParcelFileDescriptor's underlying fd) and leave a partial/empty
@@ -952,6 +1297,7 @@ internal class WavRecorder(
             try { raf?.close() } catch (_: Exception) {}
             try { pfd?.close() } catch (_: Exception) {}
             deleteSegmentFile(context, target)
+            claim.release()
             throw e
         }
     }
@@ -959,31 +1305,48 @@ internal class WavRecorder(
     /**
      * A segment file is created (and [onSegmentStarted] fired) up front, before any audio has
      * actually been captured for it, so that rollover and the initial segment share one code
-     * path. If the recording ends (rollover, stop, or a fatal error) before a single byte was
-     * ever written to it — most commonly the still-open segment at the moment recording stops —
+     * path. If the recording ends (rollover, stop, or a fatal error) before any audio was
+     * written to it -- most commonly the still-open segment at the moment recording stops --
      * finalizing it would leave a silent, pointless 0-byte-audio WAV file behind in the user's
-     * library. Delete it instead of patching a "valid" empty header onto it.
+     * library, so it is deleted instead, once that is known to be safe (see [settleWithoutAudio]).
      *
-     * A failure patching the final header or closing the writer used to be swallowed here, which
-     * meant a caller could report "Saved" for a file whose header never actually got the right
-     * size written to it (or whose last buffered bytes never made it past the writer). Both are
-     * now collected and thrown as a [WavFinalizationException] instead -- every other cleanup step
-     * (the fd close, deleting an empty segment) still runs first regardless, so this only ever
-     * reports a failure *after* doing everything it can to leave the file in the best state
-     * possible; it never skips cleanup just because it's about to report a problem.
+     * A failure patching the final header or closing the writer of a file holding audio used to be
+     * swallowed here, which meant a caller could report "Saved" for a file whose header never
+     * actually got the right size written to it (or whose last buffered bytes never made it past
+     * the writer). Both are now collected and thrown as a [WavFinalizationException] instead, and
+     * the file's journal record is kept for recovery -- every other cleanup step (the fd close)
+     * still runs first regardless, so this only ever reports a failure *after* doing everything it
+     * can to leave the file in the best state possible.
      */
-    private fun closeSegment(context: Context, segment: Segment, format: PcmFormat) {
+    private fun closeSegment(context: Context, segment: Segment, format: PcmFormat): SegmentEnd {
+        // Still not deletable while it is finalized; released (deletable, like any finished
+        // recording) once that is done, whatever the outcome.
+        segment.claim.markFinalizing()
+        try {
+            return finalizeSegment(context, segment, format)
+        } finally {
+            segment.claim.release()
+        }
+    }
+
+    private fun finalizeSegment(context: Context, segment: Segment, format: PcmFormat): SegmentEnd {
+        // After a failed audio write the file may hold more than the writer confirmed: checked
+        // first, before anything is written at the end of the confirmed audio -- where a pad byte
+        // would overwrite such audio.
+        val unconfirmed = segment.failedWrite?.takeIf { mayHoldUnconfirmedAudio(context, segment, format) }
         var failure: Exception? = null
         if (segment.audioLen > 0L) {
             try {
                 // RIFF chunks are word-aligned: odd-length audio (possible with 3-byte samples)
                 // gets the zero pad byte the specification requires, right after the data, which
-                // the finished header then counts in the RIFF size.
-                if (segment.audioLen % 2 == 1L) {
+                // the finished header then counts in the RIFF size -- unless audio may follow the
+                // confirmed audio: then nothing is written there, and the header claims no pad.
+                val padded = unconfirmed == null && segment.audioLen % 2 == 1L
+                if (padded) {
                     segment.writer.position(WavHeaderWriter.headerSize(format) + segment.audioLen)
                     writeFully(segment.writer, ByteBuffer.wrap(byteArrayOf(0)))
                 }
-                patchWavHeader(segment.writer, segment.audioLen, format, includePadByte = true)
+                patchWavHeader(segment.writer, segment.audioLen, format, includePadByte = unconfirmed == null)
             } catch (e: Exception) {
                 failure = e
             }
@@ -1004,51 +1367,121 @@ internal class WavRecorder(
             // actually flushes/finalizes the data, so a failure here alone isn't treated as fatal.
         }
 
-        if (segment.audioLen <= 0L) {
-            deleteSegmentFile(context, segment.target)
+        if (unconfirmed != null) {
+            // Kept as it is -- never deleted or truncated -- with its journal record, for recovery to
+            // settle from what is physically there. Any header or close failure rides along.
+            Log.w(TAG, "${segment.target.displayPath} may hold audio past the ${segment.audioLen} bytes its " +
+                "writer confirmed; kept for recovery")
+            throw UnconfirmedAudioException(segment.target, unconfirmed).apply { failure?.let(::addSuppressed) }
         }
+        if (segment.audioLen <= 0L) return settleWithoutAudio(context, segment, failure)
+        // A file holding audio whose header patch or close failed may be truncated or carry a
+        // stale header: its journal record is kept for recovery (see finalizeCurrent), so a
+        // recovery pass (see WavRecoveryManager) still finds it and can repair it.
+        if (failure != null) throw WavFinalizationException(segment.target, failure)
+        settleJournalRecord(context, segment, ActiveSegmentJournal.Settle.CLEAR)
+        return SegmentEnd.Saved
+    }
 
-        if (failure == null) {
-            // Only clear the durable "this segment might need recovery" record once finalization
-            // is actually confirmed -- a failure below leaves it in place on purpose, so a later
-            // process-start recovery pass (see WavRecoveryManager) still finds it and can try to
-            // repair the file. clearActiveIfMatches (not a plain clear) guards against this call
-            // clobbering a *newer* segment's own still-active record -- e.g. a stale thread from
-            // an already-superseded session finally finishing its own finalization late.
-            //
-            // A false/failed clear here is deliberately *not* escalated to a finalization failure:
-            // the WAV file itself is already correct and fully closed at this point (failure ==
-            // null), so misreporting it as needing recovery would be worse than the actual, much
-            // smaller problem -- a stale journal entry that a later recovery pass will find,
-            // harmlessly re-verify against the (already correct) file, and clear on its own. Still
-            // surfaced (never silently dropped), per the honest-degraded-state policy documented
-            // on ActiveSegmentJournal.
-            val cleared = try {
-                journalFor(context).clearActiveIfMatches(segment.token)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to clear the active-segment journal record after a clean finalization", e)
-                false
-            }
-            if (!cleared) {
-                Log.w(TAG, "Active-segment journal record for ${segment.target.displayPath} was not " +
-                    "cleared after a clean finalization; a later recovery pass will re-verify it")
-            }
+    /**
+     * Whether a file whose audio write failed may hold whole frames past the audio its writer
+     * confirmed: a failed write may store more than it reports. True when its size shows at least
+     * one whole frame past the header and the confirmed audio -- or can't be determined, or is
+     * smaller than what was confirmed (then it can't be right). Less than a frame past it is an
+     * incomplete frame, which is not audio.
+     */
+    private fun mayHoldUnconfirmedAudio(context: Context, segment: Segment, format: PcmFormat): Boolean {
+        val confirmedEnd = WavHeaderWriter.headerSize(format) + segment.audioLen
+        val size = try { targetSize(context, segment.target) } catch (_: Exception) { null }
+        return size == null || size < confirmedEnd || size - confirmedEnd >= format.bytesPerFrame
+    }
+
+    /**
+     * Settles a segment no audio was confirmed written to -- normally deleting it, but only once it
+     * is certain there is nothing in it to keep, and never reporting a file for recovery that is
+     * gone. (One that may hold audio a failed write never confirmed never gets here: it is kept for
+     * recovery -- see [finalizeSegment].)
+     *  - Deleted and confirmed gone: nothing is left to recover, so the journal record is cleared,
+     *    even if closing it had failed ([closeFailure] then comes back in [SegmentEnd.NoAudio]: it
+     *    cost no audio).
+     *  - Not confirmed gone after a failed close: whether a file remains, and in what state, is
+     *    unknown -- so the failure is thrown and the record kept, as for any file that failed to
+     *    finalize.
+     *  - Not confirmed gone after a clean close: what remains is a valid WAV with no audio, so
+     *    there is nothing to recover.
+     */
+    private fun settleWithoutAudio(context: Context, segment: Segment, closeFailure: Exception?): SegmentEnd {
+        val target = segment.target
+        val gone = deleteSegmentFile(context, target)
+        if (!gone && closeFailure != null) throw WavFinalizationException(target, closeFailure)
+        if (!gone) Log.w(TAG, "Could not confirm that ${target.displayPath}, which holds no audio, was deleted")
+        settleJournalRecord(context, segment, ActiveSegmentJournal.Settle.CLEAR)
+        return SegmentEnd.NoAudio(closeFailure)
+    }
+
+    /**
+     * Settles [segment]'s durable "this segment might need recovery" record once this writer has
+     * finished with the file for good (see [ActiveSegmentJournal.settleFinishedSegment]): cleared
+     * when nothing is left to recover, moved to the recovery queue when the file may need
+     * recovery. Token-specific, so a stale thread from an already-superseded session finishing late
+     * never touches a *newer* segment's record.
+     *
+     * A settle that fails to reach storage is deliberately *not* escalated to a finalization
+     * failure: the file itself is already settled at this point, and the record is left exactly as
+     * it was -- still recoverable -- and settled again before the next segment is recorded. Still
+     * surfaced (never silently dropped), per the honest-degraded-state policy documented on
+     * ActiveSegmentJournal.
+     */
+    private fun settleJournalRecord(context: Context, segment: Segment, settle: ActiveSegmentJournal.Settle) {
+        // A stop that gave up waiting interrupts this thread to unblock its file work (see
+        // awaitFinalization); that work is over now, and the interrupt mustn't fail the durable
+        // write that follows (SharedPreferences.commit() gives up when interrupted). Set aside
+        // for the settle, then restored.
+        val interrupted = Thread.interrupted()
+        val settled = try {
+            journalFor(context).settleFinishedSegment(segment.token, settle)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to settle the active-segment journal record for ${segment.target.displayPath}", e)
+            false
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
         }
-
-        if (failure != null) {
-            throw WavFinalizationException(segment.target, failure)
+        if (!settled) {
+            Log.w(TAG, "Active-segment journal record for ${segment.target.displayPath} could not be " +
+                "settled ($settle) yet; it stays recoverable, and is settled before the next recording")
         }
     }
 
-    private fun deleteSegmentFile(context: Context, target: OutputTarget) {
-        try {
+    private fun targetExists(context: Context, target: OutputTarget): Boolean = existenceOf(context, target) == true
+
+    /** Whether [target] exists: null when that can't be determined (a provider query that fails
+     * says nothing either way). A document provider reports a missing document by throwing
+     * [FileNotFoundException]. */
+    private fun existenceOf(context: Context, target: OutputTarget): Boolean? = try {
+        when (target) {
+            is OutputTarget.FileTarget -> target.file.exists()
+            is OutputTarget.SafTarget -> context.contentResolver.query(
+                target.uri, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID), null, null, null
+            )?.use { it.count > 0 }
+        }
+    } catch (_: FileNotFoundException) {
+        false
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Deletes [target]; true only when it is confirmed gone -- the deletion reported success, or
+     * the file is confirmed missing afterward. False when it may still exist. */
+    private fun deleteSegmentFile(context: Context, target: OutputTarget): Boolean {
+        val deleted = try {
             when (target) {
                 is OutputTarget.FileTarget -> target.file.delete()
-                is OutputTarget.SafTarget -> DocumentFile.fromSingleUri(context, target.uri)?.delete()
+                is OutputTarget.SafTarget -> DocumentFile.fromSingleUri(context, target.uri)?.delete() == true
             }
         } catch (_: Exception) {
-            // Not fatal: worst case, an empty WAV lingers until the user notices and deletes it.
+            false
         }
+        return deleted || existenceOf(context, target) == false
     }
 
     private fun patchWavHeader(writer: SegmentWriter, totalAudioLen: Long, format: PcmFormat, includePadByte: Boolean) {
@@ -1056,6 +1489,19 @@ internal class WavRecorder(
         writer.position(0)
         writeFully(writer, header)
     }
+}
+
+/** [target]'s size in bytes, or null if it can't be determined (a provider that doesn't report
+ * it, or a query that fails -- never read as "empty"). */
+private fun sizeOf(context: Context, target: OutputTarget): Long? = try {
+    when (target) {
+        is OutputTarget.FileTarget -> target.file.takeIf { it.exists() }?.length()
+        is OutputTarget.SafTarget -> context.contentResolver.query(
+            target.uri, arrayOf(DocumentsContract.Document.COLUMN_SIZE), null, null, null
+        )?.use { if (it.moveToFirst() && !it.isNull(0)) it.getLong(0) else null }
+    }
+} catch (_: Exception) {
+    null
 }
 
 /**

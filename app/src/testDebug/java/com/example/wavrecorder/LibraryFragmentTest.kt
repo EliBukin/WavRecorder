@@ -10,6 +10,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.ShadowToast
@@ -27,9 +28,12 @@ import java.util.concurrent.atomic.AtomicInteger
 @RunWith(RobolectricTestRunner::class)
 class LibraryFragmentTest {
 
+    @get:Rule
+    val isolation = TestIsolation()
+
     @Test
     fun `refreshList surfaces a revoked SAF permission as a clear error instead of failing silently`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
 
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
@@ -58,7 +62,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `a stale refreshList result cannot overwrite a newer one`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
 
         val slowItem = RecordingItem(
             name = "slow.wav", uri = Uri.parse("file:///slow.wav"), durationSeconds = 1.0, sizeBytes = 100
@@ -128,7 +132,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `destroying the view while a scan is still in flight produces no crash and no stale UI update`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val releaseScan = CountDownLatch(1)
         var scanReached = false
 
@@ -167,7 +171,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `repeated refresh requests coalesce so stale scans are cancelled rather than piling up unbounded work`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val invocationCount = AtomicInteger(0)
 
         scenario.onFragment { fragment ->
@@ -229,7 +233,7 @@ class LibraryFragmentTest {
         // destroying the view must now genuinely interrupt a blocking scan that itself respects
         // interruption (like CountDownLatch.await()), without the test ever releasing the latch
         // itself.
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val neverReleased = CountDownLatch(1) // deliberately never counted down by the test
         var scanReached = false
         var observedInterruption = false
@@ -271,7 +275,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `destroying the view cancels a queued or in-flight refresh so it never applies a result`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val releaseScan = CountDownLatch(1)
         var scanReached = false
 
@@ -315,7 +319,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `dismissing the stats dialog cancels its job and never updates the dialog afterward`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val item = RecordingItem(
             name = "track.wav", uri = Uri.parse("file:///track.wav"), durationSeconds = 1.0, sizeBytes = 100
         )
@@ -359,7 +363,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `destroying the view during a statistics scan causes no crash and no update to a torn-down dialog`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val item = RecordingItem(
             name = "track.wav", uri = Uri.parse("file:///track.wav"), durationSeconds = 1.0, sizeBytes = 100
         )
@@ -393,7 +397,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `a fresh refreshList call after the view is recreated is not affected by the old view's cancelled work`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val oldViewReleaseScan = CountDownLatch(1)
         var oldViewScanReached = false
 
@@ -422,7 +426,7 @@ class LibraryFragmentTest {
         scenario.moveToState(androidx.lifecycle.Lifecycle.State.DESTROYED)
         oldViewReleaseScan.countDown()
 
-        val freshScenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val freshScenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val freshItem = RecordingItem(name = "fresh.wav", uri = Uri.parse("file:///fresh.wav"),
             durationSeconds = 1.0, sizeBytes = 100)
         freshScenario.onFragment { fragment ->
@@ -449,7 +453,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `rapid refresh requests genuinely interrupt the prior reader rather than merely discarding its result`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val firstScanReached = CountDownLatch(1)
         var firstScanInterrupted = false
 
@@ -490,7 +494,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `dismissing the statistics dialog interrupts a cooperative reader and closes its stream`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val item = RecordingItem(
             name = "track.wav", uri = Uri.parse("file:///track.wav"), durationSeconds = 1.0, sizeBytes = 100
         )
@@ -539,7 +543,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `destroying the view dismisses an open statistics dialog and releases its binding`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val item = RecordingItem(
             name = "track.wav", uri = Uri.parse("file:///track.wav"), durationSeconds = 1.0, sizeBytes = 100
         )
@@ -573,7 +577,7 @@ class LibraryFragmentTest {
 
     @Test
     fun `a CancellationException from a superseded refresh never produces a failure toast`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val firstScanReached = CountDownLatch(1)
 
         scenario.onFragment { fragment ->

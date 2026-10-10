@@ -3,6 +3,7 @@ package com.example.wavrecorder
 import android.net.Uri
 import android.view.View
 import android.widget.FrameLayout
+import androidx.core.view.ViewCompat
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -46,7 +47,8 @@ class RecordingsAdapterTest {
         selectionMode: Boolean = false,
         selected: Set<Uri> = emptySet(),
         onToggleSelect: (RecordingItem) -> Unit = {},
-        onLongPress: (RecordingItem) -> Unit = {}
+        onLongPress: (RecordingItem) -> Unit = {},
+        inUse: Boolean = false
     ): RecordingsAdapter = RecordingsAdapter(
         onPlayPause = {},
         onSeekTo = { _, _ -> },
@@ -62,7 +64,8 @@ class RecordingsAdapterTest {
         isSelectionModeActive = { selectionMode },
         isSelected = { uri -> selected.contains(uri) },
         onToggleSelect = onToggleSelect,
-        onLongPress = onLongPress
+        onLongPress = onLongPress,
+        isInUse = { inUse }
     )
 
     @Test
@@ -404,5 +407,30 @@ class RecordingsAdapterTest {
         assertEquals("0:13 · 244 KB", holder.binding.fileMeta.text.toString())
         adapter.onBindViewHolder(holder, 1)
         assertEquals("1:02:05 · 341.0 MB", holder.binding.fileMeta.text.toString())
+    }
+
+    @Test
+    fun `a row being recorded is labelled so and offers neither playback nor delete`() {
+        val adapter = buildAdapter(inUse = true)
+        adapter.submitList(listOf(item))
+        val holder = newHolder(adapter)
+        adapter.onBindViewHolder(holder, 0)
+
+        val context = holder.binding.root.context
+        assertEquals(context.getString(R.string.recording_in_use), holder.binding.fileMeta.text.toString())
+        assertEquals(View.INVISIBLE, holder.binding.playButton.visibility)
+        assertEquals("no overflow menu, so no delete", View.INVISIBLE, holder.binding.overflowButton.visibility)
+        assertEquals(context.getString(R.string.recording_in_use), ViewCompat.getStateDescription(holder.binding.root)?.toString())
+    }
+
+    @Test
+    fun `in selection mode a row being recorded can't be checked`() {
+        val adapter = buildAdapter(selectionMode = true, inUse = true)
+        adapter.submitList(listOf(item))
+        val holder = newHolder(adapter)
+        adapter.onBindViewHolder(holder, 0)
+
+        assertFalse(holder.binding.selectionCheckbox.isEnabled)
+        assertEquals(holder.binding.root.context.getString(R.string.recording_in_use), holder.binding.fileMeta.text.toString())
     }
 }

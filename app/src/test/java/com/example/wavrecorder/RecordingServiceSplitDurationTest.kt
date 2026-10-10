@@ -28,6 +28,9 @@ import java.util.concurrent.TimeUnit
 class RecordingServiceSplitDurationTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     private fun segmentBytes(duration: RecordingSplitDuration): Int = (duration.seconds * 2).toInt()

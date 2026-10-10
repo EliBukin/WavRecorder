@@ -31,6 +31,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class StartupWatchdogTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     private fun context() = ApplicationProvider.getApplicationContext<Context>()

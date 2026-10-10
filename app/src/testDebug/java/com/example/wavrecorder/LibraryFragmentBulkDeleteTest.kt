@@ -14,6 +14,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.ShadowDialog
@@ -32,6 +33,9 @@ import java.util.concurrent.TimeUnit
  */
 @RunWith(RobolectricTestRunner::class)
 class LibraryFragmentBulkDeleteTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun localItem(name: String): RecordingItem = RecordingItem(
         name = name, uri = Uri.parse("file:///$name"), durationSeconds = 1.0, sizeBytes = 100
@@ -52,7 +56,7 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `long-pressing a recording enters selection mode with it selected`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val item = localItem("a.wav")
 
         scenario.onFragment { fragment -> fragment.enterSelectionMode(item) }
@@ -66,7 +70,7 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `tapping additional recordings toggles their selection and updates the count`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val a = localItem("a.wav")
         val b = localItem("b.wav")
 
@@ -92,7 +96,7 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `deselecting the last item exits selection mode`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val a = localItem("a.wav")
         scenario.onFragment { fragment -> fragment.enterSelectionMode(a) }
 
@@ -106,11 +110,11 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `cancel exits selection mode without deleting anything`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         var deleteCalls = 0
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean { deleteCalls++; return true }
+                override fun removeFromStorage(uri: Uri): Boolean { deleteCalls++; return true }
             }
             fragment.enterSelectionMode(localItem("a.wav"))
             fragment.view!!.findViewById<View>(R.id.selectionCancelButton).performClick()
@@ -126,12 +130,12 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `system back exits selection mode without deleting anything`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         var deleteCalls = 0
         var backCallbackEnabled = false
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean { deleteCalls++; return true }
+                override fun removeFromStorage(uri: Uri): Boolean { deleteCalls++; return true }
             }
             fragment.enterSelectionMode(localItem("a.wav"))
             backCallbackEnabled = fragment.requireActivity().onBackPressedDispatcher.hasEnabledCallbacks()
@@ -151,7 +155,7 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `confirming deletion with one item selected uses the singular wording`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         scenario.onFragment { fragment -> fragment.enterSelectionMode(localItem("a.wav")) }
 
         scenario.onFragment { fragment -> fragment.confirmBulkDelete() }
@@ -162,7 +166,7 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `confirming deletion with five items selected uses the plural wording`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         scenario.onFragment { fragment ->
             fragment.enterSelectionMode(localItem("a.wav"))
             for (i in 2..5) fragment.toggleSelection(localItem("$i.wav"))
@@ -176,11 +180,11 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `cancelling the confirmation dialog deletes nothing`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         var deleteCalls = 0
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean { deleteCalls++; return true }
+                override fun removeFromStorage(uri: Uri): Boolean { deleteCalls++; return true }
             }
             fragment.enterSelectionMode(localItem("a.wav"))
             fragment.confirmBulkDelete()
@@ -196,13 +200,13 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `a successful multi-delete removes every target and reports full success`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val a = localItem("a.wav")
         val b = safItem("b.wav")
         val deleted = mutableListOf<Uri>()
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean { deleted.add(uri); return true }
+                override fun removeFromStorage(uri: Uri): Boolean { deleted.add(uri); return true }
                 override fun listRecordings(): List<RecordingItem> = emptyList()
             }
             fragment.enterSelectionMode(a)
@@ -219,12 +223,12 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `a mixed success-failure result never claims total success and keeps failed items retryable`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val succeeds = localItem("succeeds.wav")
         val fails = localItem("fails.wav")
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean = uri == succeeds.uri
+                override fun removeFromStorage(uri: Uri): Boolean = uri == succeeds.uri
                 // The failed target is still really "on disk" as far as this fake is concerned --
                 // a real refresh must find it again, exactly like the production DestinationManager
                 // re-scanning a real folder would.
@@ -285,13 +289,13 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `deleting a recording that is genuinely playing releases playback before the file is removed`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val playing = localItem("playing.wav")
         registerMedia(playing.uri)
         var deleteCalls = 0
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean { deleteCalls++; return true }
+                override fun removeFromStorage(uri: Uri): Boolean { deleteCalls++; return true }
                 override fun listRecordings(): List<RecordingItem> = listOf(playing)
             }
             fragment.refreshList()
@@ -339,13 +343,13 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `a second bulk-delete tap while one is already running is ignored`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val startedCount = java.util.concurrent.atomic.AtomicInteger(0)
         val releaseDelete = CountDownLatch(1)
         val item = localItem("a.wav")
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean {
+                override fun removeFromStorage(uri: Uri): Boolean {
                     startedCount.incrementAndGet()
                     releaseDelete.await(5, TimeUnit.SECONDS)
                     return true
@@ -372,12 +376,12 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `two rapid taps on Delete selected before confirming allow only one confirmation and one deletion pass`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val attemptCounts = mutableMapOf<Uri, Int>()
         val item = localItem("a.wav")
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean {
+                override fun removeFromStorage(uri: Uri): Boolean {
                     attemptCounts[uri] = (attemptCounts[uri] ?: 0) + 1
                     return true
                 }
@@ -405,12 +409,12 @@ class LibraryFragmentBulkDeleteTest {
 
     @Test
     fun `a bulk-delete result arriving after the view is destroyed is discarded safely`() {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val releaseDelete = CountDownLatch(1)
         val item = localItem("a.wav")
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean {
+                override fun removeFromStorage(uri: Uri): Boolean {
                     releaseDelete.await(5, TimeUnit.SECONDS)
                     return true
                 }
@@ -434,11 +438,11 @@ class LibraryFragmentBulkDeleteTest {
         // own newest-wins staleness guard (see LibraryFragmentTest) -- this confirms the combined
         // flow still reports the delete's own outcome honestly even when a concurrent scan is
         // triggered in between.
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         val item = localItem("a.wav")
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(ApplicationProvider.getApplicationContext()) {
-                override fun deleteRecording(uri: Uri): Boolean = true
+                override fun removeFromStorage(uri: Uri): Boolean = true
                 override fun listRecordings(): List<RecordingItem> = emptyList()
             }
             fragment.enterSelectionMode(item)

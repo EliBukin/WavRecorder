@@ -23,6 +23,9 @@ import java.nio.ByteOrder
 class FormatAwareRecoveryTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = org.junit.rules.TemporaryFolder()
 
     private fun context() = ApplicationProvider.getApplicationContext<Context>()

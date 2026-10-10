@@ -26,6 +26,9 @@ import java.util.concurrent.TimeUnit
 class WavRecorderFormatTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     private fun context() = ApplicationProvider.getApplicationContext<Context>()
@@ -212,9 +215,12 @@ class WavRecorderFormatTest {
             openAudioSource = { WavRecorder.RecorderConfig(fake, format, 60) }
         )
         recorder.start(context(), WavRecorder.NextTarget { OutputTarget.FileTarget(file) }, {}, {}, onError = { error = it })
+        // Inactive the moment it fails; its error is posted just after -- so this waits for the report.
         val deadline = System.currentTimeMillis() + 3000
-        while (recorder.isActive && System.currentTimeMillis() < deadline) Thread.sleep(5)
-        shadowOf(Looper.getMainLooper()).idle()
+        while ((recorder.isActive || error == null) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
         assertTrue(error is MicrophoneDisconnectedException)
         assertEquals(WavRecorder.FinalizeResult.Ok, recorder.stop())
         val parsed = parse(file)

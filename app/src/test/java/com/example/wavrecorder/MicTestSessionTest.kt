@@ -8,6 +8,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import java.io.IOException
@@ -23,6 +24,9 @@ import java.util.concurrent.TimeUnit
  */
 @RunWith(RobolectricTestRunner::class)
 class MicTestSessionTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun context() = ApplicationProvider.getApplicationContext<android.content.Context>()
 
@@ -65,7 +69,9 @@ class MicTestSessionTest {
 
     @Test
     fun `stop releases the AudioSource and the session reports inactive`() {
-        val fake = FakeAudioSource(scriptedReads = listOf(byteArrayOf(1, 2, 3, 4)))
+        // Stays open (empty reads) once its audio is used up, rather than failing with -1: that would
+        // end the test by itself, racing the check that it is active.
+        val fake = FakeAudioSource(scriptedReads = listOf(byteArrayOf(1, 2, 3, 4)), readReturnsZeroWhenExhausted = true)
         val session = MicTestSession(startup = ImmediateStartup, openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) })
 
         session.start(context(), onMicrophoneInfo = {}, onLevel = {}, onError = {})

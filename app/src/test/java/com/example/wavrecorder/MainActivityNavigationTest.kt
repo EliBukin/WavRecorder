@@ -16,6 +16,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -27,6 +28,9 @@ import org.robolectric.Shadows.shadowOf
  */
 @RunWith(RobolectricTestRunner::class)
 class MainActivityNavigationTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
@@ -49,7 +53,7 @@ class MainActivityNavigationTest {
 
     @Test
     fun `the app opens on Record with the matching navigation item selected`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         scenario.onActivity { activity ->
             assertEquals(MainActivity.PAGE_RECORD, pager(activity).currentItem)
             assertEquals(R.id.nav_record, nav(activity).selectedItemId)
@@ -58,7 +62,7 @@ class MainActivityNavigationTest {
 
     @Test
     fun `tapping a navigation item switches the page, in both directions`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         scenario.onActivity { activity ->
             activity.findViewById<View>(R.id.nav_library).performClick()
             idle()
@@ -74,7 +78,7 @@ class MainActivityNavigationTest {
 
     @Test
     fun `changing the page directly (as a swipe does) moves the navigation selection with it`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         scenario.onActivity { activity ->
             assertTrue("swiping between pages must stay supported", pager(activity).isUserInputEnabled)
             pager(activity).currentItem = MainActivity.PAGE_LIBRARY
@@ -88,7 +92,7 @@ class MainActivityNavigationTest {
 
     @Test
     fun `switching pages never recreates or duplicates a fragment`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         scenario.onActivity { activity ->
             activity.findViewById<View>(R.id.nav_library).performClick()
             idle()
@@ -107,7 +111,7 @@ class MainActivityNavigationTest {
 
     @Test
     fun `recreation restores the selected page and navigation item without duplicate fragments`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         scenario.onActivity { activity ->
             activity.findViewById<View>(R.id.nav_library).performClick()
             idle()
@@ -126,7 +130,7 @@ class MainActivityNavigationTest {
 
     @Test
     fun `reselecting the current item is a no-op`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         scenario.onActivity { activity ->
             activity.findViewById<View>(R.id.nav_record).performClick()
             idle()
@@ -136,7 +140,7 @@ class MainActivityNavigationTest {
 
     @Test
     fun `navigation items and the header are labelled for accessibility`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         scenario.onActivity { activity ->
             val menu = nav(activity).menu
             assertEquals(2, menu.size())

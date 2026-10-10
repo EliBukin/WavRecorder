@@ -26,6 +26,9 @@ import java.util.concurrent.atomic.AtomicInteger
 class RouteAwareCaptureTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     private fun context() = ApplicationProvider.getApplicationContext<Context>()

@@ -129,7 +129,12 @@ and the microphone test, never the main thread: a stalled audio driver can't
 freeze the screen, and a new start can't open a microphone until the previous
 one has been released. While a start is negotiating, the Record screen shows
 "Preparing to record…" and Stop cancels it; a cancelled start never becomes a
-recording, and no file is created until the microphone has been accepted.
+recording, and no file is created until the microphone has been accepted. A
+start stopped while its opened microphone is on its way to the screen is
+released by the cleanup the stop queues on that same thread -- ahead of any
+start made after it -- even if the screen receives the handoff first; the
+screen then leaves it alone rather than release it later, behind the new
+start.
 
 That thread can't be interrupted, so a **watchdog** on the main thread supervises
 it. A start that hasn't finished within 12 seconds -- queued time included -- ends
@@ -141,6 +146,116 @@ nothing new is opened until the stuck call returns, and then everything works
 again. A recording's file status and the microphone's release are reported
 separately: a finalized file shows as saved even while Android is still
 releasing the microphone, with a note until it has.
+
+**Capture and storage are decoupled.** During a recording, one thread reads the
+microphone and another -- the only one that touches files -- writes. The capture
+thread hands whole frames to the writer through a bounded queue of reusable
+buffers holding up to 10 seconds of audio (capped at 48 MiB for very high
+formats; buffers are allocated only as the queue fills). A slow write, a slow
+provider creating the next file at a split, a header flush or a forced write
+therefore never stops the microphone being drained. If storage falls more than
+the queue behind, recording stops with an explicit error ("Storage couldn't keep
+up") rather than dropping audio or growing memory without limit; everything
+accepted up to then is written and saved. The capture thread never waits for
+room in the queue -- a wait would itself stop the microphone being drained -- and
+it doesn't guess from timing whether the microphone is "ahead of real time":
+the queue's 10 seconds are the whole policy. On stop, every accepted buffer is
+written before the file is finalized; if the microphone's read never returns,
+the writer waits at most half the stop timeout for it, then finalizes without
+it.
+
+A write that fails -- while recording, or while draining the queue at the stop
+-- ends the session as *incomplete*, never as saved: the file is finalized as a
+valid WAV of the audio written up to the failure, and the user is told once
+that it was saved only up to that point. Only a session in which every accepted
+buffer reached storage is reported as saved.
+
+What a session reports as saved is what actually holds audio. A file that
+receives no audio is deleted when it is closed, so no result ever points at
+one: a partial save names the last file that holds audio (an earlier part, if
+the failure came before any audio reached the file after it), and a session
+that saved no audio at all -- a write failing before the first frame reached
+storage, or a microphone that failed before delivering any -- says nothing was
+saved, never "saved up to that point". Silent audio that was written counts as
+saved audio, and so do the whole frames a failing write managed to store. A
+failure finalizing a file that holds audio (its header or close) keeps its own
+meaning: the file may need recovery, and its crash-recovery record is kept.
+
+A write that fails may have stored more than it reported. So after any failed
+write -- whether or not audio was confirmed before it -- finalization first
+checks the file's size: if it shows at least one whole frame past the confirmed
+audio, or can't be read, the file is kept as it is (never deleted or truncated,
+and no pad byte written over what may be audio), its header describes the
+confirmed audio, its recovery record is kept, and the recording is reported as
+possibly needing recovery; recovery later settles it from what is physically
+there. Less than a frame past it is an incomplete frame, not audio.
+
+A file with no audio is deleted -- and its recovery record cleared -- only once
+it is certain there is nothing in it to keep and that it is really gone. If
+deleting it can't be confirmed after its close failed, it is reported as
+possibly needing recovery rather than as gone. An empty file whose close failed
+but which was deleted cost no audio: it is reported only when it explains a
+session that saved nothing.
+
+**Crash-recovery records.** Each file being recorded has a durable record in
+the segment journal while it is open. Only the recording's own writer settles
+it, once it has finished with the file for good (finalizing it closed it,
+whatever the outcome) -- never a stop request, a timeout or the screen: a
+cleanly finalized file's record is cleared; one that may need recovery is moved,
+in one commit, to the recovery queue, which the next service start repairs in
+the background. So a failed recording neither loses its recovery record nor
+blocks the next recording in the same process, and a writer still stuck in a
+native call keeps its record (and new recordings wait) until it really is done.
+Settling touches only that file's own record, and doing it twice changes
+nothing. If the journal can't be written, the record stays exactly as it was
+and settling is retried before the next recording and at the next service
+start.
+
+The capture thread checks the microphone's route and connection on its own
+schedule, whatever the reads return, so a source that keeps returning nothing
+is still checked. If no audio at all -- not even silence -- arrives for 10
+seconds (a read that never returns, or one that keeps returning no data), the
+recording ends as stalled and what was captured is saved. The microphone test
+applies the same limit, watched by a thread of its own, since a read that never
+returns can't check anything itself; the watchdog can't make that read return,
+but it ends the test at the limit and whatever the read delivers afterwards is
+ignored. Silent audio is audio: a muted microphone, or another
+app's call taking priority, delivers zero-valued samples and keeps recording.
+Every interval is measured on a monotonic clock, never the wall clock. The live
+level is posted to the screen at most every 50 ms (the loudest peak since the
+last update).
+
+**Deleting recordings.** A file being recorded, finalized or repaired by crash
+recovery can't be deleted: `RecordingOwnership` records which files are in use,
+and every delete goes through `DestinationManager.deleteRecording`. Whether a
+file may be claimed or deleted is decided atomically under one lock, but no
+storage I/O ever runs under it: a delete marks the file as being deleted, removes
+it outside the lock, then clears the mark, and a file being deleted can't be
+claimed. A new file is created outside the lock, claimed, and checked to still
+exist; if a delete won the race, the writer creates another file instead, so it
+never writes into a deleted one. One window remains: a delete that removes the
+new file before even its first existence check makes it look like a file that is
+only created when first opened. An app-storage file is then simply recreated by
+opening it; a document in a folder you picked can't be opened, so the recording
+ends with an error before anything is written. The Library's per-row lookups read a published
+snapshot without taking the lock, so a slow provider delete never stalls the
+screen. A delete from the Library therefore can't slip in, whatever the screen
+showed when it was confirmed. The Library labels such a file "Recording in progress" and offers
+no delete, playback or selection for it; finished files, including the completed
+parts of a recording that is still going, stay deletable.
+
+The "Recording saved" summary shows the audio actually recorded, counted from
+the frames written across all of a session's files and stored with the outcome
+at the stop -- not the time since the recording started, whenever it is shown.
+A permission request remembers what it was for (a recording or a microphone
+test) across the screen being recreated, and its result is used once: a grant
+never starts anything nobody asked for.
+
+Unplugging headphones pauses playback, and it stays paused until the user
+plays it again: no later audio-focus change -- a notification sound's transient
+loss and gain, say -- can start it on the speaker, whether the track was playing
+or still loading. Only a pause caused by a transient focus loss, of a track the
+user still wants playing, is resumed when focus returns.
 
 Audio is read with `AudioRecord.read(ByteBuffer, ...)` into a reused direct
 buffer -- the one read that works for every encoding, float included -- and
@@ -178,8 +293,11 @@ app/src/main/java/com/example/wavrecorder/
                               recording logic of its own
   RecordingService.kt        Foreground service that owns the WavRecorder instance,
                               the notification, and the recording lifecycle
-  WavRecorder.kt              Core capture engine: opening the negotiated
-                              AudioRecord, the record loop, segment rollover
+  WavRecorder.kt              Core capture engine: the capture thread, the writer
+                              (files, headers, rollover, finalization) and the
+                              bounded queue between them
+  RecordingOwnership.kt       Which files are being written, finalized or repaired,
+                              so they can't be deleted
   FormatNegotiation.kt        Pure candidate ranking/fallback for the input format
   CaptureQuality.kt           The selection policy and format evidence (matched / converted / unreported)
   CaptureNegotiation.kt       Route-aware candidate lifecycle and the coverage-aware quality search
@@ -233,6 +351,23 @@ release, plus lint. Tests live in `app/src/test` and run for both variants,
 except the fragment UI tests, which live in `app/src/testDebug`: they use
 FragmentScenario, whose host activity is a test-only manifest entry merged into
 debug builds only (`fragment-testing-manifest`), never into a release build.
+
+Every test that records, runs the microphone test or opens a screen declares
+the `TestIsolation` rule. After the test and its `@After` methods, it closes
+the screens the test registered with it, then waits (bounded) until every
+recording, microphone-test, finalization, recovery and delete thread the test
+started has ended, the shared audio worker is idle, and no screen of the test
+is still registered for recording-ownership changes -- and fails the test,
+naming what is still running, if not. Work left running by one test used to
+reach into later ones and make them fail intermittently. Tests that simulate a
+stuck microphone release it in `@After`, never by simply outlasting the test.
+
+`ProcessDeathRestorationTest` covers restoring after Android kills the app's
+process: pending permission requests, persisted outcomes and an interrupted
+recording. It keeps what Android keeps (preferences, files, and the saved
+Activity state round-tripped through a Parcel) and builds fresh Activity,
+Fragment and service objects from it. It can't restart the JVM or the
+Application itself, so a real process kill still needs checking on a device.
 
 ## Why a hand-rolled WAV writer
 

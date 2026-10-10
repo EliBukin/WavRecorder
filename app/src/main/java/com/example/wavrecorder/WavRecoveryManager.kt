@@ -217,7 +217,8 @@ private fun openReadableRecoveryChannel(context: Context, target: OutputTarget):
 }
 
 /**
- * Repairs every WAV segment left mid-write by abrupt previous-process deaths -- see
+ * Repairs every WAV segment left mid-write by abrupt previous-process deaths, or handed over by
+ * this process's own writer after finalizing it failed -- see
  * [ActiveSegmentJournal] for how each such segment is durably identified (via the ordered
  * RECOVERY_PENDING queue specifically, never the live ACTIVE record), and
  * `WavRecorder.openSegment`/`closeSegment` for how the ACTIVE record is written/cleared during
@@ -281,7 +282,19 @@ internal class WavRecoveryManager(
         return candidates.map { recoverOne(context, it, journal) }
     }
 
+    /** Repairs one candidate while holding it ([RecordingOwnership]), so it can't be deleted
+     * mid-repair; one already in use is left queued for a later pass. */
     private fun recoverOne(context: Context, record: ActiveSegmentJournal.Record, journal: ActiveSegmentJournal): RecoveryOutcome {
+        val claim = RecordingOwnership.tryClaim(record.target, RecordingOwnership.Use.RECOVERING)
+            ?: return RecoveryOutcome.Failed(record.target, "The file is in use; recovery will be retried later", RecoveryOutcome.Mutation.UNTOUCHED)
+        return try {
+            repair(context, record, journal)
+        } finally {
+            claim.release()
+        }
+    }
+
+    private fun repair(context: Context, record: ActiveSegmentJournal.Record, journal: ActiveSegmentJournal): RecoveryOutcome {
         var mutation = RecoveryOutcome.Mutation.UNTOUCHED
         val writable = try {
             openWritable(context, record.target)

@@ -104,7 +104,28 @@ open class DestinationManager(private val context: Context) {
         else "${fileName}_$attempt"
     }
 
-    open fun deleteRecording(uri: Uri): Boolean {
+    /** How a [deleteRecording] call ended. */
+    enum class DeleteResult {
+        DELETED,
+        /** Left alone: it is being recorded, finalized or repaired right now (see [RecordingOwnership]). */
+        IN_USE,
+        FAILED
+    }
+
+    /**
+     * Deletes the recording at [uri] -- unless it is in use: being captured, finalized or
+     * repaired. The one delete path every caller goes through; the in-use check and the deletion
+     * happen atomically with respect to a writer claiming the file ([RecordingOwnership]), so a
+     * live recording can't be deleted from under its writer, whatever the caller's view of it.
+     */
+    fun deleteRecording(uri: Uri): DeleteResult {
+        val deleted = RecordingOwnership.deleteUnlessInUse(uri) { removeFromStorage(uri) } ?: return DeleteResult.IN_USE
+        return if (deleted) DeleteResult.DELETED else DeleteResult.FAILED
+    }
+
+    /** The storage deletion itself, called only by [deleteRecording] once the file is known not to
+     * be in use. Open so tests can substitute a failing or recording one. */
+    protected open fun removeFromStorage(uri: Uri): Boolean {
         return try {
             if (uri.scheme == "file") {
                 val path = uri.path ?: return false

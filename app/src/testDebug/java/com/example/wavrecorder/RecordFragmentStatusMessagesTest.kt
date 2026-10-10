@@ -7,6 +7,7 @@ import android.view.View
 import android.widget.TextView
 import androidx.fragment.app.testing.launchFragmentInContainer
 import androidx.test.core.app.ApplicationProvider
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -41,9 +42,18 @@ import java.util.concurrent.TimeUnit
 class RecordFragmentStatusMessagesTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
+
+    /** Released after each test: a microphone read that never returns while the test runs. */
+    private val readWedge = CountDownLatch(1)
+
+    @After
+    fun releaseReadWedge() = readWedge.countDown()
 
     /** Fails only the seek-back-to-0 that a header patch always does, simulating a finalization
      * failure without disturbing normal data writes -- same technique as WavRecorderTest. */
@@ -154,9 +164,7 @@ class RecordFragmentStatusMessagesTest {
         val source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-                // Never returns, and stop() deliberately does not unblock it -- forces
-                // WavRecorder.stop()'s join timeout to give up, producing FinalizeResult.Unknown.
-                Thread.sleep(10_000)
+                readWedge.await(10, TimeUnit.SECONDS) // never returns while the test runs
                 return -1
             }
             override fun stop() {}
@@ -166,9 +174,24 @@ class RecordFragmentStatusMessagesTest {
         service.destinationManager = object : DestinationManager(app()) {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
+        // Finalizing the file stalls (storage stuck at the stop), so WavRecorder.stop()'s join
+        // timeout gives up: FinalizeResult.Unknown. (A stuck microphone read alone no longer does
+        // that -- the writer finalizes without it.)
+        val finalizationStalls = CountDownLatch(1)
         service.recorder = WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 50,
-            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
+            openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) },
+            wrapChannel = { channel ->
+                object : SegmentWriter {
+                    override fun write(buffer: ByteBuffer): Int = channel.write(buffer)
+                    override fun position(): Long = channel.position()
+                    override fun position(newPosition: Long) { channel.position(newPosition) }
+                    override fun close() {
+                        finalizationStalls.await(3, TimeUnit.SECONDS)
+                        channel.close()
+                    }
+                }
+            }
         )
 
         val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
@@ -189,6 +212,7 @@ class RecordFragmentStatusMessagesTest {
             text.contains(savedTitle))
         assertFalse("the friendly saved date/duration detail must stay hidden when unconfirmed",
             detailVisible(scenario))
+        finalizationStalls.countDown()
     }
 
     @Test
@@ -297,8 +321,9 @@ class RecordFragmentStatusMessagesTest {
             Thread.sleep(5)
             shadowOf(Looper.getMainLooper()).idle()
         }
-        while (reads < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5)
-        Thread.sleep(20)
+        // A second read means the first one's audio was accepted: stopped before that, nothing
+        // would be saved, and nothing reported as saved.
+        while (reads < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5)
         service.stopRecording()
         awaitFinalizationAndIdle(service)
 
@@ -341,7 +366,8 @@ class RecordFragmentStatusMessagesTest {
         service.startRecording(1L)
         worker.runAll()
         val deadline = System.currentTimeMillis() + 2000
-        while (service.lastTarget == null && System.currentTimeMillis() < deadline) {
+        // Until audio was accepted too (a second read): stopped before that, nothing is saved.
+        while ((service.lastTarget == null || reads < 2) && System.currentTimeMillis() < deadline) {
             Thread.sleep(5)
             shadowOf(Looper.getMainLooper()).idle()
         }
@@ -378,9 +404,12 @@ class RecordFragmentStatusMessagesTest {
             service.LocalBinder()
         )
         val chunk = byteArrayOf(1, 2, 3, 4)
+        val reads = java.util.concurrent.atomic.AtomicInteger()
         val source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads.incrementAndGet()
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -397,7 +426,8 @@ class RecordFragmentStatusMessagesTest {
 
         service.startRecording(1L)
         val segmentOpenedDeadline = System.currentTimeMillis() + 2000
-        while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+        // Until audio was accepted too (a second read): stopped before that, nothing is saved.
+        while ((service.lastTarget == null || reads.get() < 2) && System.currentTimeMillis() < segmentOpenedDeadline) {
             Thread.sleep(5)
             shadowOf(Looper.getMainLooper()).idle()
         }

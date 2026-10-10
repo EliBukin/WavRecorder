@@ -14,6 +14,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -26,6 +27,9 @@ import org.robolectric.Shadows.shadowOf
  */
 @RunWith(RobolectricTestRunner::class)
 class MainActivityLegacyNotificationCleanupTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
     private fun manager(): NotificationManager = app().getSystemService(NotificationManager::class.java)
@@ -68,7 +72,7 @@ class MainActivityLegacyNotificationCleanupTest {
             manager().activeNotifications.any { it.id == 1002 }
         )
 
-        ActivityScenario.launch(MainActivity::class.java)
+        isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
 
         assertFalse(
             "normal app launch must cancel the legacy notification without needing a new recording",
@@ -82,7 +86,7 @@ class MainActivityLegacyNotificationCleanupTest {
 
     @Test
     fun `opening the app normally never starts a recording or foreground service`() {
-        ActivityScenario.launch(MainActivity::class.java)
+        isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
 
         assertNull(
             "merely opening the app (and running the legacy cleanup) must never itself start a real recording",

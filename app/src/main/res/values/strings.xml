@@ -37,6 +37,9 @@
     <string name="delete_confirm_positive">Delete</string>
     <string name="delete_confirm_cancel">Cancel</string>
     <string name="delete_failed">Could not delete the file</string>
+    <!-- A file the current recording is writing (or finishing, or that is being repaired). -->
+    <string name="delete_in_use">This recording is still being written, so it can\'t be deleted yet.</string>
+    <string name="recording_in_use">Recording in progress</string>
     <string name="audio_focus_denied">Another app is using audio playback right now</string>
     <string name="more_options">More options</string>
 
@@ -117,6 +120,20 @@
     <string name="mic_route_changed_error">Recording input changed unexpectedly (no longer using the external microphone). Recording was stopped and saved up to that point.</string>
     <!-- The microphone's previous owner hasn't been released yet (a stalled stop/release in the
          audio system), or a start didn't finish within the startup watchdog's limit. -->
+    <!-- The microphone delivered no audio at all (not even silence) for too long. -->
+    <string name="mic_stalled_error">The microphone stopped delivering audio, so recording was stopped. Everything up to that point was saved.</string>
+    <string name="mic_test_stalled_error">The microphone stopped delivering audio. Test stopped.</string>
+    <!-- Storage fell so far behind that the capture queue filled up. -->
+    <!-- Writing to storage failed before all captured audio reached the file. -->
+    <string name="recording_incomplete_error">Writing to storage failed, so the recording is incomplete. It was saved up to that point.</string>
+    <string name="storage_too_slow_error">Storage couldn\'t keep up, so recording was stopped. Everything up to that point was saved.</string>
+    <!-- The recording ended before any of its audio reached storage, so nothing was saved. -->
+    <string name="recording_not_saved_error">Writing to storage failed before any audio was saved, so nothing was recorded.</string>
+    <string name="mic_disconnected_nothing_saved">External microphone disconnected before any audio was recorded. Recording was stopped; nothing was saved.</string>
+    <string name="mic_route_changed_nothing_saved">Recording input changed unexpectedly (no longer using the external microphone) before any audio was recorded. Recording was stopped; nothing was saved.</string>
+    <string name="mic_stalled_nothing_saved">The microphone didn\'t deliver any audio, so recording was stopped. Nothing was saved.</string>
+    <string name="storage_too_slow_nothing_saved">Storage couldn\'t keep up, so recording was stopped before any audio could be saved. Nothing was saved.</string>
+    <string name="recording_error_nothing_saved">Recording error: %1$s. Nothing was saved.</string>
     <string name="mic_busy_error">Android is still releasing the microphone. Try again in a moment.</string>
     <string name="mic_start_timeout_error">The microphone didn\'t start in time. Try again.</string>
     <string name="mic_release_pending">Android is still releasing the microphone.</string>
@@ -208,4 +225,5 @@
         <item quantity="other">Deleted %1$d recordings</item>
     </plurals>
     <string name="bulk_delete_partial">%1$d deleted, %2$d could not be deleted</string>
+    <string name="bulk_delete_in_use">Deleted: %1$d. Kept: %2$d (still being written, or couldn\'t be deleted).</string>
 </resources>

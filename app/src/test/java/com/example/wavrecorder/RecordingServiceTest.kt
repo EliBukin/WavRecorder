@@ -39,6 +39,36 @@ private open class StubListener : RecordingService.Listener {
 class RecordingServiceTest {
 
     @get:Rule
+    val isolation = TestIsolation()
+
+    /** Released after each test. A writer built with [closeBlockedUntil] this latch stalls while
+     * finalizing its last file -- storage stalling at the stop -- which is what leaves a
+     * finalization genuinely unknown (a stuck microphone read no longer does: the writer
+     * finalizes without it; see WavRecorder.recordLoop). */
+    private val finalizationWedge = CountDownLatch(1)
+
+    /** Released after each test: a microphone read that never returns while the test runs. */
+    private val readWedge = CountDownLatch(1)
+
+    @org.junit.After
+    fun releaseWedges() {
+        readWedge.countDown()
+        finalizationWedge.countDown()
+    }
+
+    private fun closeBlockedUntil(release: CountDownLatch): (java.nio.channels.FileChannel) -> SegmentWriter = { channel ->
+        object : SegmentWriter {
+            override fun write(buffer: java.nio.ByteBuffer): Int = channel.write(buffer)
+            override fun position(): Long = channel.position()
+            override fun position(newPosition: Long) { channel.position(newPosition) }
+            override fun close() {
+                release.await(10, TimeUnit.SECONDS)
+                channel.close()
+            }
+        }
+    }
+
+    @get:Rule
     val tempFolder = TemporaryFolder()
 
     /** stopRecording()/onError now finalize asynchronously (see RecordingService.beginAsyncFinalize):
@@ -60,9 +90,12 @@ class RecordingServiceTest {
         // Session 1's source: hands back real audio immediately and repeatedly (never blocks,
         // never errors) so the test -- not the source running out on its own -- decides when the
         // session ends, via an explicit stopRecording() below.
+        val session1Reads = java.util.concurrent.atomic.AtomicInteger()
         val session1Source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                session1Reads.incrementAndGet()
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -117,7 +150,10 @@ class RecordingServiceTest {
         // together rather than assuming a single idle() call right after startRecording() would
         // already find it queued.
         val segmentOpenedDeadline = System.currentTimeMillis() + 2000
-        while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+        // Until audio was captured, too: a session stopped before any reaches its file saves
+        // nothing, and reports no file (see RecordingOutcome.Saved) -- a second read means the
+        // first one's audio was accepted.
+        while ((service.lastTarget == null || session1Reads.get() < 2) && System.currentTimeMillis() < segmentOpenedDeadline) {
             Thread.sleep(5)
             shadowOf(Looper.getMainLooper()).idle()
         }
@@ -268,6 +304,7 @@ class RecordingServiceTest {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
         service.recorder = WavRecorder(startup = ImmediateStartup,
+            wrapChannel = closeBlockedUntil(finalizationWedge),
             threadJoinTimeoutMs = 50, // fast, deterministic timeout so stop() gives up quickly
             openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -519,7 +556,7 @@ class RecordingServiceTest {
                     System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                     return chunk.size
                 }
-                Thread.sleep(10_000) // never unblocked by stop() -- wedged, stays "finalizing"
+                readWedge.await(10, TimeUnit.SECONDS) // never unblocked by stop() -- wedged, stays "finalizing"
                 return -1
             }
             override fun stop() {}
@@ -532,6 +569,7 @@ class RecordingServiceTest {
                 OutputTarget.FileTarget(tempFolder.newFile("session1.wav"))
         }
         service.recorder = WavRecorder(startup = ImmediateStartup,
+            wrapChannel = closeBlockedUntil(finalizationWedge),
             threadJoinTimeoutMs = 300, // short and deterministic: the join gives up quickly, yielding Unknown
             openAudioSource = {
                 openAudioSourceCallCount++
@@ -579,7 +617,7 @@ class RecordingServiceTest {
         service.startRecording(3L)
         assertTrue("a genuinely new request after the old session reached a terminal outcome " +
             "must succeed normally", service.isRecording)
-        service.stopRecording() // cleanup
+        service.stopAndAwaitFinalization() // cleanup
     }
 
     @Test
@@ -635,10 +673,13 @@ class RecordingServiceTest {
         awaitFinalizationAndIdle(service)
 
         assertTrue("expected FinalizationFailed to still be delivered for session 1", finalizationFailedDelivered)
-        assertNotNull("a failed finalization must still leave its journal record in place for a " +
-            "later recovery pass -- it must never be lost", journal.peekActive())
-        assertEquals(segmentFile.absolutePath,
-            (journal.peekActive()?.target as? OutputTarget.FileTarget)?.file?.absolutePath)
+        // Once its writer has finished, the record is handed to the recovery queue -- kept for a
+        // later recovery pass, never lost, and no longer blocking the next recording.
+        assertEquals("a failed finalization must still leave its journal record in place for a " +
+            "later recovery pass -- it must never be lost",
+            listOf(segmentFile.absolutePath),
+            journal.peekRecoveryCandidates().map { (it.target as? OutputTarget.FileTarget)?.file?.absolutePath })
+        assertNull(journal.peekActive())
     }
 
     @Test
@@ -660,6 +701,7 @@ class RecordingServiceTest {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(segmentFile)
         }
         service.recorder = WavRecorder(startup = ImmediateStartup,
+            wrapChannel = closeBlockedUntil(finalizationWedge),
             threadJoinTimeoutMs = 200,
             openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -704,7 +746,7 @@ class RecordingServiceTest {
                     System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                     return chunk.size
                 }
-                Thread.sleep(10_000)
+                readWedge.await(10, TimeUnit.SECONDS)
                 return -1
             }
             override fun stop() {}
@@ -716,6 +758,7 @@ class RecordingServiceTest {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(tempFolder.newFile("s1.wav"))
         }
         service.recorder = WavRecorder(startup = ImmediateStartup,
+            wrapChannel = closeBlockedUntil(finalizationWedge),
             threadJoinTimeoutMs = 200,
             openAudioSource = { WavRecorder.RecorderConfig(session1Source, sampleRate = 48000, bufferSize = chunk.size) }
         )
@@ -760,7 +803,7 @@ class RecordingServiceTest {
                     System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                     return chunk.size
                 }
-                Thread.sleep(10_000)
+                readWedge.await(10, TimeUnit.SECONDS)
                 return -1
             }
             override fun stop() {}
@@ -772,6 +815,7 @@ class RecordingServiceTest {
             override fun createOutputFile(fileName: String): OutputTarget = OutputTarget.FileTarget(tempFolder.newFile("s1.wav"))
         }
         service.recorder = WavRecorder(startup = ImmediateStartup,
+            wrapChannel = closeBlockedUntil(finalizationWedge),
             threadJoinTimeoutMs = 200,
             openAudioSource = {
                 openAudioSourceCallCount++
@@ -977,6 +1021,7 @@ class RecordingServiceTest {
                     OutputTarget.FileTarget(tempFolder.newFile("unknown.wav"))
             }
             service.recorder = WavRecorder(startup = ImmediateStartup,
+                wrapChannel = closeBlockedUntil(finalizationWedge),
                 threadJoinTimeoutMs = 50,
                 openAudioSource = { WavRecorder.RecorderConfig(source, sampleRate = 48000, bufferSize = 4) }
             )
@@ -1099,6 +1144,7 @@ class RecordingServiceTest {
         val source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -1142,6 +1188,7 @@ class RecordingServiceTest {
         val source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -1187,9 +1234,12 @@ class RecordingServiceTest {
         service.pendingOutcomeStore = failingStore
 
         val chunk = byteArrayOf(1, 2, 3, 4)
+        val reads = java.util.concurrent.atomic.AtomicInteger()
         val source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads.incrementAndGet()
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -1210,7 +1260,9 @@ class RecordingServiceTest {
 
         service.startRecording(1L)
         val segmentOpenedDeadline = System.currentTimeMillis() + 2000
-        while (service.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+        // Until audio was captured too (a second read means the first one's was accepted): a
+        // session stopped before any audio reaches its file reports no file.
+        while ((service.lastTarget == null || reads.get() < 2) && System.currentTimeMillis() < segmentOpenedDeadline) {
             Thread.sleep(5)
             shadowOf(Looper.getMainLooper()).idle()
         }
@@ -1234,6 +1286,7 @@ class RecordingServiceTest {
         val source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -1298,9 +1351,12 @@ class RecordingServiceTest {
         val controller1 = Robolectric.buildService(RecordingService::class.java)
         val service1 = controller1.create().get()
         val chunk = byteArrayOf(1, 2, 3, 4)
+        val reads = java.util.concurrent.atomic.AtomicInteger()
         val source = object : AudioSource {
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads.incrementAndGet()
+                Thread.sleep(1) // no faster than a real microphone
                 System.arraycopy(chunk, 0, buffer, offset, chunk.size)
                 return chunk.size
             }
@@ -1318,7 +1374,8 @@ class RecordingServiceTest {
 
         service1.startRecording(1L)
         val segmentOpenedDeadline = System.currentTimeMillis() + 2000
-        while (service1.lastTarget == null && System.currentTimeMillis() < segmentOpenedDeadline) {
+        // Until audio was accepted too (a second read): stopped before that, nothing is saved.
+        while ((service1.lastTarget == null || reads.get() < 2) && System.currentTimeMillis() < segmentOpenedDeadline) {
             Thread.sleep(5)
             shadowOf(Looper.getMainLooper()).idle()
         }
@@ -1435,7 +1492,7 @@ class RecordingServiceTest {
             service.startRequestPending)
         assertTrue("must still be recording, undisturbed", service.isRecording)
 
-        service.stopRecording() // release the blocking fake source so it doesn't linger past the test
+        service.stopAndAwaitFinalization() // release the blocking fake source so it doesn't linger past the test
     }
 
     @Test
@@ -1451,7 +1508,7 @@ class RecordingServiceTest {
         assertTrue("a late cancellation must never stop an active recording", service.isRecording)
         assertFalse("must not have self-stopped", shadowOf(service).isStoppedBySelf)
 
-        service.stopRecording() // release the blocking fake source so it doesn't linger past the test
+        service.stopAndAwaitFinalization() // release the blocking fake source so it doesn't linger past the test
     }
 
     /** A [WavRecorder] whose [openAudioSource] always throws synchronously, simulating e.g. the

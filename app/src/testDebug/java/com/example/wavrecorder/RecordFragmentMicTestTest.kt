@@ -15,9 +15,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -36,6 +38,9 @@ import java.util.concurrent.TimeUnit
  */
 @RunWith(RobolectricTestRunner::class)
 class RecordFragmentMicTestTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
@@ -71,9 +76,15 @@ class RecordFragmentMicTestTest {
         }
     }
 
+    private val sessions = mutableListOf<MicTestSession>()
+
     private fun fakeSession(fake: AudioSource) = MicTestSession(startup = ImmediateStartup,
         openAudioSource = { WavRecorder.RecorderConfig(fake, 48000, 4) }
-    )
+    ).also { sessions += it }
+
+    /** No microphone test outlives its test. */
+    @After
+    fun stopSessions() = sessions.forEach { it.stop() }
 
     // Reports itself as a verified external mic so it matches the external input device setUp()
     // registers below -- otherwise RecordFragment's own post-start mic-route mismatch check (a
@@ -203,7 +214,7 @@ class RecordFragmentMicTestTest {
             testButtonEnabled = fragment.view!!.findViewById<Button>(R.id.testMicButton).isEnabled
         }
         assertFalse("microphone testing must be disabled while genuinely recording", testButtonEnabled)
-        service.stopRecording()
+        service.stopAndAwaitFinalization()
     }
 
     @Test

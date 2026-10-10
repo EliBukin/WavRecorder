@@ -11,9 +11,11 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -32,7 +34,16 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 class RecordFragmentServiceStateGateTest {
 
+    @get:Rule
+    val isolation = TestIsolation()
+
     private fun app(): Application = ApplicationProvider.getApplicationContext()
+
+    /** Released after each test: a microphone read that never returns while the test runs. */
+    private val readWedge = CountDownLatch(1)
+
+    @After
+    fun releaseReadWedge() = readWedge.countDown()
 
     @Before
     fun setUp() {
@@ -87,7 +98,7 @@ class RecordFragmentServiceStateGateTest {
             "microphone testing must stay disabled once a delayed connection reveals a pre-existing recording",
             enabled
         )
-        service.stopRecording()
+        service.stopAndAwaitFinalization()
     }
 
     @Test
@@ -124,7 +135,7 @@ class RecordFragmentServiceStateGateTest {
      * read() (or blocking) at all -- silently finalizing almost instantly instead of staying
      * genuinely in progress. */
     private fun neverFinalizingRecorder(readGate: CountDownLatch): WavRecorder {
-        val neverReleased = CountDownLatch(1)
+        val neverReleased = readWedge // not while the test runs
         return WavRecorder(startup = ImmediateStartup,
             threadJoinTimeoutMs = 10_000L,
             openAudioSource = {
@@ -243,7 +254,7 @@ class RecordFragmentServiceStateGateTest {
         }
         assertFalse(enabled)
         assertEquals(app().getString(R.string.test_microphone), buttonText)
-        busyService.stopRecording()
+        busyService.stopAndAwaitFinalization()
     }
 
     @Test
@@ -291,6 +302,6 @@ class RecordFragmentServiceStateGateTest {
             "the audio level section must stay visible for the real recording, not be hidden by the test's own reset",
             levelSectionVisible
         )
-        busyService.stopRecording()
+        busyService.stopAndAwaitFinalization()
     }
 }

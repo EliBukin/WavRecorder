@@ -41,7 +41,12 @@ internal class MicTestSession(
     // Same as WavRecorder's: negotiation runs on the shared audio-startup worker -- the same single
     // thread real recording uses, so a test's startup (or its cleanup) and a recording's can never
     // hold the microphone at once -- and its result is delivered on the main thread.
-    private val startup: AudioStartup = AudioStartup.shared
+    private val startup: AudioStartup = AudioStartup.shared,
+    // Monotonic milliseconds for the level and route-check cadence and the no-progress limit --
+    // never the wall clock, which can jump. Injectable for tests.
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000 },
+    // Same limit as WavRecorder's: no audio at all (not even silence) for this long ends the test.
+    private val noProgressTimeoutMs: Long = NO_PROGRESS_TIMEOUT_MS
 ) {
     companion object {
         private const val THREAD_JOIN_TIMEOUT_MS = 2000L
@@ -55,7 +60,22 @@ internal class MicTestSession(
         // Same cadence WavRecorder's own header-flush-piggybacked disconnect/route checks use --
         // this doesn't need read()-level responsiveness, just to not go unnoticed for long.
         private const val ROUTE_CHECK_INTERVAL_MS = 3000L
+
+        // See WavRecorder.NO_PROGRESS_TIMEOUT_MS: silent (zero-valued) audio is still audio.
+        private const val NO_PROGRESS_TIMEOUT_MS = 10_000L
+
+        // How often the progress watchdog looks, at most (it looks at least four times per limit).
+        private const val WATCH_INTERVAL_MS = 250L
     }
+
+    /** When the test loop last received any audio (silence included), in [clock] time. */
+    private class Progress(start: Long) {
+        @Volatile var lastAudioAt = start
+    }
+
+    // Cancels the current test's progress watchdog at once -- main-thread confined, like
+    // audioSource/testThread.
+    private var watchdogCancel: java.util.concurrent.CountDownLatch? = null
 
     /** IDLE -> STARTING ([start]: negotiating off the main thread) -> TESTING (the level meter
      * runs) -> IDLE ([stop], which also cancels a STARTING test). */
@@ -168,8 +188,17 @@ internal class MicTestSession(
 
         val myGeneration = generation.incrementAndGet()
         isActive.set(true)
+        val progress = Progress(clock())
+        // Watches progress from outside the read loop, so a read that never returns is noticed too.
+        // Armed before the reader starts, so the very first read is watched.
+        val cancel = java.util.concurrent.CountDownLatch(1)
+        watchdogCancel = cancel
+        Thread({ watchProgress(myGeneration, progress, cancel, onError) }, "MicTestWatchdog").apply {
+            isDaemon = true
+            start()
+        }
         testThread = Thread({
-            testLoop(myGeneration, source, config.frameAlignedBufferSize, config.format, onLevel, onError)
+            testLoop(myGeneration, source, config.frameAlignedBufferSize, config.format, progress, onLevel, onError)
         }, "MicTestThread").apply { start() }
 
         // Last, once fully TESTING: the Record screen's route check may stop the test from right
@@ -195,6 +224,8 @@ internal class MicTestSession(
         }
         isActive.set(false)
         generation.incrementAndGet()
+        watchdogCancel?.countDown()
+        watchdogCancel = null
         audioSource?.let { startup.shutdown(it) }
         audioSource = null
         val thread = testThread
@@ -207,21 +238,72 @@ internal class MicTestSession(
         }
     }
 
+    /**
+     * The test's progress watchdog, on its own thread: independent of the read loop, so it notices
+     * a read that never returns as well as one that keeps returning nothing -- no audio at all, not
+     * even silence, for [noProgressTimeoutMs] ends the test as stalled (reported once). It can't
+     * make a native read return; the caller's [stop] then hands the source to the audio worker to
+     * be stopped and released, and no new microphone is opened before that release finishes.
+     * Ends at once when the test is stopped ([cancel]) or superseded.
+     */
+    private fun watchProgress(myGeneration: Int, progress: Progress, cancel: java.util.concurrent.CountDownLatch, onError: (Exception) -> Unit) {
+        val handler = Handler(Looper.getMainLooper())
+        val interval = (noProgressTimeoutMs / 4).coerceIn(1L, WATCH_INTERVAL_MS)
+        try {
+            while (isActive.get() && generation.get() == myGeneration) {
+                if (clock() - progress.lastAudioAt >= noProgressTimeoutMs) {
+                    reportFatal(
+                        myGeneration, handler, onError,
+                        MicrophoneStalledException("The microphone delivered no audio for ${noProgressTimeoutMs} ms")
+                    )
+                    return
+                }
+                if (cancel.await(interval, java.util.concurrent.TimeUnit.MILLISECONDS)) return
+            }
+        } catch (_: InterruptedException) {
+            // Only ever abandoned: nothing to report.
+        }
+    }
+
     private fun testLoop(
         myGeneration: Int,
         source: AudioSource,
         bufferSize: Int,
         format: PcmFormat,
+        progress: Progress,
         onLevel: (Float) -> Unit,
         onError: (Exception) -> Unit
     ) {
         val handler = Handler(Looper.getMainLooper())
         val buffer = ByteArray(bufferSize)
-        var lastLevelPost = 0L
-        var lastRouteCheck = System.currentTimeMillis()
+        var lastLevelPost = Long.MIN_VALUE
+        var lastRouteCheck = clock()
         val emptyReads = EmptyReadBackoff()
 
         while (isActive.get() && generation.get() == myGeneration) {
+            // Route and disconnect checks run on their own cadence whatever the reads return, so a
+            // source that keeps returning nothing is still checked -- see WavRecorder.captureLoop.
+            val checkedAt = clock()
+            if (checkedAt - lastRouteCheck >= routeCheckIntervalMs) {
+                lastRouteCheck = checkedAt
+                if (!source.isDeviceConnected()) {
+                    reportFatal(myGeneration, handler, onError, MicrophoneDisconnectedException("Microphone disconnected during test"))
+                    break
+                }
+                // Checked in addition to (not instead of) isDeviceConnected() above -- a silent
+                // reroute to the phone mic may never fire a removal callback at all; see
+                // WavRecorder.captureLoop's identical note.
+                if (!source.isRouteUnchanged()) {
+                    reportFatal(
+                        myGeneration, handler, onError,
+                        MicrophoneRouteChangedException(
+                            "Microphone test input changed unexpectedly; no longer using the verified external microphone"
+                        )
+                    )
+                    break
+                }
+            }
+
             val read = try {
                 source.read(buffer, 0, buffer.size)
             } catch (e: Exception) {
@@ -229,7 +311,7 @@ internal class MicTestSession(
                 break
             }
 
-            // Mirrors WavRecorder.recordLoop's identical recheck: source.read() can block
+            // Mirrors WavRecorder.captureLoop's identical recheck: source.read() can block
             // arbitrarily long, and stop() intentionally stops/releases the AudioSource *before*
             // this loop notices, specifically to unblock a pending read() -- recheck immediately,
             // before this data (or a negative/zero result caused by the intentional stop) touches
@@ -244,6 +326,7 @@ internal class MicTestSession(
                 break
             }
             if (read == 0) {
+                // No audio this time; the progress watchdog ends the test if that goes on too long.
                 // Paced, not retried immediately: see EmptyReadBackoff. Interrupted only when a
                 // stopped test's thread is being abandoned, so that just ends the loop.
                 try {
@@ -255,36 +338,13 @@ internal class MicTestSession(
             }
             emptyReads.onData()
 
-            val now = System.currentTimeMillis()
-            if (now - lastLevelPost >= levelUpdateIntervalMs) {
+            val now = clock()
+            progress.lastAudioAt = now
+            if (lastLevelPost == Long.MIN_VALUE || now - lastLevelPost >= levelUpdateIntervalMs) {
                 lastLevelPost = now
                 // Only whole frames are metered; a trailing partial frame is simply not counted.
                 val level = peakAmplitude(buffer, read, format)
                 postIfCurrent(myGeneration, handler) { onLevel(level) }
-            }
-
-            if (now - lastRouteCheck >= routeCheckIntervalMs) {
-                lastRouteCheck = now
-                if (!source.isDeviceConnected()) {
-                    reportFatal(
-                        myGeneration, handler, onError,
-                        MicrophoneDisconnectedException("Microphone disconnected during test")
-                    )
-                    break
-                }
-                // Checked in addition to (not instead of) isDeviceConnected() above -- a silent
-                // reroute to the phone mic may never fire a removal callback at all; see
-                // WavRecorder.recordLoop's identical note.
-                if (!source.isRouteUnchanged()) {
-                    reportFatal(
-                        myGeneration, handler, onError,
-                        MicrophoneRouteChangedException(
-                            "Microphone test input changed unexpectedly; no longer using the " +
-                                "verified external microphone"
-                        )
-                    )
-                    break
-                }
             }
         }
     }

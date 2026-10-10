@@ -14,6 +14,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 
@@ -21,12 +22,15 @@ import org.robolectric.Shadows.shadowOf
 @RunWith(RobolectricTestRunner::class)
 class LibraryFragmentRedesignTest {
 
+    @get:Rule
+    val isolation = TestIsolation()
+
     private val app = ApplicationProvider.getApplicationContext<android.app.Application>()
 
     private fun item(name: String) = RecordingItem(name, Uri.parse("file:///$name"), 13.0, 250_000)
 
     private fun launchWith(items: List<RecordingItem>): FragmentScenario<LibraryFragment> {
-        val scenario = launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder)
+        val scenario = isolation.closeAfter(launchFragmentInContainer<LibraryFragment>(themeResId = R.style.Theme_WavRecorder))
         scenario.onFragment { fragment ->
             fragment.destinationManager = object : DestinationManager(app) {
                 override fun listRecordings() = items

@@ -59,11 +59,17 @@ class LibraryFragment : Fragment() {
     // Preparing state, so every control path that isn't the initial playNew() call must check
     // this and no-op instead of touching the player.
     private var isPreparingPlayback = false
-    // Set when a focus loss (of either kind) arrives while still Preparing: onPrepared checks this
-    // instead of unconditionally auto-starting, so a track that lost focus before it ever finished
-    // preparing doesn't start playing anyway. Cleared by onPrepared itself, or by a focus-gain that
-    // arrives before preparation finishes (see audioFocusListener).
-    private var suppressAutoStartOnPrepared = false
+    // The user's intent for the active track, kept apart from temporary audio-focus suspension:
+    // set only by their own play (playNew(), or a resume tap), and cleared by their pause, by
+    // headphones being unplugged (the output changed, so they restart playback themselves), by a
+    // permanent focus loss, and by releasing the player. Focus changes never set it -- they can only
+    // hold playback back (heldByFocusLoss). So nothing but the user can make playback start again
+    // after an unplug, whatever focus changes follow, and whether or not the track is still
+    // preparing. onPrepared starts the track only if it is wanted and not held back.
+    private var playbackWanted = false
+    // A transient focus loss is holding playback back; the matching gain releases it, and playback
+    // resumes only if still wanted.
+    private var heldByFocusLoss = false
 
     // Bumped on every refreshList() call; a scan result only gets applied if it's still the most
     // recent one requested. Kept as a *secondary* guard alongside the Job-cancellation coalescing
@@ -121,56 +127,59 @@ class LibraryFragment : Fragment() {
 
     private lateinit var audioManager: AudioManager
     private var focusRequest: AudioFocusRequest? = null
-    private var resumeOnFocusGain = false
 
     // Android documents isPlaying()/pause() (and most other MediaPlayer control calls) as
     // undefined while still in the Preparing state, which prepareAsync() leaves the player in
     // until onPrepared/onError fires -- a focus-change or ACTION_AUDIO_BECOMING_NOISY broadcast
     // can land at any moment, including squarely inside that window, so every branch below is
-    // written to never touch isPlaying()/pause() while isPreparingPlayback is still true.
+    // written to never touch isPlaying()/pause() while isPreparingPlayback is still true: it only
+    // records intent (see playbackWanted), which onPrepared then honors.
     private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS -> {
-                resumeOnFocusGain = false
-                if (isPreparingPlayback) {
-                    // Permanent loss: cancel the auto-start outright rather than start playback
-                    // into a focus state that's already gone, or leave it to time out on its own.
-                    suppressAutoStartOnPrepared = true
-                } else {
-                    pauseActive()
-                }
+                // Permanent: playback isn't wanted any more -- not now, and not once prepared.
+                playbackWanted = false
+                heldByFocusLoss = false
+                pauseIfPlaying()
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                if (isPreparingPlayback) {
-                    // Transient: don't auto-start once ready either, but remember to once focus
-                    // actually comes back (below), the same way an already-playing track would.
-                    suppressAutoStartOnPrepared = true
-                    resumeOnFocusGain = true
-                } else {
-                    resumeOnFocusGain = mediaPlayer?.isPlaying == true
-                    pauseActive()
-                }
+                // Held back until focus returns -- intent unchanged.
+                heldByFocusLoss = true
+                pauseIfPlaying()
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
-                if (resumeOnFocusGain) {
-                    resumeOnFocusGain = false
-                    if (isPreparingPlayback) {
-                        // Still not ready: let onPrepared itself start it once it is, instead of
-                        // touching a player that's still Preparing.
-                        suppressAutoStartOnPrepared = false
-                    } else {
-                        resumeActive()
-                    }
+                if (heldByFocusLoss) {
+                    heldByFocusLoss = false
+                    // Still preparing: onPrepared starts it, if still wanted, once it is ready.
+                    if (playbackWanted && !isPreparingPlayback && mediaPlayer?.isPlaying == false) resumeActive()
                 }
             }
         }
     }
 
-    /** Wired headphones pulled out mid-playback would otherwise blast audio through the speaker. */
+    /** Wired headphones pulled out would otherwise send playback to the speaker: playback is no
+     * longer wanted until the user plays again -- whatever is playing pauses, a track still
+     * preparing won't start once ready, and no later focus gain resumes it. */
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (!isPreparingPlayback && mediaPlayer?.isPlaying == true) pauseActive()
+            playbackWanted = false
+            heldByFocusLoss = false
+            pauseIfPlaying()
+        }
+    }
+
+    /** Pauses the active track if it is actually playing -- never touching a player that is still
+     * preparing, or pausing one that was never started (not a valid MediaPlayer transition). */
+    private fun pauseIfPlaying() {
+        if (!isPreparingPlayback && mediaPlayer?.isPlaying == true) pauseActive()
+    }
+
+    /** Relabels the rows when a recording file starts or stops being in use (see
+     * [RecordingOwnership]); may be called from any thread. */
+    private val ownershipListener: () -> Unit = {
+        Handler(Looper.getMainLooper()).post {
+            if (_binding != null && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) refreshList()
         }
     }
 
@@ -206,8 +215,10 @@ class LibraryFragment : Fragment() {
             isSelectionModeActive = { selectionMode },
             isSelected = { uri -> selectedUris.contains(uri) },
             onToggleSelect = { item -> toggleSelection(item) },
-            onLongPress = { item -> if (!selectionMode) enterSelectionMode(item) else toggleSelection(item) }
+            onLongPress = { item -> if (!selectionMode) enterSelectionMode(item) else toggleSelection(item) },
+            isInUse = { uri -> RecordingOwnership.useOf(uri) != null }
         )
+        RecordingOwnership.addChangeListener(ownershipListener)
         binding.recordingsList.layoutManager = LinearLayoutManager(requireContext())
         binding.recordingsList.adapter = adapter
 
@@ -427,11 +438,17 @@ class LibraryFragment : Fragment() {
         val manager = destinationManager
         val appContext = requireContext().applicationContext
         Thread({
-            val deleted = manager.deleteRecording(item.uri)
+            // Refused (IN_USE) if the file is being recorded, finalized or repaired -- decided at
+            // the storage boundary, whatever this screen showed when the user confirmed.
+            val result = manager.deleteRecording(item.uri)
             Handler(Looper.getMainLooper()).post {
                 if (_binding == null) return@post
-                if (!deleted) {
-                    Toast.makeText(appContext, R.string.delete_failed, Toast.LENGTH_SHORT).show()
+                when (result) {
+                    DestinationManager.DeleteResult.DELETED -> Unit
+                    DestinationManager.DeleteResult.IN_USE ->
+                        Toast.makeText(appContext, R.string.delete_in_use, Toast.LENGTH_LONG).show()
+                    DestinationManager.DeleteResult.FAILED ->
+                        Toast.makeText(appContext, R.string.delete_failed, Toast.LENGTH_SHORT).show()
                 }
                 refreshList()
             }
@@ -449,7 +466,7 @@ class LibraryFragment : Fragment() {
     private fun startSelection(firstSelected: Uri?) {
         selectionMode = true
         selectedUris.clear()
-        firstSelected?.let { selectedUris.add(it) }
+        firstSelected?.takeIf { RecordingOwnership.useOf(it) == null }?.let { selectedUris.add(it) }
         updateSelectionToolbar()
         adapter.notifyDataSetChanged()
     }
@@ -462,6 +479,9 @@ class LibraryFragment : Fragment() {
     }
 
     internal fun toggleSelection(item: RecordingItem) {
+        // A file being recorded, finalized or repaired can't be selected for deletion (the delete
+        // itself refuses it too, should it have been selected before it came into use).
+        if (!selectedUris.contains(item.uri) && RecordingOwnership.useOf(item.uri) != null) return
         if (!selectedUris.remove(item.uri)) selectedUris.add(item.uri)
         if (selectedUris.isEmpty()) {
             exitSelectionMode()
@@ -540,8 +560,14 @@ class LibraryFragment : Fragment() {
         Thread({
             var succeeded = 0
             var failed = 0
+            var inUse = 0
             for (uri in targets) {
-                if (manager.deleteRecording(uri)) succeeded++ else failed++
+                // A stale selection can't delete a live recording: the storage boundary refuses it.
+                when (manager.deleteRecording(uri)) {
+                    DestinationManager.DeleteResult.DELETED -> succeeded++
+                    DestinationManager.DeleteResult.IN_USE -> inUse++
+                    DestinationManager.DeleteResult.FAILED -> failed++
+                }
             }
             Handler(Looper.getMainLooper()).post {
                 if (myGeneration != bulkDeleteGeneration.get()) return@post
@@ -552,10 +578,10 @@ class LibraryFragment : Fragment() {
                 exitSelectionMode()
                 if (_binding == null) return@post
                 refreshList()
-                val message = if (failed == 0) {
-                    resources.getQuantityString(R.plurals.bulk_delete_success, succeeded, succeeded)
-                } else {
-                    getString(R.string.bulk_delete_partial, succeeded, failed)
+                val message = when {
+                    failed == 0 && inUse == 0 -> resources.getQuantityString(R.plurals.bulk_delete_success, succeeded, succeeded)
+                    inUse == 0 -> getString(R.string.bulk_delete_partial, succeeded, failed)
+                    else -> getString(R.string.bulk_delete_in_use, succeeded, inUse + failed)
                 }
                 Toast.makeText(appContext, message, Toast.LENGTH_LONG).show()
             }
@@ -569,8 +595,16 @@ class LibraryFragment : Fragment() {
             // state that accepts start()/pause() yet, so ignore the extra tap rather than let it
             // throw.
             isPreparingPlayback -> Unit
-            mediaPlayer?.isPlaying == true -> pauseActive()
-            else -> resumeActive()
+            mediaPlayer?.isPlaying == true -> {
+                playbackWanted = false
+                pauseActive()
+            }
+            else -> {
+                // The user's own resume: wanted again (after an unplug, too).
+                playbackWanted = true
+                heldByFocusLoss = false
+                resumeActive()
+            }
         }
     }
 
@@ -585,7 +619,9 @@ class LibraryFragment : Fragment() {
         activeUri = item.uri
         currentSpeed = 1.0f
         isPreparingPlayback = true
-        suppressAutoStartOnPrepared = false
+        // The user's own play: wanted, and not held back by anything that came before it.
+        playbackWanted = true
+        heldByFocusLoss = false
         try {
             // createConfigureOrRelease() releases the just-created player itself if configure
             // throws -- previously, a failure in setDataSource()/prepareAsync() left the
@@ -612,13 +648,11 @@ class LibraryFragment : Fragment() {
                         if (mp !== mediaPlayer) return@setOnPreparedListener
                         isPreparingPlayback = false
                         activeDurationMs = mp.duration
-                        if (suppressAutoStartOnPrepared) {
-                            // A permanent focus loss (or a still-unresolved transient one)
-                            // arrived while this was preparing -- leave it prepared but paused
-                            // instead of starting into a focus state that's already gone; see
-                            // audioFocusListener.
-                            suppressAutoStartOnPrepared = false
-                        } else {
+                        // Started only if the user still wants it and nothing holds it back: an
+                        // unplug or a permanent focus loss while preparing leaves it prepared but
+                        // not playing (the user starts it), and a transient loss still in effect
+                        // leaves it to the matching focus gain. See playbackWanted.
+                        if (playbackWanted && !heldByFocusLoss) {
                             mp.start()
                             progressHandler.post(progressTick)
                         }
@@ -734,7 +768,8 @@ class LibraryFragment : Fragment() {
             @Suppress("DEPRECATION")
             audioManager.abandonAudioFocus(audioFocusListener)
         }
-        resumeOnFocusGain = false
+        // Focus given up: nothing is held back waiting for it any more.
+        heldByFocusLoss = false
     }
 
     /** Fully tears down playback: track finished, a different track was picked, or we're leaving. */
@@ -752,12 +787,14 @@ class LibraryFragment : Fragment() {
         activeDurationMs = 0
         currentSpeed = 1.0f
         isPreparingPlayback = false
-        suppressAutoStartOnPrepared = false
+        playbackWanted = false
+        heldByFocusLoss = false
         if (_binding != null) adapter.notifyDataSetChanged()
     }
 
     override fun onDestroyView() {
         super.onDestroyView()
+        RecordingOwnership.removeChangeListener(ownershipListener)
         releasePlayer()
         // Explicit, rather than left to whatever the OS/window manager eventually does: a Dialog
         // built from an Activity Context has its own independent lifecycle from this Fragment's

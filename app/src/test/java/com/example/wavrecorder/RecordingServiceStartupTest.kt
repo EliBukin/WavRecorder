@@ -11,6 +11,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -22,6 +23,9 @@ import org.robolectric.Shadows.shadowOf
  */
 @RunWith(RobolectricTestRunner::class)
 class RecordingServiceStartupTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
@@ -186,7 +190,7 @@ class RecordingServiceStartupTest {
         // Delivers a little audio, so there is a file to save (an empty segment is deleted).
         val source = object : AudioSource {
             var releases = 0
-            private var reads = 0
+            @Volatile var reads = 0
             override fun startRecording() {}
             override fun read(buffer: ByteArray, offset: Int, length: Int): Int = if (++reads <= 5) length else 0
             override fun stop() {}
@@ -204,7 +208,8 @@ class RecordingServiceStartupTest {
         service.startRecording(1L)
         settle()
         val deadline = System.currentTimeMillis() + 3000
-        while (!events.log.contains("segment") && System.currentTimeMillis() < deadline) {
+        // Until audio was accepted too (a second read): stopped before that, nothing is saved.
+        while ((!events.log.contains("segment") || source.reads < 2) && System.currentTimeMillis() < deadline) {
             shadowOf(Looper.getMainLooper()).idle()
             Thread.sleep(5)
         }

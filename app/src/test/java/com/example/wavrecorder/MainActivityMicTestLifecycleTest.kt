@@ -15,6 +15,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -32,6 +33,9 @@ import java.util.concurrent.TimeUnit
  */
 @RunWith(RobolectricTestRunner::class)
 class MainActivityMicTestLifecycleTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
 
@@ -65,7 +69,7 @@ class MainActivityMicTestLifecycleTest {
 
     @Test
     fun `switching from Record to Library stops an active mic test and releases its source exactly once, then Record shows a clean idle state`() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         var releaseCount = 0
         val fake = object : AudioSource {
             override fun startRecording() {}
@@ -141,7 +145,7 @@ class MainActivityMicTestLifecycleTest {
         boundService.startRecording(1L)
         assertTrue("sanity: the service must genuinely be recording before switching tabs", boundService.isRecording)
 
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        val scenario = isolation.closeAfter(ActivityScenario.launch(MainActivity::class.java))
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(
             "sanity: the Record page must have picked up the already-active recording on connecting",
@@ -162,6 +166,6 @@ class MainActivityMicTestLifecycleTest {
             "switching back to the Record tab must still leave the real recording running",
             boundService.isRecording
         )
-        boundService.stopRecording()
+        boundService.stopAndAwaitFinalization()
     }
 }

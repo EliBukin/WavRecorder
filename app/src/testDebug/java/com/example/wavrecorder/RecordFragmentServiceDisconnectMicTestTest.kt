@@ -18,6 +18,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -36,6 +37,9 @@ import java.util.concurrent.TimeUnit
  */
 @RunWith(RobolectricTestRunner::class)
 class RecordFragmentServiceDisconnectMicTestTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     private fun app(): Application = ApplicationProvider.getApplicationContext()
     private val componentName get() = ComponentName(app(), RecordingService::class.java)
@@ -202,7 +206,7 @@ class RecordFragmentServiceDisconnectMicTestTest {
         )
         assertTrue("the audio level section must reflect the real recording, not stay hidden", levelSectionVisible)
         assertFalse("mic testing must stay disabled while a real recording is active", testButtonEnabled)
-        busyService.stopRecording()
+        busyService.stopAndAwaitFinalization()
     }
 
     @Test

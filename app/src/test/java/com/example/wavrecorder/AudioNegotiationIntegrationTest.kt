@@ -12,6 +12,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.junit.Rule
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.AudioDeviceInfoBuilder
@@ -30,6 +31,9 @@ import org.robolectric.shadows.AudioProfileBuilder
  */
 @RunWith(RobolectricTestRunner::class)
 class AudioNegotiationIntegrationTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
 
     @get:org.junit.Rule
     val tempFolder = org.junit.rules.TemporaryFolder()
