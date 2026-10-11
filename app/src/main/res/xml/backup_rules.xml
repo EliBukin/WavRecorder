@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 6-11 Auto Backup (android:fullBackupContent). An allowlist: only what is included here
+     is backed up. Keep in sync with data_extraction_rules.xml (Android 12+) and BackupRulesTest.
+
+     Included: wav_recorder_settings.xml, which holds only ordinary preferences (the split length).
+     Everything else is left out on purpose: recordings (app storage, domain "external", or
+     internal storage, domain "file"), the picked folder's URI and its permission
+     (wav_recorder_prefs.xml: only valid on this device), the crash-recovery journal
+     (wav_recorder_active_segment.xml) and the last session's pending outcome
+     (wav_recorder_pending_outcome.xml). Leaving them out of backups doesn't touch them on this
+     device, so crash recovery keeps working. -->
+<full-backup-content>
+    <include domain="sharedpref" path="wav_recorder_settings.xml" />
+</full-backup-content>

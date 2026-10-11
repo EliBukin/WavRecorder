@@ -36,9 +36,10 @@
 
         <!-- System bars match the theme: the status bar blends into the app header, the
              navigation bar into the bottom navigation. Icons flip between dark and light with
-             the theme (wr_light_system_bars; the navigation-bar half lives in values-v27). The
-             window is not drawn edge-to-edge, so the content is always laid out between the bars
-             and nothing can end up hidden behind them. -->
+             the theme (wr_light_system_bars; the navigation-bar half lives in values-v27). These
+             colors style the launch window; once created, MainActivity draws edge-to-edge with
+             transparent bars (Android 15+ ignores these colors anyway) and applies the insets
+             itself, so the header and bottom navigation show through the bars the same way. -->
         <item name="android:statusBarColor">@color/wr_background</item>
         <item name="android:navigationBarColor">@color/wr_surface_container</item>
         <item name="android:windowLightStatusBar">@bool/wr_light_system_bars</item>

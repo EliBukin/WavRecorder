@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">bukin\'s wav recorder</string>
+    <string name="app_name">Bukin Mic Recorder</string>
     <!-- stop_recording, status_recording, status_recording_part, status_preparing and
          status_finalizing are also the recording notification's own text/action label (see
          RecordingService) - the Record screen's redesigned labels below are separate strings so
@@ -226,4 +226,51 @@
     </plurals>
     <string name="bulk_delete_partial">%1$d deleted, %2$d could not be deleted</string>
     <string name="bulk_delete_in_use">Deleted: %1$d. Kept: %2$d (still being written, or couldn\'t be deleted).</string>
+    <!-- About & privacy: opened from the info button in the app header (AboutDialogFragment).
+         privacy_policy_html is the in-app copy of docs/privacy-policy.md: keep the two in sync.
+         [[PLACEHOLDER: …]] marks owner details still missing; scripts/release.sh refuses to sign a
+         bundle that still contains one. %1$s is the application ID. -->
+    <string name="about_open">About and privacy</string>
+    <string name="about_title">About &amp; privacy</string>
+    <string name="about_version">Version %1$s</string>
+    <string name="about_close">Close</string>
+    <string name="about_licenses">Open-source licenses</string>
+    <string name="privacy_policy_html"><![CDATA[
+<b>Privacy policy</b><br>
+App: Bukin Mic Recorder<br>
+Developer: bukin<br>
+Contact: dev.mechanics998877@gmail.com<br>
+Effective date: 2026-10-11<br><br>
+This app records uncompressed WAV audio from USB and built-in microphones. It is not a phone-call recorder.<br><br>
+<b>Summary</b><br>
+• The app records audio only when you start a recording or a Mic Test.<br>
+• Recordings are saved as WAV files in the app\'s own storage or in a folder you pick.<br>
+• The app has no internet permission, no ads, no analytics and no accounts. It does not send your recordings or other information to the developer or anyone else.<br>
+• Recordings can still leave your device through things outside the app\'s control, such as a cloud folder you chose or files you copy or share yourself.<br><br>
+<b>Microphone</b><br>
+The app uses the microphone only while you record, during a Mic Test, and briefly when either starts, to find a format your microphone supports. Mic Test audio is processed in memory and is not saved. The app never starts recording on its own.<br><br>
+<b>Recording in the background</b><br>
+A recording you start keeps running when you switch apps or turn the screen off, with an ongoing notification and a Stop button, until you stop it or an error ends it. If notifications are turned off, the app warns you first. Recording still runs, but without the notification.<br><br>
+<b>Where recordings are stored</b><br>
+• App storage (default): Android/data/%1$s/files on your device. Android deletes this folder when you uninstall the app. On Android 10 and earlier, other apps with storage permission may be able to read it.<br>
+• A folder you pick: the folder may belong to another app or service, such as cloud storage, which may copy, sync or back up your recordings under its own terms. Files there are kept when you uninstall this app.<br>
+The app does not encrypt WAV files.<br><br>
+<b>Keeping and deleting recordings</b><br>
+Recordings are kept until you delete them in the Library, with a file manager or in the folder you picked.<br><br>
+<b>Crash recovery and other app data</b><br>
+While recording, the app keeps a private note of the file it is writing (its name, location and format), so it can repair the file if the app or phone stops unexpectedly. The note is removed once the file is finished or repaired. The app also stores your split interval, the folder you picked and a note about how the last recording ended. This stays on your device. The app may write technical messages (such as file names and the microphone\'s name and format) to Android\'s system log on your device, and does not send them anywhere.<br><br>
+<b>Backups and new phones</b><br>
+Android\'s backup and device transfer include only the split interval. They exclude recordings, the folder you picked and crash-recovery data. They don\'t control other backup or sync tools, such as a cloud app holding a folder you picked.<br><br>
+<b>Information shared</b><br>
+The app contains no advertising, analytics, tracking or crash-reporting code, and does not collect, sell or share your personal information. If you install it from Google Play, Google gives the developer statistics such as install counts and, if you agreed to share usage and diagnostics with Google, crash reports. Google processes that data under its own privacy policy.<br><br>
+<b>Children</b><br>
+The app is intended for a general audience and is not specifically designed for children.<br><br>
+<b>Visiting this policy webpage</b><br>
+This privacy-policy webpage is hosted on GitHub Pages. GitHub logs visitor IP addresses for security purposes. This is separate from the app, which does not upload recordings or include analytics.<br><br>
+<b>Changes</b><br>
+If this policy changes, the updated version will be published with a new effective date.
+]]></string>
+    <!-- Every library the release build ships is Apache-2.0 licensed; none ships a NOTICE file.
+         Keep in sync with THIRD_PARTY_NOTICES.md. -->
+    <string name="licenses_intro">This app includes the following open-source software, licensed under the Apache License, Version 2.0:\n\n• AndroidX (Android Jetpack) libraries\n• Material Components for Android\n• Kotlin standard library\n• kotlinx.coroutines\n• JetBrains Java Annotations\n• Error Prone annotations\n• Guava ListenableFuture\n\nThe full license text follows.\n\n</string>
 </resources>

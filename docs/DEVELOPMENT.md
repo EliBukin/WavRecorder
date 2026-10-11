@@ -279,7 +279,8 @@ Approximate storage per hour: 48 kHz 16-bit mono 0.35 GB; 48 kHz 16-bit stereo
 
 ## Requirements
 
-- Android 7.0 (API 24) or newer.
+- Android 7.0 (API 24) or newer. The app targets Android 16 (API 36), the
+  Google Play requirement since 31 August 2026.
 - Microphone permission (requested at first recording). Android 13+ also
   requests notification permission, needed to show the recording-in-progress
   notification.
@@ -287,8 +288,10 @@ Approximate storage per hour: 48 kHz 16-bit mono 0.35 GB; 48 kHz 16-bit stereo
 ## Project structure
 
 ```
-app/src/main/java/com/example/wavrecorder/
-  MainActivity.kt            Hosts the Record/Library pages (ViewPager2 + bottom navigation)
+app/src/main/java/bukin/wavrecorder/
+  MainActivity.kt            Hosts the Record/Library pages (ViewPager2 + bottom navigation);
+                              draws edge-to-edge and applies the window insets
+  AboutDialogFragment.kt      About & privacy (version, privacy policy) and open-source licenses
   RecordFragment.kt          Record tab UI; binds to RecordingService, has no
                               recording logic of its own
   RecordingService.kt        Foreground service that owns the WavRecorder instance,
@@ -311,7 +314,9 @@ app/src/main/java/com/example/wavrecorder/
   WavHeaderWriter.kt           WAV headers for every supported format
   WavRiffParser.kt             Chunk-walking WAV reader (any header size)
   LibraryFragment.kt          Library tab: lists recordings, drives MediaPlayer
-                              playback (focus, speed, seeking, noisy-receiver)
+                              playback (focus, speed, seeking, noisy-receiver; stops
+                              when the app leaves the foreground)
+  AppForeground.kt            Whether the whole app is in the foreground (ProcessLifecycleOwner)
   RecordingsAdapter.kt        RecyclerView adapter for the recordings list
   DestinationManager.kt       Resolves where recordings live: app storage vs. a
                               user-picked SAF folder; list/create/delete files
@@ -327,10 +332,19 @@ app/src/main/java/com/example/wavrecorder/
 ## Building
 
 No Android Studio required — this was built entirely from the command line with
-the Android SDK command-line tools and JDK 17.
+the Android SDK command-line tools (platform 36, build-tools 35+) and JDK 21.
+The app compiles to Java 17 bytecode, but the unit tests run Robolectric on
+Android 16, which needs JDK 21.
+
+Toolchain, chosen as the newest mutually compatible set (no AGP 9 migration):
+Android Gradle plugin 8.13.2 (supports up to API 36.1, needs Gradle 8.13+),
+Gradle 8.14.6 (wrapper distribution checksum pinned in
+`gradle/wrapper/gradle-wrapper.properties`), Kotlin 2.3.10 (supports AGP up to
+9.0 and Gradle up to 9.0) and Robolectric 4.16.1 (the first release with
+Android 16). Library versions are only raised when something needs it.
 
 ```bash
-export JAVA_HOME="/path/to/jdk-17"
+export JAVA_HOME="/path/to/jdk-21"
 export ANDROID_HOME="/path/to/android/sdk"
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"
 ./gradlew :app:assembleDebug
@@ -338,6 +352,11 @@ export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"
 
 On Windows, use `gradlew.bat :app:assembleDebug` with `JAVA_HOME` and
 `ANDROID_HOME` configured.
+
+Release builds are never signed by Gradle: see [RELEASING.md](RELEASING.md) for
+signing an upload to Google Play with the upload key, version codes and release
+records, and [play/PUBLICATION-CHECKLIST.md](play/PUBLICATION-CHECKLIST.md) for
+what publication still needs.
 
 The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. It's
 signed with Gradle's default debug keystore, so it installs like any normal app
@@ -368,6 +387,55 @@ recording. It keeps what Android keeps (preferences, files, and the saved
 Activity state round-tripped through a Parcel) and builds fresh Activity,
 Fragment and service objects from it. It can't restart the JVM or the
 Application itself, so a real process kill still needs checking on a device.
+
+## Library playback and the app lifecycle
+
+Library playback has no foreground service or notification, so it stops when
+the app leaves the foreground. `AppForeground` (`ProcessLifecycleOwner`)
+reaches ON_STOP about 700 ms after the app's last activity stops: Home,
+another app, the screen turning off. On that, `LibraryFragment` releases the
+player, its audio focus and the progress updates, and the list shows the track
+stopped. Nothing resumes when the user returns.
+
+Neither of these is the app leaving the foreground:
+
+- **Switching to the Record page.** ViewPager2 only caps the Library page at
+  STARTED, so playback continues.
+- **A configuration change.** The activity is recreated within the delay. It
+  still ends playback by destroying the Library view, as it always has.
+
+Late player callbacks are ignored, because every MediaPlayer callback checks
+that it belongs to the current player. Recording (its foreground service) and
+Mic Test (stopped by the Record page itself) are unaffected.
+`LibraryBackgroundPlaybackTest` covers this.
+
+## System bars, backup and privacy
+
+**Edge-to-edge.** `MainActivity` draws behind the system bars on every Android
+version (Android 15+ enforces it, and Android 16 removed the opt-out) and
+applies the insets itself, once: the header takes the status bar and top
+cutout, the bottom navigation the navigation bar, and the header, pages and
+bottom navigation are kept clear of side insets (a landscape navigation bar or
+cutout). The insets are consumed there, so Material's bottom navigation doesn't
+pad itself a second time. No scrim is drawn behind 3-button navigation, so the
+bottom navigation's background shows through. `EdgeToEdgeTest` covers this.
+
+**Backup.** `res/xml/backup_rules.xml` (Android 6–11) and
+`res/xml/data_extraction_rules.xml` (Android 12+, cloud backup and device
+transfer) are an allowlist: only `wav_recorder_settings.xml` (the split length)
+is backed up. Recordings, the picked folder, the crash-recovery journal and the
+pending outcome stay on the device. `BackupRulesTest` ties the rules to the
+preference files the code really writes, so moving a setting or renaming a
+file fails the tests. Note that Android clears **all** of an app's data before
+applying a full restore (`bmgr restore` on an installed app deletes its
+recordings too); normal restores only happen when the app is installed.
+
+**About & privacy.** The info button in the header opens the privacy policy
+(`privacy_policy_html`, the in-app copy of
+[privacy-policy.md](privacy-policy.md)) and the open-source licenses
+([THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)). Keep the copies in sync;
+`scripts/render-privacy-policy.py` regenerates the static
+`privacy-policy.html` from the Markdown.
 
 ## Why a hand-rolled WAV writer
 

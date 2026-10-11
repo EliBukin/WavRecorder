@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ (android:dataExtractionRules): cloud backup and device-to-device transfer. The same
+     allowlist as backup_rules.xml (Android 6-11), which explains what is left out and why; keep the
+     two and BackupRulesTest in sync. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="sharedpref" path="wav_recorder_settings.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="sharedpref" path="wav_recorder_settings.xml" />
+    </device-transfer>
+</data-extraction-rules>

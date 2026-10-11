@@ -1,0 +1,159 @@
+package bukin.wavrecorder
+
+import android.Manifest
+import android.app.Application
+import android.content.ComponentName
+import android.content.DialogInterface
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.Looper
+import android.view.View
+import androidx.appcompat.app.AlertDialog
+import androidx.fragment.app.testing.launchFragmentInContainer
+import androidx.test.core.app.ApplicationProvider
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Test
+import org.junit.After
+import org.junit.Before
+import org.junit.runner.RunWith
+import org.junit.Rule
+import org.robolectric.Robolectric
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import org.robolectric.shadows.AudioDeviceInfoBuilder
+import org.robolectric.shadows.ShadowDialog
+import org.robolectric.shadows.ShadowToast
+
+/**
+ * Covers the Android 13+ permission bug: [ActivityResultContracts.RequestMultiplePermissions]'s
+ * results map only contains entries for permissions it was actually asked for, so when
+ * RECORD_AUDIO is already granted and only POST_NOTIFICATIONS gets requested, the map has no
+ * RECORD_AUDIO entry at all. The fragment must fall back to checking the live permission state
+ * instead of reading `results[RECORD_AUDIO]` and treating "absent" as "denied".
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class RecordFragmentPermissionTest {
+
+    @get:Rule
+    val isolation = TestIsolation()
+
+    private fun app(): Application = ApplicationProvider.getApplicationContext()
+
+    // The service a test's taps start recording on -- through its real, asynchronous startup -- so
+    // tearDown() can stop it: a start still pending when the test ends must not be delivered (and
+    // start recording) during a later test.
+    private var boundService: RecordingService? = null
+
+    @After
+    fun stopRecordingStartedByTheTest() {
+        boundService?.recorder?.requestStop()
+    }
+
+    @Before
+    fun setUpRecordingServiceBinding() {
+        // RecordFragment binds to RecordingService as soon as it starts (onStart), so a plain
+        // bindService() call needs somewhere to resolve to, or Robolectric hands
+        // onServiceConnected a null binder and RecordFragment's cast to LocalBinder crashes.
+        // Creating a real instance and registering its binder makes that later bindService()
+        // call actually connect.
+        val service = Robolectric.buildService(RecordingService::class.java).create().get()
+        boundService = service
+        val binder = service.LocalBinder()
+        shadowOf(app()).setComponentNameAndServiceForBindService(
+            ComponentName(app(), RecordingService::class.java),
+            binder
+        )
+
+        // These tests are specifically about the permission flow, not mic detection -- registering
+        // a generic external input device keeps the new no-external-mic confirmation dialog (see
+        // RecordFragmentMicStatusTest) out of their way, so a record-button tap still starts
+        // recording directly once permissions are settled, exactly as before that dialog existed.
+        val audioManager = app().getSystemService(AudioManager::class.java)
+        shadowOf(audioManager).setInputDevices(
+            listOf(AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_USB_DEVICE).build())
+        )
+    }
+
+    @Test
+    fun `mic already granted but notifications denied shows a confirmation before starting without visible notification controls`() {
+        shadowOf(app()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        shadowOf(app()).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
+
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        shadowOf(app()).nextStartedService // drain the bindService() from onStart() before checking
+        scenario.onFragment { fragment ->
+            // The Record tap launches the permission request (only notifications are missing)...
+            fragment.requireView().findViewById<View>(R.id.recordButton).performClick()
+            // ...and this simulates what RequestMultiplePermissions actually hands back in this
+            // situation: only the permission that was requested (and denied) appears in the map.
+            fragment.handlePermissionResult(mapOf(Manifest.permission.POST_NOTIFICATIONS to false))
+        }
+
+        assertNull("recording must not start until the user confirms recording without visible " +
+            "notification controls", shadowOf(app()).nextStartedService)
+        val dialog = ShadowDialog.getLatestDialog() as? AlertDialog
+        assertNotNull("expected a confirmation dialog explaining the missing notification permission",
+            dialog)
+
+        dialog!!.getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+        shadowOf(Looper.getMainLooper()).idle() // a dialog button's click dispatches via the main looper
+
+        val startedService = shadowOf(app()).nextStartedService
+        assertNotNull("expected RecordingService to be started once the user confirms", startedService)
+        assertEquals(RecordingService::class.java.name, startedService?.component?.className)
+    }
+
+    @Test
+    fun `canceling the missing-notification-permission confirmation leaves recording stopped`() {
+        shadowOf(app()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        shadowOf(app()).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
+
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        shadowOf(app()).nextStartedService
+        scenario.onFragment { fragment ->
+            fragment.requireView().findViewById<View>(R.id.recordButton).performClick()
+            fragment.handlePermissionResult(mapOf(Manifest.permission.POST_NOTIFICATIONS to false))
+        }
+
+        val dialog = ShadowDialog.getLatestDialog() as AlertDialog
+        dialog.getButton(DialogInterface.BUTTON_NEGATIVE).performClick()
+
+        assertNull("recording must remain stopped after the user cancels",
+            shadowOf(app()).nextStartedService)
+    }
+
+    @Test
+    fun `mic denied shows the permission-denied toast and never starts the service`() {
+        shadowOf(app()).denyPermissions(Manifest.permission.RECORD_AUDIO)
+
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        shadowOf(app()).nextStartedService // drain the bindService() from onStart() before checking
+        scenario.onFragment { fragment ->
+            fragment.requireView().findViewById<View>(R.id.recordButton).performClick()
+            fragment.handlePermissionResult(mapOf(Manifest.permission.RECORD_AUDIO to false))
+        }
+
+        assertNull(shadowOf(app()).nextStartedService)
+        assertEquals(app().getString(R.string.permission_denied), ShadowToast.getTextOfLatestToast())
+    }
+
+    @Test
+    fun `both permissions already granted starts recording directly on record button tap`() {
+        shadowOf(app()).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        shadowOf(app()).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+
+        val scenario = launchFragmentInContainer<RecordFragment>(themeResId = R.style.Theme_WavRecorder)
+        shadowOf(app()).nextStartedService // drain the bindService() from onStart() before checking
+        scenario.onFragment { fragment ->
+            fragment.view!!.findViewById<android.view.View>(R.id.recordButton).performClick()
+        }
+
+        val startedService = shadowOf(app()).nextStartedService
+        assertNotNull("expected RecordingService to be started without a permission prompt", startedService)
+        assertEquals(RecordingService::class.java.name, startedService?.component?.className)
+    }
+}

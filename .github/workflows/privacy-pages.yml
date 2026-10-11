@@ -1,0 +1,45 @@
+name: Publish approved privacy policy
+
+# Intentionally manual: committing or pushing must never publish a draft.
+on:
+  workflow_dispatch:
+    inputs:
+      approve_publication:
+        description: I have reviewed the final policy and approve public publication
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: privacy-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/master' && inputs.approve_publication == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Validate and stage only the approved privacy page
+        run: python3 scripts/prepare-privacy-site.py
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _privacy_site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy approved page
+        id: deployment
+        uses: actions/deploy-pages@v4

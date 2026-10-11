@@ -9,3 +9,26 @@
 .cxx/
 local.properties
 app/build/
+
+# Release signing: keystores, certificates and signing properties never belong in Git (keep them
+# outside the repository -- see docs/RELEASING.md); signed bundles and release records go to dist/.
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+keystore.properties
+signing.properties
+upload*.properties
+/dist/
+
+# Generated privacy-only Pages preview/build artifact
+/_privacy_site/
+
+# Python helper caches
+__pycache__/
+*.py[cod]
+
+# Kotlin compiler session state
+/.kotlin/

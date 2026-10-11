@@ -1,4 +1,4 @@
-# WavRecorder
+# Bukin Mic Recorder
 
 Simple WAV recording for Android, designed for USB microphones. You can also
 use your phone's built-in mic.
@@ -7,7 +7,7 @@ The app selects a recording format automatically based on the microphone and
 what Android supports.
 
 <p align="center">
-  <img src="docs/images/recording-screen.png" alt="WavRecorder main recording screen" width="320">
+  <img src="docs/images/recording-screen.png" alt="Bukin Mic Recorder main recording screen" width="320">
 </p>
 
 ## What you can do

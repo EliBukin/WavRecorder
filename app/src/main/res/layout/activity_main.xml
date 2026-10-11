@@ -63,6 +63,21 @@
             android:textAppearance="?attr/textAppearanceLabelSmall"
             android:textColor="?attr/colorOnSurfaceVariant" />
 
+        <!-- About & privacy (AboutDialogFragment). The negative end margin lines the icon itself
+             up with the header's content edge while keeping a 48dp touch target. -->
+        <ImageButton
+            android:id="@+id/aboutButton"
+            android:layout_width="@dimen/touch_target"
+            android:layout_height="@dimen/touch_target"
+            android:layout_marginStart="@dimen/space_xs"
+            android:layout_marginEnd="-12dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/about_open"
+            android:padding="12dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_info"
+            app:tint="?attr/colorOnSurfaceVariant" />
+
     </LinearLayout>
 
     <androidx.viewpager2.widget.ViewPager2
@@ -71,8 +86,9 @@
         android:layout_height="0dp"
         android:layout_weight="1" />
 
-    <!-- Kept in sync with viewPager in both directions by MainActivity. Not drawn behind the
-         navigation bar (the window isn't edge-to-edge), so it always sits above it. -->
+    <!-- Kept in sync with viewPager in both directions by MainActivity. The window is
+         edge-to-edge: MainActivity pads this view by the navigation bar's inset, so its background
+         runs behind the bar while its items stay above it. -->
     <com.google.android.material.bottomnavigation.BottomNavigationView
         android:id="@+id/bottomNavigation"
         android:layout_width="match_parent"

@@ -1,16 +1,18 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
 android {
-    namespace = "com.example.wavrecorder"
-    compileSdk = 34
+    namespace = "bukin.wavrecorder"
+    compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.wavrecorder"
+        applicationId = "bukin.wavrecorder"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
     }
@@ -19,16 +21,16 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Deliberately unsigned: Gradle never signs a release build, and never with the debug
+            // key. The upload key stays outside the repository and is applied afterwards by
+            // scripts/release.sh (build, then sign) -- see docs/RELEASING.md.
+            signingConfig = null
         }
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = "17"
     }
 
     buildFeatures {
@@ -53,6 +55,12 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
@@ -62,9 +70,12 @@ dependencies {
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.fragment:fragment-ktx:1.8.2")
+    // ProcessLifecycleOwner: Library playback stops when the app leaves the foreground. The same
+    // version the app already shipped transitively (via emoji2), now depended on directly.
+    implementation("androidx.lifecycle:lifecycle-process:2.6.2")
 
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("org.robolectric:robolectric:4.16.1")
     testImplementation("androidx.test:core:1.6.1")
     testImplementation("androidx.test.ext:junit:1.2.1")
     // Fragment UI tests (FragmentScenario) live in the debug unit-test source set, src/testDebug:

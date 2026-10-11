@@ -248,7 +248,7 @@
                             android:text="@string/section_audio_level"
                             android:textAppearance="@style/TextAppearance.WavRecorder.Overline" />
 
-                        <com.example.wavrecorder.WaveformView
+                        <bukin.wavrecorder.WaveformView
                             android:id="@+id/waveformView"
                             android:layout_width="match_parent"
                             android:layout_height="@dimen/waveform_height"
