@@ -21,6 +21,8 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -62,13 +64,19 @@ class EmptyFileFinalizationTest {
     }
 
     /** Delivers [chunks] chunks of [chunkBytes], then only empty reads -- paced like a microphone. */
-    private class Source(private val chunks: Int, private val chunkBytes: Int) : AudioSource {
+    private class Source(
+        private val chunks: Int,
+        private val chunkBytes: Int,
+        private val onLastChunk: () -> Unit = {}
+    ) : AudioSource {
         val reads = AtomicInteger()
         override fun startRecording() {}
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
             Thread.sleep(1)
-            if (reads.incrementAndGet() <= chunks) {
+            val readNumber = reads.incrementAndGet()
+            if (readNumber <= chunks) {
                 buffer.fill(7, offset, offset + chunkBytes)
+                if (readNumber == chunks) onLastChunk()
                 return chunkBytes
             }
             Thread.sleep(1)
@@ -365,20 +373,61 @@ class EmptyFileFinalizationTest {
 
     @Test
     fun `when the empty last part's close fails, the service reports the earlier part as saved`() {
+        assertEarlierPartSaved(waitForEntireBurst = false)
+    }
+
+    @Test
+    fun `empty final part outcome is unchanged when writing waits for the entire synthetic burst`() {
+        assertEarlierPartSaved(waitForEntireBurst = true)
+    }
+
+    private fun assertEarlierPartSaved(waitForEntireBurst: Boolean) {
         // 100 Hz 16-bit mono: a 30-minute part is 360,000 bytes -- 18 chunks, then part 2 opens empty.
+        // This source emits 30 minutes in milliseconds, not real time. Give this finalization test
+        // room for the whole burst plus the next empty read; production overflow is tested elsewhere.
+        val chunkCount = 18
+        val burstRead = CountDownLatch(1)
+        val writerWaited = CountDownLatch(1)
         val dir = tempFolder.newFolder()
         val parts = AtomicInteger()
-        val source = Source(chunks = 18, chunkBytes = 20_000)
+        val source = Source(chunks = chunkCount, chunkBytes = 20_000) { burstRead.countDown() }
         val service = service(dir, WavRecorder(startup = ImmediateStartup,
+            maxQueuedBuffers = chunkCount + 1,
             openAudioSource = { WavRecorder.RecorderConfig(source, 100, 20_000) },
-            wrapChannel = { FaultyWriter(it, if (parts.incrementAndGet() == 2) Fault.CLOSE_FAILS else Fault.NONE) }
+            wrapChannel = { channel ->
+                val part = parts.incrementAndGet()
+                val writer = FaultyWriter(channel, if (part == 2) Fault.CLOSE_FAILS else Fault.NONE)
+                object : SegmentWriter by writer {
+                    private var firstAudioWrite = true
+                    override fun write(buffer: ByteBuffer): Int {
+                        if (part == 1 && firstAudioWrite && channel.position() >= 44) {
+                            firstAudioWrite = false
+                            if (waitForEntireBurst) {
+                                writerWaited.countDown()
+                                check(burstRead.await(2, TimeUnit.SECONDS)) {
+                                    "Synthetic burst did not fit in the test queue"
+                                }
+                            }
+                        }
+                        return writer.write(buffer)
+                    }
+                }
+            }
         ).also { recorders += it })
         val log = Log()
         service.listener = log
         service.startRecording(1L, splitMinutes = 30)
-        waitFor("part 2 is open") { dir.list()!!.any { it.endsWith("_part02.wav") } }
+        try {
+            waitFor("part 2 is open") {
+                check(log.error == null) { "Recording failed before rollover: ${log.error}" }
+                dir.list()!!.any { it.endsWith("_part02.wav") }
+            }
+        } catch (e: Exception) {
+            throw AssertionError("reads=${source.reads.get()}, events=${log.events}, error=${log.error}", e)
+        }
         service.stopAndAwaitFinalization()
 
+        if (waitForEntireBurst) assertEquals("writer exercised the burst gate", 0L, writerWaited.count)
         assertEquals(listOf("stopped"), log.events)
         assertTrue("reported ${log.target}", log.target.file()!!.name.endsWith("_part01.wav"))
         assertEquals(360_000L, dataSizeOf(log.target.file()!!))
