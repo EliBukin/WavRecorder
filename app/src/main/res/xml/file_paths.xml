@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the FileProvider may hand out (see RecordingSharing): recordings in app storage, which
+     DestinationManager writes directly into the app's external files directory, or its internal
+     files directory when there's no external one. A file is only ever readable by the app the
+     user shares it with, and only that one file. -->
+<paths>
+    <external-files-path name="recordings" path="." />
+    <files-path name="recordings_internal" path="." />
+</paths>

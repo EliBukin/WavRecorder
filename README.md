@@ -18,6 +18,7 @@ what Android supports.
 - Split long recordings into 30-, 45-, or 60-minute files.
 - Save recordings to a folder of your choice.
 - Listen back, adjust playback speed, and delete recordings individually or in bulk.
+- Share recordings to other apps, save a copy anywhere on your phone, and rename them.
 
 ## Getting started
 

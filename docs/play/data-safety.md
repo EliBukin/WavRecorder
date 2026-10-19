@@ -20,6 +20,7 @@ Google's definitions (checked 2026-10-10, [Provide information for Google Play's
 |---|---|
 | No `INTERNET` permission. No networking, analytics, ads or crash-reporting code or SDKs. | The app can't transmit anything off the device itself. |
 | Recordings are written to app storage, or to a folder the user picks through Android's folder picker. | If that folder belongs to a cloud provider, the user sends the files to their own account under the provider's terms. Not collection by the app. |
+| Share and Save a copy (since 1.1) only hand a recording to Android's share sheet or save dialog when the user taps them; the user picks the receiving app or place. The app gains no network access and sends nothing itself. | User-initiated transfer to an app or place the user chooses, not collection or sharing by the app. Re-checked for 1.1 against the definitions above; confirm in Play Console before submitting. |
 | Mic Test audio is processed in memory and never saved or sent. | Processed on the device only. |
 | Android's backup includes only the split-length preference (`backup_rules.xml`, `data_extraction_rules.xml`). | Not app-initiated transmission. The privacy policy describes it anyway. |
 

@@ -33,6 +33,10 @@ class RecordingsAdapter(
     /** True while the file is being recorded, finalized or repaired ([RecordingOwnership]): the
      * row is labelled so, and offers no playback, deletion or selection. */
     private val isInUse: (Uri) -> Boolean = { false },
+    // The row menu's Share, Save a copy and Rename (alongside Stats and Delete).
+    private val onShare: (RecordingItem) -> Unit = {},
+    private val onSaveCopy: (RecordingItem) -> Unit = {},
+    private val onRename: (RecordingItem) -> Unit = {},
     // "Now" for the presentation-only date group headers (Today/Yesterday/...) -- see
     // RecordingDateGroups. A seam only so tests can pin the date.
     private val nowMillis: () -> Long = System::currentTimeMillis
@@ -42,6 +46,13 @@ class RecordingsAdapter(
 
     companion object {
         private val PROGRESS_PAYLOAD = Any()
+
+        // The row menu's items, in the order shown.
+        internal const val MENU_SHARE = 1
+        internal const val MENU_SAVE_COPY = 2
+        internal const val MENU_RENAME = 3
+        internal const val MENU_STATS = 4
+        internal const val MENU_DELETE = 5
     }
 
     fun submitList(newItems: List<RecordingItem>) {
@@ -133,8 +144,8 @@ class RecordingsAdapter(
         }
 
         if (inUse) {
-            // Being written right now: no playback, no delete, and no size/duration that would
-            // already be out of date.
+            // Being written right now: no playback, no menu (so no share, copy, rename or
+            // delete), and no size/duration that would already be out of date.
             holder.binding.activeAccent.visibility = View.INVISIBLE
             holder.binding.rowActions.visibility = View.VISIBLE
             holder.binding.preparingIndicator.visibility = View.GONE
@@ -159,12 +170,18 @@ class RecordingsAdapter(
         holder.binding.speedButton.setOnClickListener { onSpeedToggle(item) }
         holder.binding.overflowButton.setOnClickListener { anchor ->
             PopupMenu(anchor.context, anchor).apply {
-                menu.add(0, 1, 0, anchor.context.getString(R.string.stats_button))
-                menu.add(0, 2, 1, anchor.context.getString(R.string.delete_button))
+                menu.add(0, MENU_SHARE, 0, anchor.context.getString(R.string.share_button))
+                menu.add(0, MENU_SAVE_COPY, 1, anchor.context.getString(R.string.save_copy_button))
+                menu.add(0, MENU_RENAME, 2, anchor.context.getString(R.string.rename_button))
+                menu.add(0, MENU_STATS, 3, anchor.context.getString(R.string.stats_button))
+                menu.add(0, MENU_DELETE, 4, anchor.context.getString(R.string.delete_button))
                 setOnMenuItemClickListener { menuItem ->
                     when (menuItem.itemId) {
-                        1 -> { onShowStats(item); true }
-                        2 -> { onDelete(item); true }
+                        MENU_SHARE -> { onShare(item); true }
+                        MENU_SAVE_COPY -> { onSaveCopy(item); true }
+                        MENU_RENAME -> { onRename(item); true }
+                        MENU_STATS -> { onShowStats(item); true }
+                        MENU_DELETE -> { onDelete(item); true }
                         else -> false
                     }
                 }

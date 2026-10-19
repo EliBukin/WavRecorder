@@ -36,6 +36,22 @@ class RecordingDateGroupsTest {
     }
 
     @Test
+    fun `a renamed recording is dated by when its file was last written`() {
+        val yesterdayNoon = SimpleDateFormat("yyyyMMdd HHmmss", Locale.US).parse("20260923 120000")!!.time
+        assertEquals("Yesterday", RecordingDateGroups.label(app, "Band practice.wav", now, lastModifiedMillis = yesterdayNoon))
+        assertEquals("the name's own timestamp still comes first",
+            "Today", RecordingDateGroups.label(app, "recording_20260924_000001_part01.wav", now, lastModifiedMillis = yesterdayNoon))
+
+        val items = listOf(
+            item("recording_20260924_090000_part01.wav"),
+            RecordingItem("Band practice.wav", Uri.parse("file:///band.wav"), 1.0, 1, lastModifiedMillis = yesterdayNoon),
+            item("recording_20260923_080000_part01.wav")
+        )
+        val headers = items.indices.map { RecordingDateGroups.headerFor(app, items, it, now) }
+        assertEquals(listOf("Today", "Yesterday", null), headers)
+    }
+
+    @Test
     fun `a header starts each group and only when the day changes, without reordering anything`() {
         val items = listOf(
             item("recording_20260924_090000_part02.wav"),

@@ -85,6 +85,19 @@
                 android:textColor="?attr/colorOnSecondaryContainer"
                 tools:text="3 selected" />
 
+            <!-- Icon-only like Cancel (not destructive, so it needn't be labelled), leaving the
+                 count its width; its content description says what it does. -->
+            <ImageButton
+                android:id="@+id/selectionShareButton"
+                android:layout_width="@dimen/touch_target"
+                android:layout_height="@dimen/touch_target"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/share_selected_action"
+                android:padding="12dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_share"
+                app:tint="?attr/colorOnSecondaryContainer" />
+
             <!-- Labelled (not icon-only) and error-colored: destructive, but never by color alone. -->
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/selectionDeleteButton"

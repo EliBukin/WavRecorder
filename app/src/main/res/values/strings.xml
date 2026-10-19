@@ -226,6 +226,41 @@
     </plurals>
     <string name="bulk_delete_partial">%1$d deleted, %2$d could not be deleted</string>
     <string name="bulk_delete_in_use">Deleted: %1$d. Kept: %2$d (still being written, or couldn\'t be deleted).</string>
+    <!-- Share, Save a copy and Rename in the Library (a row's menu; Share also for a selection) -->
+    <string name="share_button">Share</string>
+    <string name="save_copy_button">Save a copy…</string>
+    <string name="rename_button">Rename</string>
+    <plurals name="share_chooser_title">
+        <item quantity="one">Share recording</item>
+        <item quantity="other">Share %1$d recordings</item>
+    </plurals>
+    <string name="share_selected_action">Share selected</string>
+    <string name="share_in_use">This recording is still being written, so it can\'t be shared yet.</string>
+    <plurals name="share_skipped_in_use">
+        <item quantity="one">%1$d recording is still being written and was left out.</item>
+        <item quantity="other">%1$d recordings are still being written and were left out.</item>
+    </plurals>
+    <string name="share_unavailable">No app on this phone can receive this recording.</string>
+    <string name="share_failed">Couldn\'t share the recording</string>
+    <string name="save_copy_in_use">This recording is still being written, so it can\'t be copied yet.</string>
+    <string name="save_copy_started">Saving a copy…</string>
+    <string name="save_copy_done">Copy saved</string>
+    <string name="save_copy_failed">Couldn\'t save the copy</string>
+    <string name="rename_title">Rename recording</string>
+    <string name="rename_hint">Name</string>
+    <string name="rename_suffix">.wav</string>
+    <string name="rename_positive">Rename</string>
+    <string name="rename_cancel">Cancel</string>
+    <string name="rename_error_empty">Enter a name</string>
+    <string name="rename_error_characters">A name can\'t contain / \\ : * ? \" &lt; &gt; |</string>
+    <string name="rename_error_dot">A name can\'t start with a dot</string>
+    <string name="rename_error_too_long">That name is too long</string>
+    <string name="rename_error_reserved">Names like recording_20261019_120000_part01 are kept for new recordings</string>
+    <string name="rename_error_taken">Another recording already has this name</string>
+    <string name="rename_in_use">This recording is still being written or repaired, so it can\'t be renamed yet.</string>
+    <string name="rename_not_supported">The selected folder doesn\'t allow renaming files.</string>
+    <string name="rename_failed">Couldn\'t rename the recording</string>
+
     <!-- About & privacy: opened from the info button in the app header (AboutDialogFragment).
          privacy_policy_html is the in-app copy of docs/privacy-policy.md: keep the two in sync.
          [[PLACEHOLDER: …]] marks owner details still missing; scripts/release.sh refuses to sign a

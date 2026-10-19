@@ -13,5 +13,8 @@ data class RecordingItem(
     val name: String,
     val uri: Uri,
     val durationSeconds: Double,
-    val sizeBytes: Long
+    val sizeBytes: Long,
+    /** When the file was last written, or 0 if unknown. Dates a recording whose name doesn't
+     * carry the app's timestamp, such as a renamed one (see [RecordingDateGroups]). */
+    val lastModifiedMillis: Long = 0L
 )

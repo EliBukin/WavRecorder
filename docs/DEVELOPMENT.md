@@ -244,6 +244,24 @@ showed when it was confirmed. The Library labels such a file "Recording in progr
 no delete, playback or selection for it; finished files, including the completed
 parts of a recording that is still going, stay deletable.
 
+**Sharing, copying and renaming recordings.** The Library's row menu offers
+Share, Save a copy, Rename, Stats and Delete; Share also works on a selection.
+Share hands the recordings to Android's share sheet: an app-storage file through
+the app's non-exported `FileProvider` (`res/xml/file_paths.xml`), a file in a
+picked folder by its own document URI, and the receiving app gets read access to
+those files only. Save a copy writes a copy to a document the user creates in
+the system's save dialog; a copy that fails part-way is removed again, and the
+recording itself is only ever read. Neither is offered for a file in use.
+Rename goes through `DestinationManager.renameRecording`, which never replaces
+another file (names are compared ignoring case) and is refused while the file is
+in use, being deleted, or still named by the crash-recovery journal, because a
+file that may need repairing must keep the name the journal knows it by. Like a
+delete, a rename marks the file in `RecordingOwnership` for its duration, so
+nothing can claim it meanwhile. The names new recordings get
+(`recording_<date>_<time>_partNN`) are reserved, so a renamed file can never
+take the name of a recording starting at that moment. A renamed file has no
+timestamp in its name, so the Library dates it by its last-modified time.
+
 The "Recording saved" summary shows the audio actually recorded, counted from
 the frames written across all of a session's files and stored with the outcome
 at the stop -- not the time since the recording started, whenever it is shown.

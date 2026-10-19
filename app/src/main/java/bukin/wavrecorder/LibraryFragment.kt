@@ -1,7 +1,9 @@
 package bukin.wavrecorder
 
+import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.IntentFilter
 import android.media.AudioAttributes
@@ -17,13 +19,19 @@ import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.widget.TooltipCompat
+import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
+import bukin.wavrecorder.databinding.DialogRenameBinding
 import bukin.wavrecorder.databinding.DialogStatsBinding
 import bukin.wavrecorder.databinding.FragmentLibraryBinding
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -95,6 +103,9 @@ class LibraryFragment : Fragment() {
     // How many recordings the list currently shows -- only to decide whether the header's Select
     // action is offered at all (there's nothing to select in an empty library).
     private var listedItemCount = 0
+    // The recordings the list currently shows: a selection is kept as URIs, and sharing it needs
+    // the items themselves.
+    private var listedItems: List<RecordingItem> = emptyList()
     // Guards against a second bulk-delete starting while one is already running -- deletion
     // always runs to completion on its own Thread regardless of the fragment's view lifecycle
     // (see performBulkDelete()'s doc, mirroring deleteRecording()'s existing rationale), so
@@ -115,6 +126,23 @@ class LibraryFragment : Fragment() {
     // torn down just because this Fragment's view is.
     private var activeBulkDeleteDialog: androidx.appcompat.app.AlertDialog? = null
 
+    // ---- Save a copy / Rename ----
+    // The recording a Save a copy is waiting on the system's save dialog for. Kept across this
+    // fragment being recreated (e.g. rotated) while that dialog is open: see onSaveInstanceState.
+    internal var pendingCopySource: Uri? = null
+    private val saveCopyLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument(RecordingSharing.MIME_TYPE)
+    ) { destination ->
+        val source = pendingCopySource
+        pendingCopySource = null
+        if (source != null && destination != null) saveCopy(source, destination)
+    }
+    // The Rename dialog, if one is showing -- tracked like activeStatsDialog, so onDestroyView()
+    // can dismiss it and a second one can't open on top of it.
+    internal var activeRenameDialog: androidx.appcompat.app.AlertDialog? = null
+    // True while a confirmed rename is running, so the dialog can't start a second one.
+    private var renameInProgress = false
+
     private val progressHandler = Handler(Looper.getMainLooper())
     private val progressTick = object : Runnable {
         override fun run() {
@@ -125,6 +153,9 @@ class LibraryFragment : Fragment() {
 
     companion object {
         private val SPEED_STEPS = floatArrayOf(1.0f, 1.25f, 1.5f, 2.0f)
+        private const val KEY_PENDING_COPY_SOURCE = "pending_copy_source"
+        // Material's opacity for disabled content.
+        private const val DISABLED_ALPHA = 0.38f
     }
 
     private lateinit var audioManager: AudioManager
@@ -199,6 +230,16 @@ class LibraryFragment : Fragment() {
         }
     }
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        pendingCopySource = savedInstanceState?.getString(KEY_PENDING_COPY_SOURCE)?.let(Uri::parse)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingCopySource?.let { outState.putString(KEY_PENDING_COPY_SOURCE, it.toString()) }
+    }
+
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -232,7 +273,10 @@ class LibraryFragment : Fragment() {
             isSelected = { uri -> selectedUris.contains(uri) },
             onToggleSelect = { item -> toggleSelection(item) },
             onLongPress = { item -> if (!selectionMode) enterSelectionMode(item) else toggleSelection(item) },
-            isInUse = { uri -> RecordingOwnership.useOf(uri) != null }
+            isInUse = { uri -> RecordingOwnership.useOf(uri) != null },
+            onShare = { item -> shareRecordings(listOf(item)) },
+            onSaveCopy = { item -> startSaveCopy(item) },
+            onRename = { item -> showRenameDialog(item) }
         )
         RecordingOwnership.addChangeListener(ownershipListener)
         observedAppLifecycle = AppForeground.lifecycle.also { it.addObserver(appBackgroundObserver) }
@@ -241,6 +285,8 @@ class LibraryFragment : Fragment() {
 
         binding.selectionCancelButton.setOnClickListener { exitSelectionMode() }
         binding.selectionDeleteButton.setOnClickListener { confirmBulkDelete() }
+        binding.selectionShareButton.setOnClickListener { shareSelected() }
+        TooltipCompat.setTooltipText(binding.selectionShareButton, getString(R.string.share_selected_action))
         binding.selectButton.setOnClickListener { enterSelectionMode() }
         androidx.core.view.ViewCompat.setAccessibilityHeading(binding.libraryTitle, true)
 
@@ -317,6 +363,7 @@ class LibraryFragment : Fragment() {
             result.fold(
                 onSuccess = { items ->
                     adapter.submitList(items)
+                    listedItems = items
                     listedItemCount = items.size
                     binding.emptyState.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
                     updateSelectionToolbar()
@@ -527,6 +574,10 @@ class LibraryFragment : Fragment() {
         // nothing is selected yet (selection entered from the header's Select action).
         binding.selectionDeleteButton.isEnabled = !bulkDeleteInProgress && selectedUris.isNotEmpty()
         binding.selectionCancelButton.isEnabled = !bulkDeleteInProgress
+        // An ImageButton doesn't dim itself when disabled.
+        val canShare = !bulkDeleteInProgress && selectedUris.isNotEmpty()
+        binding.selectionShareButton.isEnabled = canShare
+        binding.selectionShareButton.alpha = if (canShare) 1f else DISABLED_ALPHA
     }
 
     internal fun confirmBulkDelete() {
@@ -603,6 +654,189 @@ class LibraryFragment : Fragment() {
                 Toast.makeText(appContext, message, Toast.LENGTH_LONG).show()
             }
         }, "BulkDeleteThread").start()
+    }
+
+    /** Share for the current selection: the selected recordings the list shows. */
+    internal fun shareSelected() {
+        if (bulkDeleteInProgress) return
+        val items = listedItems.filter { it.uri in selectedUris }
+        if (items.isNotEmpty()) shareRecordings(items)
+    }
+
+    /**
+     * Opens the system share sheet for [items] -- WhatsApp, Telegram, Gmail, Drive or whatever
+     * the phone has. A recording being written is left out: its WAV header isn't final until it
+     * is finalized, so another app would get an incomplete file.
+     */
+    internal fun shareRecordings(items: List<RecordingItem>) {
+        if (_binding == null) return
+        val context = requireContext()
+        val ready = items.filter { RecordingOwnership.useOf(it.uri) == null }
+        if (ready.isEmpty()) {
+            Toast.makeText(context, R.string.share_in_use, Toast.LENGTH_LONG).show()
+            return
+        }
+        val chooser = try {
+            RecordingSharing.chooserIntent(
+                context, ready, resources.getQuantityString(R.plurals.share_chooser_title, ready.size, ready.size)
+            )
+        } catch (e: Exception) {
+            // FileProvider refuses a file outside the paths it may hand out.
+            Toast.makeText(context, R.string.share_failed, Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            startActivity(chooser)
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(context, R.string.share_unavailable, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val skipped = items.size - ready.size
+        if (skipped > 0) {
+            Toast.makeText(
+                context, resources.getQuantityString(R.plurals.share_skipped_in_use, skipped, skipped), Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    /** Save a copy: asks where (the system's save dialog, named like the recording), then copies. */
+    internal fun startSaveCopy(item: RecordingItem) {
+        if (_binding == null) return
+        if (RecordingOwnership.useOf(item.uri) != null) {
+            Toast.makeText(requireContext(), R.string.save_copy_in_use, Toast.LENGTH_LONG).show()
+            return
+        }
+        pendingCopySource = item.uri
+        try {
+            saveCopyLauncher.launch(item.name)
+        } catch (e: ActivityNotFoundException) {
+            pendingCopySource = null
+            Toast.makeText(requireContext(), R.string.save_copy_failed, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Copies [source] into [destination], which the user just created in the save dialog. Its own
+     * Thread, for the same reason as [deleteRecording]: the user asked for this copy, so it
+     * finishes even if this screen is destroyed meanwhile, and its result is reported either way.
+     * A copy that fails part-way is removed ([RecordingSharing.copyRecording]); the recording
+     * itself is only read.
+     */
+    private fun saveCopy(source: Uri, destination: Uri) {
+        val appContext = requireContext().applicationContext
+        Toast.makeText(appContext, R.string.save_copy_started, Toast.LENGTH_SHORT).show()
+        Thread({
+            val saved = RecordingSharing.copyRecording(appContext, source, destination)
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(appContext, if (saved) R.string.save_copy_done else R.string.save_copy_failed, Toast.LENGTH_SHORT).show()
+            }
+        }, "SaveCopyThread").start()
+    }
+
+    /**
+     * The Rename dialog for [item], offering its current name without the extension. A name the
+     * rules refuse ([RecordingRenameRules]), or one another recording already has, is reported in
+     * the dialog, which stays open for a correction.
+     */
+    internal fun showRenameDialog(item: RecordingItem) {
+        if (_binding == null || activeRenameDialog != null) return
+        if (RecordingOwnership.useOf(item.uri) != null) {
+            Toast.makeText(requireContext(), R.string.rename_in_use, Toast.LENGTH_LONG).show()
+            return
+        }
+        val dialogBinding = DialogRenameBinding.inflate(LayoutInflater.from(requireContext()))
+        dialogBinding.renameInput.setText(RecordingRenameRules.editableName(item.name))
+        dialogBinding.renameInput.selectAll()
+        val dialog = MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.rename_title)
+            .setView(dialogBinding.root)
+            .setNegativeButton(R.string.rename_cancel, null)
+            // Its click is set once shown (below): the default would close the dialog even when
+            // the name is refused.
+            .setPositiveButton(R.string.rename_positive, null)
+            .setOnDismissListener { if (activeRenameDialog === it) activeRenameDialog = null }
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener { submitRename(item, dialog, dialogBinding) }
+        }
+        dialogBinding.renameInput.doAfterTextChanged { dialogBinding.renameInputLayout.error = null }
+        dialogBinding.renameInput.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_DONE) {
+                submitRename(item, dialog, dialogBinding)
+                true
+            } else {
+                false
+            }
+        }
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
+        dialog.show()
+        activeRenameDialog = dialog
+    }
+
+    private fun submitRename(
+        item: RecordingItem, dialog: androidx.appcompat.app.AlertDialog, dialogBinding: DialogRenameBinding
+    ) {
+        if (renameInProgress) return
+        val error = when (val checked = RecordingRenameRules.validate(dialogBinding.renameInput.text?.toString().orEmpty(), item.name)) {
+            is RecordingRenameRules.Result.Valid -> {
+                startRename(item, checked.fileName, dialog, dialogBinding)
+                return
+            }
+            RecordingRenameRules.Result.Unchanged -> {
+                dialog.dismiss()
+                return
+            }
+            RecordingRenameRules.Result.Empty -> R.string.rename_error_empty
+            RecordingRenameRules.Result.ForbiddenCharacters -> R.string.rename_error_characters
+            RecordingRenameRules.Result.StartsWithDot -> R.string.rename_error_dot
+            RecordingRenameRules.Result.TooLong -> R.string.rename_error_too_long
+            RecordingRenameRules.Result.Reserved -> R.string.rename_error_reserved
+        }
+        dialogBinding.renameInputLayout.error = getString(error)
+    }
+
+    /** Renames [item] to [newFileName] off the main thread -- its own Thread, like
+     * [deleteRecording], so a rename the user confirmed finishes even if this screen is destroyed
+     * meanwhile. Refused at the storage boundary if the file is in use or may still need
+     * repairing ([DestinationManager.renameRecording]), whatever this screen showed. */
+    private fun startRename(
+        item: RecordingItem, newFileName: String,
+        dialog: androidx.appcompat.app.AlertDialog, dialogBinding: DialogRenameBinding
+    ) {
+        renameInProgress = true
+        setRenameButtonsEnabled(dialog, false)
+        // MediaPlayer keeps the file open by its old name; the row it plays under is going away.
+        if (item.uri == activeUri) releasePlayer()
+        val manager = destinationManager
+        val appContext = requireContext().applicationContext
+        Thread({
+            val result = manager.renameRecording(item.uri, newFileName)
+            Handler(Looper.getMainLooper()).post {
+                renameInProgress = false
+                if (result == DestinationManager.RenameResult.NAME_TAKEN && dialog.isShowing && _binding != null) {
+                    // Left open, so the user can pick another name.
+                    setRenameButtonsEnabled(dialog, true)
+                    dialogBinding.renameInputLayout.error = getString(R.string.rename_error_taken)
+                    return@post
+                }
+                dialog.dismiss()
+                if (_binding == null) return@post
+                val message = when (result) {
+                    DestinationManager.RenameResult.RENAMED -> null
+                    DestinationManager.RenameResult.IN_USE -> R.string.rename_in_use
+                    DestinationManager.RenameResult.NAME_TAKEN -> R.string.rename_error_taken
+                    DestinationManager.RenameResult.NOT_SUPPORTED -> R.string.rename_not_supported
+                    DestinationManager.RenameResult.FAILED -> R.string.rename_failed
+                }
+                message?.let { Toast.makeText(appContext, it, Toast.LENGTH_LONG).show() }
+                refreshList()
+            }
+        }, "RenameRecordingThread").start()
+    }
+
+    private fun setRenameButtonsEnabled(dialog: androidx.appcompat.app.AlertDialog, enabled: Boolean) {
+        dialog.getButton(DialogInterface.BUTTON_POSITIVE)?.isEnabled = enabled
+        dialog.getButton(DialogInterface.BUTTON_NEGATIVE)?.isEnabled = enabled
     }
 
     private fun togglePlayPause(item: RecordingItem) {
@@ -830,6 +1064,9 @@ class LibraryFragment : Fragment() {
         // completely unaffected by this.
         activeBulkDeleteDialog?.dismiss()
         activeBulkDeleteDialog = null
+        // Same again: a rename already confirmed runs on its own Thread and still completes.
+        activeRenameDialog?.dismiss()
+        activeRenameDialog = null
         // No explicit job cancellation needed here beyond the above: viewLifecycleOwner's own
         // Lifecycle already moves to DESTROYED just after this returns, which is what actually
         // cancels viewLifecycleOwner.lifecycleScope (and therefore refreshList()'s/showStats()'s

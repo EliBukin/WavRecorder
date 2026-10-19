@@ -7,16 +7,18 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Which recording files are in use right now -- being captured to, finalized, or repaired -- and
- * therefore must not be deleted. The one authority that everything writing a recording
- * ([WavRecorder], [WavRecoveryManager]) and everything deleting one ([DestinationManager], and
- * through it the Library) goes through.
+ * therefore must not be deleted or renamed. The one authority that everything writing a recording
+ * ([WavRecorder], [WavRecoveryManager]) and everything deleting or renaming one
+ * ([DestinationManager], and through it the Library) goes through.
  *
- * Each file is either free, claimed (for a [Use]), or being deleted. Claiming and starting a
- * delete are decided atomically, under one lock -- but that lock only ever guards these state
- * changes, never storage or provider I/O, so a slow delete or file creation holds up nothing but
- * itself:
+ * Each file is either free, claimed (for a [Use]), or being deleted or renamed. Claiming and
+ * starting a delete or rename are decided atomically, under one lock -- but that lock only ever
+ * guards these state changes, never storage or provider I/O, so a slow delete, rename or file
+ * creation holds up nothing but itself:
  *  - A delete marks the file as being deleted (refused if it is claimed), deletes it outside the
  *    lock, then clears the mark. A claim on a file being deleted is refused.
+ *  - A rename does the same, but is also refused while the file is being deleted or renamed, and
+ *    marks the name it renames to as well ([renameUnlessInUse]).
  *  - A new segment's file is created outside the lock, then claimed, then checked to still exist:
  *    a delete that won the race -- one that started, or even finished, between the file being
  *    created and claimed -- makes the writer create another file instead, so it never writes into
@@ -70,7 +72,7 @@ internal object RecordingOwnership {
     private val lock = Any()
     // Guarded by [lock]; never touched while doing storage I/O.
     private val claims = HashMap<String, Claim>()
-    private val deleting = HashMap<String, Int>() // key -> deletes in progress
+    private val deleting = HashMap<String, Int>() // key -> deletes and renames in progress
     // What useOf() reads: replaced (never mutated) under the lock on every change.
     @Volatile private var published: Map<String, Use> = emptyMap()
     private val listeners = CopyOnWriteArrayList<() -> Unit>()
@@ -147,6 +149,30 @@ internal object RecordingOwnership {
             synchronized(lock) {
                 val remaining = (deleting[key] ?: 1) - 1
                 if (remaining > 0) deleting[key] = remaining else deleting.remove(key)
+            }
+        }
+    }
+
+    /**
+     * Runs [rename] for [uri] unless it is in use, or already being deleted or renamed. Like
+     * [deleteUnlessInUse], starting is decided under the lock and [rename] runs outside it, with
+     * the file -- and [toUri], the name it is renamed to, when known in advance -- marked so that
+     * nothing can claim either meanwhile. Returns [rename]'s result, or null when it was refused.
+     */
+    fun <R> renameUnlessInUse(uri: Uri, toUri: Uri?, rename: () -> R): R? {
+        val keys = listOfNotNull(keyOf(uri), toUri?.let(::keyOf)).distinct()
+        synchronized(lock) {
+            if (keys.any { claims.containsKey(it) || deleting.containsKey(it) }) return null
+            keys.forEach { deleting[it] = (deleting[it] ?: 0) + 1 }
+        }
+        try {
+            return rename()
+        } finally {
+            synchronized(lock) {
+                keys.forEach { key ->
+                    val remaining = (deleting[key] ?: 1) - 1
+                    if (remaining > 0) deleting[key] = remaining else deleting.remove(key)
+                }
             }
         }
     }

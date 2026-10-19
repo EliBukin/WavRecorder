@@ -82,11 +82,12 @@ class TestIsolation(private val timeoutMs: Long = 5_000) : TestRule {
 
     private companion object {
         /** Every background thread the app itself starts for recording, the microphone test,
-         * finalization, recovery and deletes (the shared audio worker is checked separately: its
+         * finalization, recovery, deletes, renames and copies (the shared audio worker is checked separately: its
          * idle thread outlives its work by design). */
         val WORK_THREADS = setOf(
             "WavRecorderThread", "WavRecorderCapture", "RecordingFinalizeThread", "WavRecoveryThread",
-            "MicTestThread", "MicTestWatchdog", "MicTestStopThread", "DeleteRecordingThread", "BulkDeleteThread"
+            "MicTestThread", "MicTestWatchdog", "MicTestStopThread", "DeleteRecordingThread", "BulkDeleteThread",
+            "RenameRecordingThread", "SaveCopyThread"
         )
 
         /** Measures instead of failing (set by a diagnostic run only). */

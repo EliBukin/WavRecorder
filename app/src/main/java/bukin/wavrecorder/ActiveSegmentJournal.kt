@@ -448,6 +448,13 @@ internal open class ActiveSegmentJournal(
      * any of them. */
     open fun peekRecoveryCandidates(): List<Record> = synchronized(LOCK) { readRecoveryQueue() }
 
+    /** Every file the journal still names -- the ACTIVE segment, if any, and each queued recovery
+     * candidate -- read under one lock, so a record moving from ACTIVE into the queue meanwhile
+     * can't be missed. A file named here may still need repairing, so it must keep its name. */
+    open fun journaledTargets(): List<OutputTarget> = synchronized(LOCK) {
+        listOfNotNull(readRecord(ACTIVE_KEYS)?.target) + readRecoveryQueue().map { it.target }
+    }
+
     /** Removes the exact candidate identified by [token] from the queue, if present, reindexing
      * the remaining entries in one commit -- a candidate that failed to recover must stay queued
      * (untouched) while a different, independent candidate is successfully removed. Returns true

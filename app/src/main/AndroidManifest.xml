@@ -28,6 +28,18 @@
             android:name=".RecordingService"
             android:foregroundServiceType="microphone"
             android:exported="false" />
+
+        <!-- Share: lets the app the user shares a recording with read that one file. Not exported;
+             access is granted per file, per share (see RecordingSharing). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>
