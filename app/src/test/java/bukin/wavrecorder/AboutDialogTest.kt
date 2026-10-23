@@ -5,6 +5,9 @@ import android.app.Application
 import android.content.ComponentName
 import android.content.DialogInterface
 import android.os.Looper
+import android.text.Spanned
+import android.text.method.LinkMovementMethod
+import android.text.style.ClickableSpan
 import android.view.View
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
@@ -80,8 +83,19 @@ class AboutDialogTest {
             assertTrue(text, text.contains("include only the split interval"))
             assertTrue("rendered, not raw HTML", !text.contains("<b>") && !text.contains("<br>"))
 
-            about.getButton(DialogInterface.BUTTON_NEUTRAL).performClick()
+            // Two buttons, Send feedback and Close, so they fit on one row; the licenses are a link
+            // right under the version.
+            assertEquals("Close", about.getButton(DialogInterface.BUTTON_POSITIVE).text.toString())
+            assertEquals("Send feedback", about.getButton(DialogInterface.BUTTON_NEGATIVE).text.toString())
+            assertEquals(View.GONE, about.getButton(DialogInterface.BUTTON_NEUTRAL).visibility)
+            val message = about.findViewById<TextView>(android.R.id.message)!!
+            assertTrue(text, text.startsWith("Version $version\nOpen-source licenses\n\n"))
+            assertTrue(message.movementMethod is LinkMovementMethod)
+            val links = (message.text as Spanned).getSpans(0, message.text.length, ClickableSpan::class.java)
+            assertEquals(1, links.size)
+            links[0].onClick(message)
             idle()
+            assertTrue("About stays open underneath", about.isShowing)
             val licenses = activity.shownDialog(LicensesDialogFragment.TAG).message()
             assertTrue(licenses.contains("Material Components for Android"))
             assertTrue(licenses.contains("Apache License"))

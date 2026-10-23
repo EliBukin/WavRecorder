@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -10,6 +11,8 @@ spec.loader.exec_module(builder)
 ROOT = builder.ROOT
 MD = (ROOT / 'docs/privacy-policy.md').read_text()
 XML = (ROOT / 'app/src/main/res/values/strings.xml').read_text()
+# The policy's current effective date: the tests below change it to check what's refused.
+DATE = re.search(r'\*\*Effective date:\*\* (\d{4}-\d{2}-\d{2})', MD)[1]
 
 
 def approved():
@@ -33,12 +36,12 @@ class PrivacySiteTests(unittest.TestCase):
     def test_mismatched_dates_refused(self):
         md, xml = approved()
         with self.assertRaises(ValueError):
-            builder.validate(md, xml.replace('2026-10-11', '2026-10-12'))
+            builder.validate(md, xml.replace(DATE, '2026-10-12'))
 
     def test_invalid_date_refused(self):
         md, xml = approved()
         with self.assertRaises(ValueError):
-            builder.validate(md.replace('2026-10-11', '2026-02-30'), xml.replace('2026-10-11', '2026-02-30'))
+            builder.validate(md.replace(DATE, '2026-02-30'), xml.replace(DATE, '2026-02-30'))
 
     def test_missing_identity_refused(self):
         md, xml = approved()

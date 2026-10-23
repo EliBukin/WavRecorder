@@ -192,8 +192,9 @@ class RecordFragment : Fragment() {
                 pendingStart = false
                 startRecordingOn(service, pendingRequestId, pendingSplitDuration, pendingRequireExternalMic)
             }
-            syncUiWithService()
+            val showedOutcome = syncUiWithService()
             refreshTestButtonEnabled()
+            showWhatsNewIfDue(service, showedOutcome)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -637,9 +638,10 @@ class RecordFragment : Fragment() {
         recordingService = null
     }
 
-    private fun syncUiWithService() {
+    /** Returns whether it caught this screen up on an outcome (see the idle branch below). */
+    private fun syncUiWithService(): Boolean {
         refreshTestButtonEnabled()
-        val service = recordingService ?: return
+        val service = recordingService ?: return false
         // Captured, then unconditionally cleared, before branching: whichever branch below runs,
         // a real connection has now landed, so this Fragment is no longer showing the honest
         // "service state unknown" status -- see micTestServiceUnavailableShown's own doc. The
@@ -683,7 +685,22 @@ class RecordFragment : Fragment() {
                 resetToIdle()
             }
             if (service.microphoneReleasePending) showMicrophoneReleasePending(true)
+            return outcome != null
         }
+        return false
+    }
+
+    /**
+     * Offers the one-time What's new card (see [WhatsNew]) -- only here, once a connection has
+     * shown the service's real state, and only while nothing is going on: never over a recording
+     * that is starting, running or finishing, a Mic Test, a microphone or notification permission
+     * request this screen has in flight, or an outcome this connection has just shown. Otherwise
+     * nothing is stored, and a later visit asks again.
+     */
+    private fun showWhatsNewIfDue(service: RecordingService, showedOutcome: Boolean) {
+        val busy = service.state != ServiceState.IDLE || pendingStart || micTestActive ||
+            pendingPermissionAction != PendingPermissionAction.NONE || showedOutcome
+        WhatsNew.showIfDue(requireContext(), requireActivity().supportFragmentManager, busy)
     }
 
     private fun confirmStopRecording() {

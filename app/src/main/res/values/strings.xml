@@ -270,18 +270,31 @@
     <string name="about_version">Version %1$s</string>
     <string name="about_close">Close</string>
     <string name="about_licenses">Open-source licenses</string>
+    <!-- Send feedback (Feedback): opens the user's email app; nothing is sent unless they send it. -->
+    <string name="feedback_button">Send feedback</string>
+    <!-- %1$s is the version name. -->
+    <string name="feedback_subject">Bukin Mic Recorder %1$s feedback</string>
+    <!-- Room for the user's own words, then: %1$s version name, %2$d version code, %3$s Android
+         version, %4$d API level, %5$s phone maker and model. -->
+    <string name="feedback_body">\n\n\n---\nApp: Bukin Mic Recorder %1$s (%2$d)\nAndroid: %3$s (API %4$d)\nPhone: %5$s</string>
+    <!-- %1$s is the email address. -->
+    <string name="feedback_no_email_app">No email app found. You can write to %1$s</string>
+    <!-- The one-time card after updating to this release (WhatsNew). -->
+    <string name="whats_new_title">What\'s new in 1.2</string>
+    <string name="whats_new_message">• Send feedback: tell us what works and what doesn\'t, from About &amp; privacy (the info button at the top). Your email app opens with the app version, Android version and phone model filled in, so you see everything before you send it.\n\n• The privacy policy now says when recordings leave your phone.\n\n• Added in 1.1: Share, Save a copy and Rename recordings in the Library.</string>
+    <string name="whats_new_close">OK</string>
     <string name="privacy_policy_html"><![CDATA[
 <b>Privacy policy</b><br>
 App: Bukin Mic Recorder<br>
 Developer: bukin<br>
 Contact: dev.mechanics998877@gmail.com<br>
-Effective date: 2026-10-11<br><br>
+Effective date: 2026-10-23<br><br>
 This app records uncompressed WAV audio from USB and built-in microphones. It is not a phone-call recorder.<br><br>
 <b>Summary</b><br>
 • The app records audio only when you start a recording or a Mic Test.<br>
 • Recordings are saved as WAV files in the app\'s own storage or in a folder you pick.<br>
 • The app has no internet permission, no ads, no analytics and no accounts. It does not send your recordings or other information to the developer or anyone else.<br>
-• Recordings can still leave your device through things outside the app\'s control, such as a cloud folder you chose or files you copy or share yourself.<br><br>
+• Recordings leave your phone through this app only when you use Share or Save a copy, or when you pick a cloud-backed folder to save them in. After that, or if you copy files yourself with another app, what happens to them is outside the app\'s control.<br><br>
 <b>Microphone</b><br>
 The app uses the microphone only while you record, during a Mic Test, and briefly when either starts, to find a format your microphone supports. Mic Test audio is processed in memory and is not saved. The app never starts recording on its own.<br><br>
 <b>Recording in the background</b><br>
@@ -293,11 +306,12 @@ The app does not encrypt WAV files.<br><br>
 <b>Keeping and deleting recordings</b><br>
 Recordings are kept until you delete them in the Library, with a file manager or in the folder you picked.<br><br>
 <b>Crash recovery and other app data</b><br>
-While recording, the app keeps a private note of the file it is writing (its name, location and format), so it can repair the file if the app or phone stops unexpectedly. The note is removed once the file is finished or repaired. The app also stores your split interval, the folder you picked and a note about how the last recording ended. This stays on your device. The app may write technical messages (such as file names and the microphone\'s name and format) to Android\'s system log on your device, and does not send them anywhere.<br><br>
+While recording, the app keeps a private note of the file it is writing (its name, location and format), so it can repair the file if the app or phone stops unexpectedly. The note is removed once the file is finished or repaired. The app also stores your split interval, the folder you picked, a note about how the last recording ended and whether you have seen the What\'s new note. This stays on your device. The app may write technical messages (such as file names and the microphone\'s name and format) to Android\'s system log on your device, and does not send them anywhere.<br><br>
 <b>Backups and new phones</b><br>
 Android\'s backup and device transfer include only the split interval. They exclude recordings, the folder you picked and crash-recovery data. They don\'t control other backup or sync tools, such as a cloud app holding a folder you picked.<br><br>
 <b>Information shared</b><br>
-The app contains no advertising, analytics, tracking or crash-reporting code, and does not collect, sell or share your personal information. If you install it from Google Play, Google gives the developer statistics such as install counts and, if you agreed to share usage and diagnostics with Google, crash reports. Google processes that data under its own privacy policy.<br><br>
+The app contains no advertising, analytics, tracking or crash-reporting code, and does not collect, sell or share your personal information. If you install it from Google Play, Google gives the developer statistics such as install counts and, if you agreed to share usage and diagnostics with Google, crash reports. Google processes that data under its own privacy policy.<br>
+If you use Send feedback, the app opens your email app with a message to the developer that includes the app version, Android version and phone model. Nothing is sent unless you send it yourself, and the developer uses your message only to reply and to improve the app.<br><br>
 <b>Children</b><br>
 The app is intended for a general audience and is not specifically designed for children.<br><br>
 <b>Visiting this policy webpage</b><br>

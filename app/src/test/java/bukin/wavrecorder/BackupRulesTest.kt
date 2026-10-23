@@ -78,7 +78,9 @@ class BackupRulesTest {
     @Test
     fun `device-specific state lives in files the rules leave out`() {
         val included = (rules(R.xml.backup_rules) + rules(R.xml.data_extraction_rules)).map { it.path }.toSet()
-        listOf(DestinationManager::class.java, ActiveSegmentJournal::class.java, PendingOutcomeStore::class.java).forEach {
+        listOf(
+            DestinationManager::class.java, ActiveSegmentJournal::class.java, PendingOutcomeStore::class.java, WhatsNew::class.java
+        ).forEach {
             val file = prefsFile(it)
             assertFalse("${it.simpleName}'s $file must not be backed up", file in included)
             assertFalse("${it.simpleName} must not share the settings file", file == settingsFile)

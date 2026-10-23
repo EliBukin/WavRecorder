@@ -3,7 +3,7 @@
 - **App:** Bukin Mic Recorder
 - **Developer:** bukin
 - **Contact:** dev.mechanics998877@gmail.com
-- **Effective date:** 2026-10-11
+- **Effective date:** 2026-10-23
 
 This policy explains what the app does with your information. The app is a
 microphone recorder that saves uncompressed WAV files. It works with USB and
@@ -17,8 +17,10 @@ built-in microphones. It is not a phone-call recorder.
 - The app has no internet permission, no ads, no analytics and no accounts. It
   does not send your recordings or other information to the developer or to
   anyone else.
-- Recordings can still leave your device through things outside the app's
-  control, such as a cloud folder you chose or files you copy or share yourself.
+- Recordings leave your phone through this app only when you use **Share** or
+  **Save a copy**, or when you pick a cloud-backed folder to save them in.
+  After that, or if you copy files yourself with another app, what happens to
+  them is outside the app's control.
 
 ## Microphone
 
@@ -85,7 +87,8 @@ The app also stores, privately on your device:
 - your chosen file-splitting interval;
 - the folder you picked, if any;
 - a short note about how the last recording ended, so the app can tell you
-  after it restarts.
+  after it restarts;
+- whether you have seen the "What's new" note shown after an update.
 
 This information stays on your device. The app may also write technical
 diagnostic messages to Android's system log on your device, such as file names,
@@ -113,6 +116,11 @@ If you install the app from Google Play, Google provides the developer with
 statistics such as install counts and, if you agreed to share usage and
 diagnostics data with Google, crash and performance reports about the app.
 Google processes this data under its own privacy policy.
+
+If you use **Send feedback**, the app opens your email app with a message to
+the developer that includes the app version, Android version and phone model.
+Nothing is sent unless you send it yourself, and the developer uses your
+message only to reply and to improve the app.
 
 ## Children
 

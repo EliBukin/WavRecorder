@@ -6,9 +6,11 @@
      Everything else is left out on purpose: recordings (app storage, domain "external", or
      internal storage, domain "file"), the picked folder's URI and its permission
      (wav_recorder_prefs.xml: only valid on this device), the crash-recovery journal
-     (wav_recorder_active_segment.xml) and the last session's pending outcome
-     (wav_recorder_pending_outcome.xml). Leaving them out of backups doesn't touch them on this
-     device, so crash recovery keeps working. -->
+     (wav_recorder_active_segment.xml), the last session's pending outcome
+     (wav_recorder_pending_outcome.xml) and whether the What's new card was seen
+     (wav_recorder_whats_new.xml: a restore goes with a fresh install, which never shows it).
+     Leaving them out of backups doesn't touch them on this device, so crash recovery keeps
+     working. -->
 <full-backup-content>
     <include domain="sharedpref" path="wav_recorder_settings.xml" />
 </full-backup-content>

@@ -453,7 +453,18 @@ recordings too); normal restores only happen when the app is installed.
 [privacy-policy.md](privacy-policy.md)) and the open-source licenses
 ([THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)). Keep the copies in sync;
 `scripts/render-privacy-policy.py` regenerates the static
-`privacy-policy.html` from the Markdown.
+`privacy-policy.html` from the Markdown, and `PrivacyPolicySyncTest` checks
+that all three share the effective date and the key sentences.
+
+**Send feedback and What's new.** `Feedback` opens the user's email app
+(`ACTION_SENDTO`, `mailto:`) with the app version, Android version and phone
+model filled in; the app itself sends nothing. `WhatsNew` shows a one-time
+card after an update (never after a fresh install), checked when
+`RecordFragment`'s service connection lands and only while nothing is going
+on: no recording starting, running or finishing, no Mic Test, no permission
+request in flight, no outcome just shown and no other dialog. The card's
+text and `WhatsNew.CARD_VERSION` change together in a release that has a new
+card.
 
 ## Why a hand-rolled WAV writer
 
