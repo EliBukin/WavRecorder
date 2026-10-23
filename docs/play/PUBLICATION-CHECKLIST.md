@@ -63,7 +63,7 @@ and a new Play declaration.
 
 ## 3. App content declarations (Play Console)
 
-- [x] **Privacy policy** URL hosted and verified; still needs entering in Play Console.
+- [x] **Privacy policy** URL hosted, verified and entered in Play Console.
 - [ ] **Data safety**: "no data collected or shared". Draft in
       `data-safety.md`.
 - [ ] **Ads**: no ads.
