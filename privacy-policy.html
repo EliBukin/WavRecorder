@@ -29,7 +29,7 @@
 <li><strong>App:</strong> Bukin Mic Recorder</li>
 <li><strong>Developer:</strong> bukin</li>
 <li><strong>Contact:</strong> dev.mechanics998877@gmail.com</li>
-<li><strong>Effective date:</strong> 2026-11-03</li>
+<li><strong>Effective date:</strong> 2026-11-06</li>
 </ul>
 <p>This policy explains what the app does with your information. The app is a microphone recorder that saves uncompressed WAV files. It works with USB and built-in microphones. It is not a phone-call recorder.</p>
 <h2>Summary</h2>
@@ -37,8 +37,9 @@
 <li>The app records audio only when you start a recording or a Mic Test.</li>
 <li>Recordings are saved as WAV files in the place you choose: the app's own storage on your device, or a folder you pick.</li>
 <li>The app has no analytics and no accounts, and it never sends your recordings to the developer or to anyone else.</li>
-<li>The app shows ads from Google AdMob in one place only: a banner at the bottom of the Library. Google's ad software is the app's only use of the internet, and it gets none of your recordings, file names or settings (see <strong>Ads</strong>).</li>
-<li>Recordings leave your phone through this app only when you use <strong>Share</strong> or <strong>Save a copy</strong>, or when you pick a cloud-backed folder to save them in. After that, or if you copy files yourself with another app, what happens to them is outside the app's control.</li>
+<li>The app shows ads from Google AdMob only as a banner at the bottom of the Library and Transcripts screens. Google's ad software is the app's only use of the internet, and it gets none of your recordings, file names or settings (see <strong>Ads</strong>).</li>
+<li>Recordings and transcripts leave your phone through this app only when you share, copy or save them yourself (<strong>Share</strong>, <strong>Save a copy</strong>, <strong>Copy</strong>, <strong>Save as .txt</strong>), or when you pick a cloud-backed folder to save recordings in. After that, or if you copy files yourself with another app, what happens to them is outside the app's control.</li>
+<li>Transcription runs on your phone: nothing is sent anywhere to transcribe a recording, and transcripts stay on your phone unless you copy, share or save them (see <strong>Transcription</strong>).</li>
 </ul>
 <h2>Microphone</h2>
 <p>The app asks for the microphone permission. It uses the microphone only:</p>
@@ -60,6 +61,8 @@
 <p>The app does not encrypt WAV files. They are protected by Android's normal storage protections and by the folder or service you chose.</p>
 <h2>How long recordings are kept, and deleting them</h2>
 <p>Recordings are kept until you delete them. You can delete recordings individually or in bulk in the app's Library. You can also delete them with a file manager or in the folder you picked. A file that is still being recorded or repaired cannot be deleted from the Library until it is finished.</p>
+<h2>Transcription</h2>
+<p>If you choose <strong>Transcribe</strong> for a recording, the app turns its speech into text on your phone. Nothing is sent anywhere to do it, and Google's ad software gets neither the audio nor the text. Transcripts stay on your phone unless you copy, share or save them. To share transcripts as files, the app writes a .txt copy of each to its private cache, hands those copies only to the app you pick, and deletes them a day later. Transcripts are kept in the app's private storage until you delete them or their recording, and are not included in Android's backups. The speech models come from Google Play, which downloads each one the first time you transcribe in its language. You can delete them on the <strong>Transcripts</strong> tab, under <strong>Models</strong>.</p>
 <h2>Crash recovery and other app data</h2>
 <p>To protect a recording if the app or phone stops unexpectedly, the app keeps a small private record of the file it is currently writing: the file's name and location, and its recording format. After an interruption, the app uses this record to repair the file so the audio already captured can be played. The record is removed once the file is finished or repaired.</p>
 <p>The app also stores, privately on your device:</p>
@@ -68,14 +71,15 @@
 <li>the folder you picked, if any;</li>
 <li>a short note about how the last recording ended, so the app can tell you after it restarts;</li>
 <li>whether you have seen the "What's new" note shown after an update;</li>
-<li>whether you bought the coffee that removes the ads (see <strong>Ads</strong>).</li>
+<li>whether you bought the coffee that removes the ads (see <strong>Ads</strong>);</li>
+<li>your transcripts, any transcription still in progress, and the language you last transcribed in (see <strong>Transcription</strong>).</li>
 </ul>
 <p>This information stays on your device. Google's ad and consent software also keeps its own data in the app's private storage, such as your consent choice (see <strong>Ads</strong>). The app may also write technical diagnostic messages to Android's system log on your device, such as file names, the microphone's name and the recording format. The app does not send these messages anywhere.</p>
 <h2>Backups and moving to a new phone</h2>
-<p>Android can back up app data to your Google account and copy it to a new phone. For this app, Android's backup and device-transfer features include <strong>only the file-splitting interval</strong>. They exclude recordings, the folder you picked, crash-recovery records and other device-specific data.</p>
+<p>Android can back up app data to your Google account and copy it to a new phone. For this app, Android's backup and device-transfer features include <strong>only the file-splitting interval</strong>. They exclude recordings, transcripts, the folder you picked, crash-recovery records and other device-specific data.</p>
 <p>These rules apply only to Android's own backup and transfer features. They do not control separate backup, sync or file-transfer tools, including a cloud storage app that holds a folder you picked.</p>
 <h2>Ads</h2>
-<p>The app shows ads from Google AdMob in one place only: a banner at the bottom of the <strong>Library</strong> screen. There are no ads on the Record screen or during a Mic Test, and no full-screen ads. Ads start muted.</p>
+<p>The app shows ads from Google AdMob only as a banner at the bottom of the <strong>Library</strong> and <strong>Transcripts</strong> screens. There are no ads on the Record screen or during a Mic Test, and no full-screen ads. Ads start muted.</p>
 <p>The ads come from Google's Mobile Ads software inside the app, which is the app's only use of the internet. To show ads, measure them and prevent fraud, it sends Google your device's IP address (from which Google can estimate your general location, such as your city), your device's advertising ID and app set ID, how you interact with the ads (such as views and taps) and technical information about the app and your device. Google handles this under its own privacy policy; see <a href="https://policies.google.com/technologies/partner-sites">How Google uses information from sites or apps that use its services</a>.</p>
 <ul>
 <li><strong>What the ads never get.</strong> The app gives Google's ad software none of its own data: not your recordings or Mic Test audio, not the names of your files or folders, and not your settings. Ads are limited to content rated for general audiences with parental guidance (PG).</li>
